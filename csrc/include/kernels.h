@@ -99,7 +99,7 @@ void kernel_kv_cache_write(__nv_bfloat16 *kv_cache,
                            const __nv_bfloat16 *v_new,
                            int seq_start, int tokens,
                            int num_kv_heads, int head_dim,
-                           cudaStream_t stream);
+                           int max_seq_len, cudaStream_t stream);
 
 /**
  * Naive scaled-dot-product attention with causal mask and GQA.
@@ -120,7 +120,7 @@ void kernel_attention(__nv_bfloat16 *out, const __nv_bfloat16 *q,
                       const __nv_bfloat16 *kv_cache,
                       int seq_start, int tokens, int seq_len,
                       int num_heads, int num_kv_heads, int head_dim,
-                      float scale, cudaStream_t stream);
+                      float scale, int max_seq_len, cudaStream_t stream);
 
 /**
  * Gated attention output: out = attn * sigmoid(gate)

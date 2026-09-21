@@ -49,16 +49,12 @@ void kernel_kv_cache_write(__nv_bfloat16 *kv_cache,
                            const __nv_bfloat16 *v_new,
                            int seq_start, int tokens,
                            int num_kv_heads, int head_dim,
-                           cudaStream_t stream) {
-    // max_seq_len is not passed here; the caller must ensure the cache is sized
-    // correctly. We use a large enough grid.
+                           int max_seq_len, cudaStream_t stream) {
     int kv_dim = num_kv_heads * head_dim;
     int block = min(256, (kv_dim + 3) / 4);
-    // Note: max_seq_len is embedded in the cache allocation, not needed here
-    // We pass it as a parameter - for now use a default that the engine provides
     kv_cache_write_kernel<<<tokens, block, 0, stream>>>(
         kv_cache, k_new, v_new, seq_start, tokens,
-        num_kv_heads, head_dim, 8192 /* max_seq_len placeholder */);
+        num_kv_heads, head_dim, max_seq_len);
 }
 
 /**
@@ -144,14 +140,13 @@ void kernel_attention(__nv_bfloat16 *out, const __nv_bfloat16 *q,
                       const __nv_bfloat16 *kv_cache,
                       int seq_start, int tokens, int seq_len,
                       int num_heads, int num_kv_heads, int head_dim,
-                      float scale, cudaStream_t stream) {
+                      float scale, int max_seq_len, cudaStream_t stream) {
     dim3 grid(tokens, num_heads);
     dim3 block(min(head_dim, 256));
-    // Shared memory: q_vec (head_dim floats) + scores (seq_len floats)
     size_t smem = (head_dim + seq_len) * sizeof(float);
     attention_kernel<<<grid, block, smem, stream>>>(
         out, q, kv_cache, seq_start, tokens, seq_len,
-        num_heads, num_kv_heads, head_dim, scale, 8192);
+        num_heads, num_kv_heads, head_dim, scale, max_seq_len);
 }
 
 /**

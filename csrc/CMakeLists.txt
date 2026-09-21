@@ -16,6 +16,9 @@ find_package(CUDAToolkit REQUIRED)
 add_library(engine STATIC
     engine.cu
     memory.cu
+    safetensors_loader.cu
+    kernels/gemm.cu
+    kernels/layers.cu
     kernels/rmsnorm.cu
     kernels/rope.cu
     kernels/attention.cu

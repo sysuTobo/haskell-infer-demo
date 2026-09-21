@@ -50,28 +50,28 @@ __global__ void gdn_delta_rule_decode_kernel(
     const __nv_bfloat16 *k_ptr = k + (long long)kh * k_head_dim;
     const __nv_bfloat16 *v_ptr = v + (long long)h * v_head_dim;
 
-    // Step 1: compute (k @ S)[i] = sum_j k[j] * S[j * v_head_dim + i]
+    // Step 1: o[i] = (q @ S_old)[i] -- OUTPUT BEFORE STATE UPDATE
+    // The GatedDeltaNet convention: o_t = q_t @ S_t (state BEFORE update)
+    float o = 0.0f;
+    for (int j = 0; j < k_head_dim; j++) {
+        o += __bfloat162float(q_ptr[j]) * S[j * v_head_dim + i];
+    }
+    out[(long long)h * v_head_dim + i] = __float2bfloat16(o);
+
+    // Step 2: compute (k @ S_old)[i]
     float kS = 0.0f;
     for (int j = 0; j < k_head_dim; j++) {
         kS += __bfloat162float(k_ptr[j]) * S[j * v_head_dim + i];
     }
 
-    // Step 2: delta[i] = v[i] - kS
+    // Step 3: delta[i] = v[i] - kS
     float delta = __bfloat162float(v_ptr[i]) - kS;
 
-    // Step 3: S[j][i] = alpha * S[j][i] + beta * k[j] * delta
+    // Step 4: S[j][i] = alpha * S[j][i] + beta * k[j] * delta (STATE UPDATE)
     for (int j = 0; j < k_head_dim; j++) {
         float kj = __bfloat162float(k_ptr[j]);
         S[j * v_head_dim + i] = a * S[j * v_head_dim + i] + b * kj * delta;
     }
-
-    // Step 4: o[i] = (q @ S)[i] = sum_j q[j] * S[j][i]
-    float o = 0.0f;
-    for (int j = 0; j < k_head_dim; j++) {
-        o += __bfloat162float(q_ptr[j]) * S[j * v_head_dim + i];
-    }
-
-    out[(long long)h * v_head_dim + i] = __float2bfloat16(o);
 }
 
 void kernel_gdn_delta_rule_decode(

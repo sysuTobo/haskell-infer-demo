@@ -327,18 +327,9 @@ int forward_gdn_layer(
 
     // 1. Input RMSNorm
     kernel_rms_norm(normed, residual, w->input_norm_w_p1, H, 1, dims->rms_eps, stream);
-    // DIAG: after input_norm
-    if (residual != nullptr) {
-        __nv_bfloat16 dbg[4];
-        cudaMemcpy(dbg, normed, 4*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[gdn0] normed[0:4] = %.6f %.6f %.6f %.6f\n",
-                __bfloat162float(dbg[0]), __bfloat162float(dbg[1]),
-                __bfloat162float(dbg[2]), __bfloat162float(dbg[3]));
-    }
 
     // 2. in_proj_qkv: [1, H] @ [conv_dim, H]^T → [1, conv_dim]
     gemm_bf16(cublas, qkv_out, normed, w->in_proj_qkv_w, 1, conv_dim, H);
-    { __nv_bfloat16 d[4]; cudaMemcpy(d, qkv_out, 8, cudaMemcpyDeviceToHost); fprintf(stderr, "[gdn] qkv[0:4]=%.4f %.4f %.4f %.4f\n", __bfloat162float(d[0]),__bfloat162float(d[1]),__bfloat162float(d[2]),__bfloat162float(d[3])); }
 
     // 3. in_proj_z: [1, H] @ [v_dim, H]^T → [1, v_dim]
     gemm_bf16(cublas, z_out, normed, w->in_proj_z_w, 1, v_dim, H);
@@ -355,7 +346,6 @@ int forward_gdn_layer(
 
     // 6b. SiLU activation after conv1d (model uses activation="silu")
     silu_inplace_kernel<<<(conv_dim + 255) / 256, 256, 0, stream>>>(conv_out, conv_dim);
-    { __nv_bfloat16 d[4]; cudaMemcpy(d, conv_out, 8, cudaMemcpyDeviceToHost); fprintf(stderr, "[gdn] conv_silu[0:4]=%.4f %.4f %.4f %.4f\n", __bfloat162float(d[0]),__bfloat162float(d[1]),__bfloat162float(d[2]),__bfloat162float(d[3])); }
 
     // 7. Compute alpha and beta from a_out, b_out, A_log, dt_bias
     // Formula (Mamba-style gated delta rule):
@@ -387,7 +377,6 @@ int forward_gdn_layer(
 
     // 11. out_proj: [1, v_dim] @ [H, v_dim]^T → [1, H]
     gemm_bf16(cublas, layer_out, norm_delta, w->out_proj_w, 1, H, v_dim);
-    { __nv_bfloat16 d[4]; cudaMemcpy(d, layer_out, 8, cudaMemcpyDeviceToHost); fprintf(stderr, "[gdn] out_proj[0:4]=%.4f %.4f %.4f %.4f\n", __bfloat162float(d[0]),__bfloat162float(d[1]),__bfloat162float(d[2]),__bfloat162float(d[3])); }
 
     return 0;
 }

@@ -381,15 +381,6 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
         return ENGINE_ERR_CUDA;
     }
 
-    // Diagnostic: print first 4 embedding values (only for first token)
-    if (eng->seq_len == 0) {
-        __nv_bfloat16 h_emb[4];
-        cudaMemcpy(h_emb, act, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[diag] embed[0:4] = %.6f %.6f %.6f %.6f (token=%lld)\n",
-                __bfloat162float(h_emb[0]), __bfloat162float(h_emb[1]),
-                __bfloat162float(h_emb[2]), __bfloat162float(h_emb[3]),
-                (long long)token_id);
-    }
 
     // 2. Layers
     for (int i = 0; i < MAX_LAYERS; i++) {
@@ -459,14 +450,6 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
 
         // Residual add: act += mlp_out
         kernel_residual_add(act, mlp_out, HIDDEN, stream);
-        // Diagnostic: print residual after layer 0 (first token only)
-        if (i == 0 && eng->seq_len == 0) {
-            __nv_bfloat16 h_act[4];
-            cudaMemcpy(h_act, act, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[diag] after_layer0[0:4] = %.6f %.6f %.6f %.6f\n",
-                    __bfloat162float(h_act[0]), __bfloat162float(h_act[1]),
-                    __bfloat162float(h_act[2]), __bfloat162float(h_act[3]));
-        }
     }
 
     // 3. Final norm + lm_head on last device

@@ -327,6 +327,14 @@ int forward_gdn_layer(
 
     // 1. Input RMSNorm
     kernel_rms_norm(normed, residual, w->input_norm_w_p1, H, 1, dims->rms_eps, stream);
+    // DIAG: after input_norm
+    if (residual != nullptr) {
+        __nv_bfloat16 dbg[4];
+        cudaMemcpy(dbg, normed, 4*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[gdn0] normed[0:4] = %.6f %.6f %.6f %.6f\n",
+                __bfloat162float(dbg[0]), __bfloat162float(dbg[1]),
+                __bfloat162float(dbg[2]), __bfloat162float(dbg[3]));
+    }
 
     // 2. in_proj_qkv: [1, H] @ [conv_dim, H]^T → [1, conv_dim]
     gemm_bf16(cublas, qkv_out, normed, w->in_proj_qkv_w, 1, conv_dim, H);

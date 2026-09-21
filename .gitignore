@@ -1,0 +1,41 @@
+# Haskell
+dist-newstyle/
+cabal.project.local
+.ghc.environment.*
+*.hi
+*.o
+*.dyn_hi
+*.dyn_o
+
+# C/CUDA
+build/
+csrc/build/
+*.so
+*.a
+*.o
+*.cubin
+*.fatbin
+*.ptx
+
+# Rust
+tokenizer-ffi/target/
+target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights (never commit)
+weights/
+*.safetensors
+*.bin
+
+# Logs
+*.log

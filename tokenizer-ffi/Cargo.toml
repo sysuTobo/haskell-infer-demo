@@ -1,0 +1,18 @@
+[package]
+name = "tokenizer-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI wrapper around HuggingFace tokenizers for Haskell FFI"
+license = "MIT"
+
+[lib]
+name = "tokenizer_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

@@ -1,0 +1,78 @@
+cabal-version:      3.0
+name:               haskell-infer-demo
+version:            0.1.0.0
+synopsis:           Haskell inference framework demo for Qwen3.8-27B
+description:        A demo LLM inference framework written in Haskell with
+                    C/CUDA backend. Supports multi-GPU layer-wise partitioning.
+license:            MIT
+license-file:       LICENSE
+author:             sysuTobo
+maintainer:         sysutobo@gmail.com
+category:           AI
+build-type:         Simple
+
+extra-doc-files:    README.md
+
+common common-opts
+  default-language:   Haskell2010
+  ghc-options:        -Wall -Wcompat -O2
+  build-depends:      base >=4.18 && <4.21
+
+executable haskell-infer-demo
+  import:             common-opts
+  main-is:            Main.hs
+  hs-source-dirs:     src
+  other-modules:
+                      Infer.Config
+                      Infer.Model
+                      Infer.Runtime
+                      Infer.Generation
+                      Infer.Safetensors
+                      Infer.Tokenizer
+                      Infer.FFI.Engine
+  build-depends:
+                      base
+                    , aeson >=2.0
+                    , bytestring >=0.11
+                    , containers >=0.6
+                    , directory >=1.3
+                    , filepath >=1.4
+                    , optparse-applicative >=0.17
+                    , text >=2.0
+                    , vector >=0.12
+                    , mmap >=0.5
+  -- C/CUDA library built by CMake into csrc/build/
+  extra-lib-dirs:     csrc/build
+  extra-include-dirs: csrc/include
+  extra-libraries:    engine, cudart, cublas, stdc++
+  -- Rust tokenizer FFI
+  extra-lib-dirs:     tokenizer-ffi/target/release
+  extra-libraries:    tokenizer_ffi
+
+  if os(linux)
+    extra-libraries:  m, dl, pthread
+
+test-suite infer-tests
+  import:             common-opts
+  type:               exitcode-stdio-1.0
+  main-is:            Spec.hs
+  hs-source-dirs:     tests
+  other-modules:
+                      Infer.Config
+                      Infer.Model
+                      Infer.Safetensors
+                      Infer.FFI.Engine
+  build-depends:
+                      base
+                    , aeson
+                    , bytestring
+                    , containers
+                    , directory
+                    , filepath
+                    , haskell-infer-demo
+                    , hspec >=2.10
+                    , text
+                    , vector
+  extra-lib-dirs:     csrc/build
+  extra-include-dirs: csrc/include
+  extra-libraries:    engine, cudart, cublas, stdc++

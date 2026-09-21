@@ -381,22 +381,14 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
         return ENGINE_ERR_CUDA;
     }
 
-    // Diagnostic: test GEMM with the actual handle and a small weight
-    {
-        cublasHandle_t test_h = eng->ctx[0].cublas;
-        cublasSetStream(test_h, 0);
-        float ta = 1.0f, tb = 0.0f;
-        // Use embed_w as a large BF16 matrix, act as input
-        cublasStatus_t ts = cublasGemmEx(test_h, CUBLAS_OP_T, CUBLAS_OP_N,
-            64, 1, HIDDEN, &ta,
-            eng->embed_w, CUDA_R_16BF, HIDDEN,
-            act, CUDA_R_16BF, HIDDEN,
-            &tb, eng->ctx[0].workspace, CUDA_R_16BF, 64,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-        if (ts != CUBLAS_STATUS_SUCCESS)
-            fprintf(stderr, "[diag] GEMM on dev0 handle failed: %d\n", ts);
-        else
-            fprintf(stderr, "[diag] GEMM on dev0 handle OK\n");
+    // Diagnostic: print first 4 embedding values (only for first token)
+    if (eng->seq_len == 0) {
+        __nv_bfloat16 h_emb[4];
+        cudaMemcpy(h_emb, act, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[diag] embed[0:4] = %.6f %.6f %.6f %.6f (token=%lld)\n",
+                __bfloat162float(h_emb[0]), __bfloat162float(h_emb[1]),
+                __bfloat162float(h_emb[2]), __bfloat162float(h_emb[3]),
+                (long long)token_id);
     }
 
     // 2. Layers

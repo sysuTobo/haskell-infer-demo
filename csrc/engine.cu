@@ -443,7 +443,7 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
             gw.in_proj_a_w = lw.in_proj_a_w; gw.in_proj_b_w = lw.in_proj_b_w;
             gw.conv1d_w = lw.conv1d_w; gw.conv1d_bias = eng->conv_bias_zero;
             gw.dt_bias = lw.dt_bias; gw.A_log = lw.A_log;
-            gw.out_proj_w = lw.gdn_out_proj_w; gw.gdn_norm_w_p1 = lw.gdn_norm_w_p1_tiled;
+            gw.out_proj_w = lw.gdn_out_proj_w; gw.gdn_norm_w_p1 = lw.gdn_norm_w_p1;
             gw.input_norm_w_p1 = lw.input_norm_w_p1;
             forward_gdn_layer(cublas, stream, act, ws, layer_out, &gw,
                              eng->conv_states[gdn_idx], eng->ssm_states[gdn_idx], &eng->dims);

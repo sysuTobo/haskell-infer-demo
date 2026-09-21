@@ -95,6 +95,50 @@ __global__ void gdn_compute_alpha_beta_kernel(
     beta[h] = 1.0f / (1.0f + expf(-b));
 }
 
+/**
+ * In-place SiLU activation: x[i] = x[i] * sigmoid(x[i])
+ */
+__global__ void silu_inplace_kernel(__nv_bfloat16 *__restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = __bfloat162float(x[i]);
+    x[i] = __float2bfloat16(v / (1.0f + expf(-v)));
+}
+
+/**
+ * Per-head L2 normalization: x[h] = x[h] / ||x[h]||_2
+ * Input: [num_heads, head_dim] BF16, normalized in-place.
+ * Grid: (num_heads), Block: (head_dim)
+ */
+__global__ void l2_norm_per_head_kernel(__nv_bfloat16 *__restrict__ x,
+                                        int head_dim, int num_heads) {
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+    if (h >= num_heads || d >= head_dim) return;
+
+    __nv_bfloat16 *head_ptr = x + h * head_dim;
+    float val = __bfloat162float(head_ptr[d]);
+
+    // Block reduce sum of squares (head_dim=128, block=128, 4 warps)
+    float sum_sq = val * val;
+    __shared__ float warp_sums[4];
+    for (int off = 16; off > 0; off >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, off);
+    int warp = d / 32, lane = d % 32;
+    if (lane == 0) warp_sums[warp] = sum_sq;
+    __syncthreads();
+
+    if (d == 0) {
+        int nw = (head_dim + 31) / 32;
+        float total = 0;
+        for (int w = 0; w < nw; w++) total += warp_sums[w];
+        warp_sums[0] = rsqrtf(total + 1e-12f);
+    }
+    __syncthreads();
+
+    head_ptr[d] = __float2bfloat16(val * warp_sums[0]);
+}
+
 /* ------------------------------------------------------------------ */
 /*  MLP: gate_up → SiLU×mul → down                                    */
 /* ------------------------------------------------------------------ */
@@ -282,14 +326,7 @@ int forward_gdn_layer(
     float *beta_f32 = alpha_f32 + 48;               // [48] f32
 
     // 1. Input RMSNorm
-    fprintf(stderr, "[gdn_layer] rms_norm: normed=%p residual=%p w_p1=%p H=%d\n",
-            (void*)normed, (void*)residual, (void*)w->input_norm_w_p1, H);
     kernel_rms_norm(normed, residual, w->input_norm_w_p1, H, 1, dims->rms_eps, stream);
-    cudaError_t rn_err = cudaDeviceSynchronize();
-    if (rn_err != cudaSuccess) {
-        fprintf(stderr, "[gdn_layer] rms_norm FAILED: %s\n", cudaGetErrorString(rn_err));
-        return -1;
-    }
 
     // 2. in_proj_qkv: [1, H] @ [conv_dim, H]^T → [1, conv_dim]
     gemm_bf16(cublas, qkv_out, normed, w->in_proj_qkv_w, 1, conv_dim, H);
@@ -307,6 +344,9 @@ int forward_gdn_layer(
     kernel_causal_conv1d(conv_out, qkv_out, w->conv1d_w, w->conv1d_bias,
                          conv_state, conv_dim, 1, dims->gdn_conv_kernel, stream);
 
+    // 6b. SiLU activation after conv1d (model uses activation="silu")
+    silu_inplace_kernel<<<(conv_dim + 255) / 256, 256, 0, stream>>>(conv_out, conv_dim);
+
     // 7. Compute alpha and beta from a_out, b_out, A_log, dt_bias
     // Formula (Mamba-style gated delta rule):
     //   dt = softplus(a_out + dt_bias)
@@ -317,18 +357,23 @@ int forward_gdn_layer(
         w->A_log, w->dt_bias, nVH);
 
     // 8. Split conv_out into q[0:qk_dim], k[qk_dim:2*qk_dim], v[2*qk_dim:conv_dim]
-    const __nv_bfloat16 *q_ptr = conv_out;
-    const __nv_bfloat16 *k_ptr = conv_out + qk_dim;
+    __nv_bfloat16 *q_ptr = conv_out;
+    __nv_bfloat16 *k_ptr = conv_out + qk_dim;
     const __nv_bfloat16 *v_ptr = conv_out + 2 * qk_dim;
+
+    // 8b. L2 normalize Q and K per head (use_qk_l2norm_in_kernel=True)
+    l2_norm_per_head_kernel<<<nKH, k_hd, 0, stream>>>(q_ptr, k_hd, nKH);
+    l2_norm_per_head_kernel<<<nKH, k_hd, 0, stream>>>(k_ptr, k_hd, nKH);
 
     // 9. Gated delta rule (recurrent, single token)
     kernel_gdn_delta_rule_decode(delta_out, q_ptr, k_ptr, v_ptr,
                                  alpha_f32, beta_f32, ssm_state,
                                  nKH, nVH, k_hd, v_hd, stream);
 
-    // 10. Gated RMSNorm: norm_delta = rmsnorm(delta_out) * sigmoid(z_out)
+    // 10. Per-head Gated RMSNorm: dim=128 (head_v_dim), rows=48 (num_v_heads)
+    // The norm is applied per v-head, not across the full v_dim
     kernel_gdn_gated_norm(norm_delta, delta_out, z_out, w->gdn_norm_w_p1,
-                          v_dim, 1, dims->rms_eps, stream);
+                          v_hd, nVH, dims->rms_eps, stream);
 
     // 11. out_proj: [1, v_dim] @ [H, v_dim]^T → [1, H]
     gemm_bf16(cublas, layer_out, norm_delta, w->out_proj_w, 1, H, v_dim);

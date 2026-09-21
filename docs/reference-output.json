@@ -1,0 +1,9 @@
+{
+  "model": "Qwen3.8-27B",
+  "prompt": "The capital of France is",
+  "prompt_tokens": 5,
+  "reference_engine": "transformers 5.2.0 + torch 2.8.0, bfloat16, device_map=auto, greedy",
+  "output_text": " Paris.\nThe capital of Germany is Berlin.",
+  "output_token_ids": [11751, 13, 198, 760, 6511, 314, 9564, 369, 19241, 13],
+  "note": "Use this as ground truth for layer-by-layer numerical debugging"
+}

@@ -306,4 +306,10 @@ void kernel_cast_bf16_f32(float *out, const __nv_bfloat16 *in, int n,
  */
 void kernel_fill_f32(float *out, int n, float value, cudaStream_t stream);
 
+/**
+ * Residual add: dst[i] += src[i] (BF16, element-wise).
+ */
+void kernel_residual_add(__nv_bfloat16 *dst, const __nv_bfloat16 *src,
+                         int n, cudaStream_t stream);
+
 #endif /* HASKELL_INFER_KERNELS_H */

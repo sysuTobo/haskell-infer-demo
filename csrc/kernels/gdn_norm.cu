@@ -130,3 +130,24 @@ void kernel_fill_f32(float *out, int n, float value, cudaStream_t stream) {
     int grid = (n + block - 1) / block;
     fill_f32_kernel<<<grid, block, 0, stream>>>(out, n, value);
 }
+
+/* ------------------------------------------------------------------ */
+/*  Residual add: dst[i] += src[i] (BF16)                             */
+/* ------------------------------------------------------------------ */
+
+__global__ void residual_add_kernel(__nv_bfloat16 *__restrict__ dst,
+                                    const __nv_bfloat16 *__restrict__ src,
+                                    int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float d = __bfloat162float(dst[i]);
+    float s = __bfloat162float(src[i]);
+    dst[i] = __float2bfloat16(d + s);
+}
+
+void kernel_residual_add(__nv_bfloat16 *dst, const __nv_bfloat16 *src,
+                         int n, cudaStream_t stream) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    residual_add_kernel<<<grid, block, 0, stream>>>(dst, src, n);
+}

@@ -406,13 +406,17 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
         __nv_bfloat16 *ws = eng->ctx[dev_idx].workspace;
         LayerWeights &lw = eng->layers[i];
 
+        // layer_out buffer: dedicated space for the layer's output before residual add
+        // Place it after the MLP workspace to avoid conflicts
+        __nv_bfloat16 *layer_out = ws + HIDDEN + 2 * INTERMEDIATE + INTERMEDIATE + HIDDEN;
+
         if (lw.is_attention) {
             AttentionWeights aw;
             aw.q_proj_w = lw.q_proj_w; aw.k_proj_w = lw.k_proj_w;
             aw.v_proj_w = lw.v_proj_w; aw.o_proj_w = lw.o_proj_w;
             aw.q_norm_w = lw.q_norm_w; aw.k_norm_w = lw.k_norm_w;
             aw.input_norm_w_p1 = lw.input_norm_w_p1;
-            forward_attention_layer(cublas, stream, act, ws, &aw,
+            forward_attention_layer(cublas, stream, act, ws, layer_out, &aw,
                                    eng->kv_caches[attn_idx], eng->cos_cache,
                                    eng->sin_cache, nullptr, eng->seq_len + 1, &eng->dims);
             attn_idx++;
@@ -424,42 +428,28 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
             gw.dt_bias = lw.dt_bias; gw.A_log = lw.A_log;
             gw.out_proj_w = lw.gdn_out_proj_w; gw.gdn_norm_w_p1 = lw.gdn_norm_w_p1_tiled;
             gw.input_norm_w_p1 = lw.input_norm_w_p1;
-            forward_gdn_layer(cublas, stream, act, ws, &gw,
+            forward_gdn_layer(cublas, stream, act, ws, layer_out, &gw,
                              eng->conv_states[gdn_idx], eng->ssm_states[gdn_idx], &eng->dims);
             gdn_idx++;
         }
 
+        // Residual add: act += layer_out
+        kernel_residual_add(act, layer_out, HIDDEN, stream);
+
         // MLP: post_norm → gate_up → silu → down → residual add
-        // For v1: simplified MLP using GEMM + silu
         __nv_bfloat16 *normed = ws;
         __nv_bfloat16 *gate_up = ws + HIDDEN;
         __nv_bfloat16 *mlp_act = gate_up + 2 * INTERMEDIATE;
         __nv_bfloat16 *mlp_out = mlp_act + INTERMEDIATE;
 
-        kernel_fused_add_rms_norm(normed, act, mlp_out, lw.post_norm_w_p1,
-                                  HIDDEN, 1, eng->dims.rms_eps, stream);
-        // Wait - the fused_add adds mlp_out to act. But mlp_out isn't computed yet.
-        // Correct order: norm first, then MLP, then residual add.
-        // Let me use plain rms_norm + manual residual add:
         kernel_rms_norm(normed, act, lw.post_norm_w_p1, HIDDEN, 1, eng->dims.rms_eps, stream);
         gemm_bf16(cublas, gate_up, normed, lw.gate_proj_w, 1, INTERMEDIATE, HIDDEN);
         gemm_bf16(cublas, gate_up + INTERMEDIATE, normed, lw.up_proj_w, 1, INTERMEDIATE, HIDDEN);
         kernel_silu_mul(mlp_act, gate_up, gate_up + INTERMEDIATE, INTERMEDIATE, stream);
         gemm_bf16(cublas, mlp_out, mlp_act, lw.down_proj_w, 1, HIDDEN, INTERMEDIATE);
-        // Residual add: act += mlp_out (simple element-wise, use fused_add trick)
-        // For v1: use a simple add via the fused kernel with zero input
-        // Actually just do: act = act + mlp_out via fused_add_rms_norm with dummy
-        // Simplest: cudaMemcpy + add kernel. For demo, use fused_add_rms_norm
-        // which does residual += x. We pass mlp_out as x and act as residual.
-        // But fused_add_rms_norm also normalizes... we don't want that here.
-        // Let's just add a simple residual_add kernel inline:
-        // For v1, we'll handle this by noting that the next layer's input_norm
-        // reads from act (which should be residual + attn_out + mlp_out).
-        // The attention/GDN forward already wrote its output to ws (o_out).
-        // We need: act = act + o_out (from attn/gdn) + mlp_out
-        // This is getting complex. For the demo, let's simplify:
-        // The layer forward writes o_out to ws, we add it to act, then add mlp_out.
-        // TODO: proper residual management
+
+        // Residual add: act += mlp_out
+        kernel_residual_add(act, mlp_out, HIDDEN, stream);
     }
 
     // 3. Final norm + lm_head on last device

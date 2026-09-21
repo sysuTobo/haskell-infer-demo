@@ -67,15 +67,17 @@ typedef struct {
     MlpWeights mlp;
 } GdnWeights;
 
-/* Forward function declarations */
+/* Forward function declarations.
+ * layer_out: caller-provided buffer [1, hidden_size] for the layer's output
+ * (before residual add). The caller does: residual += layer_out. */
 int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
-    __nv_bfloat16 *residual, __nv_bfloat16 *ws,
+    __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
     const AttentionWeights *w, __nv_bfloat16 *kv_cache,
     __nv_bfloat16 *cos_cache, __nv_bfloat16 *sin_cache,
     int64_t *d_position, int seq_len, const ModelDims *dims);
 
 int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
-    __nv_bfloat16 *residual, __nv_bfloat16 *ws,
+    __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
     const GdnWeights *w, __nv_bfloat16 *conv_state,
     float *ssm_state, const ModelDims *dims);
 

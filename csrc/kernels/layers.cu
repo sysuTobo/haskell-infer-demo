@@ -42,9 +42,11 @@ int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
 
     // 2. gate_proj: [1, hidden] @ [intermediate, hidden]^T → [1, intermediate]
     if (gemm_bf16(cublas, gate_up_out, normed, gate_proj_w, 1, intermediate, hidden) != 0)
+        return -1;
 
     // 3. up_proj: [1, hidden] @ [intermediate, hidden]^T → [1, intermediate]
     if (gemm_bf16(cublas, gate_up_out + intermediate, normed, up_proj_w, 1, intermediate, hidden) != 0)
+        return -1;
 
     // 4. SiLU(gate) * up → mlp_act [1, intermediate]
     kernel_silu_mul(mlp_act, gate_up_out, gate_up_out + intermediate,
@@ -52,6 +54,7 @@ int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
 
     // 5. down_proj: [1, intermediate] @ [hidden, intermediate]^T → [1, hidden]
     if (gemm_bf16(cublas, mlp_down_out, mlp_act, down_proj_w, 1, hidden, intermediate) != 0)
+        return -1;
 
     // 6. Residual add: residual += mlp_down_out (done via fused_add_rms_norm in next layer)
     // For now, just add in-place using a simple kernel
@@ -67,6 +70,7 @@ int forward_attention_layer(
     cublasHandle_t cublas, cudaStream_t stream,
     __nv_bfloat16 *residual,        // [1, hidden] in/out (residual stream)
     __nv_bfloat16 *ws,              // workspace pointer
+    __nv_bfloat16 *layer_out,       // [1, hidden] caller-provided output buffer
     const AttentionWeights *w,
     __nv_bfloat16 *kv_cache,        // per-layer KV cache
     __nv_bfloat16 *cos_cache,       // RoPE cos table
@@ -143,7 +147,7 @@ int forward_attention_layer(
                        nH * 2 * hd, hd, stream);
 
     // 10. O projection: [1, nH*hd] @ [H, nH*hd]^T → [1, H]
-    gemm_bf16(cublas, o_out, gated, w->o_proj_w, 1, H, nH * hd);
+    gemm_bf16(cublas, layer_out, gated, w->o_proj_w, 1, H, nH * hd);
 
     // 11. Residual: residual += o_out (will be done by fused_add_rms_norm at MLP)
     // Store o_out for the fused add
@@ -162,6 +166,7 @@ int forward_gdn_layer(
     cublasHandle_t cublas, cudaStream_t stream,
     __nv_bfloat16 *residual,        // [1, hidden] in/out
     __nv_bfloat16 *ws,              // workspace
+    __nv_bfloat16 *layer_out,       // [1, hidden] caller-provided output buffer
     const GdnWeights *w,
     __nv_bfloat16 *conv_state,      // [conv_dim, kernel_size-1] BF16
     float *ssm_state,               // [nVH, k_hd, v_hd] F32
@@ -196,6 +201,7 @@ int forward_gdn_layer(
             (void*)normed, (void*)residual, (void*)w->input_norm_w_p1, H);
     kernel_rms_norm(normed, residual, w->input_norm_w_p1, H, 1, dims->rms_eps, stream);
     cudaError_t rn_err = cudaDeviceSynchronize();
+        return -1;
     }
 
     // 2. in_proj_qkv: [1, H] @ [conv_dim, H]^T → [1, conv_dim]
@@ -238,7 +244,7 @@ int forward_gdn_layer(
                           v_dim, 1, dims->rms_eps, stream);
 
     // 11. out_proj: [1, v_dim] @ [H, v_dim]^T → [1, H]
-    gemm_bf16(cublas, o_out, norm_delta, w->out_proj_w, 1, H, v_dim);
+    gemm_bf16(cublas, layer_out, norm_delta, w->out_proj_w, 1, H, v_dim);
 
     return 0;
 }

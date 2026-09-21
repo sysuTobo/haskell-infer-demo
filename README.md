@@ -105,9 +105,9 @@ Expected: ~50 GiB in 18 safetensors shards + tokenizer.json.
 | 3 | Full attention layer (naive SDPA, KV cache, GQA) | Code written |
 | 4 | GDN kernels (conv1d, delta rule, gated norm) | Code written |
 | 5 | Haskell model definition, weight loading | Code written |
-| 6 | Multi-GPU engine integration | Stub (needs GPU) |
+| 6 | Multi-GPU engine integration | Working (2x A40) |
 | 7 | Tokenizer + CLI + generation loop | Code written |
-| 8 | End-to-end validation + docs | Pending GPU |
+| 8 | End-to-end validation + docs | Forward pass stable, numerical debugging pending |
 
 ## Design Decisions
 

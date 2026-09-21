@@ -58,12 +58,13 @@ __global__ void gdn_gated_norm_kernel(__nv_bfloat16 *__restrict__ out,
 
     float scale = rsqrtf(shared[0] / (float)dim + eps);
 
-    // Normalize and gate
+    // Normalize and gate with swish (config: output_gate_type=swish)
+    // swish(z) = z * sigmoid(z)
     for (int i = threadIdx.x; i < dim; i += BLOCK) {
         float val = __bfloat162float(x_row[i]);
         float gate = __bfloat162float(z_row[i]);
-        float sig = 1.0f / (1.0f + expf(-gate));
-        out_row[i] = __float2bfloat16(val * scale * weight_p1[i] * sig);
+        float swish = gate / (1.0f + expf(-gate));  // z * sigmoid(z)
+        out_row[i] = __float2bfloat16(val * scale * weight_p1[i] * swish);
     }
 }
 

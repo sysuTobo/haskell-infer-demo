@@ -1,22 +1,25 @@
 /**
- * rope.cu - Partial Rotary Position Embedding.
+ * rope.cu - Partial Rotary Position Embedding (SPLIT-HALF variant).
  *
  * Qwen3.8-27B uses partial rotary: only the first rotary_dim (64) of each
  * head_dim (256) are rotated. theta = 1e7.
  *
- * cos/sin tables are precomputed: [max_pos, rotary_dim/2].
- * Rotation: for each pair (x[2i], x[2i+1]):
- *   out[2i]   = x[2i] * cos - x[2i+1] * sin
- *   out[2i+1] = x[2i] * sin + x[2i+1] * cos
+ * Rotation formula (split-half, as in Llama/Qwen):
+ *   For i in 0..half-1 (half = rotary_dim/2 = 32):
+ *     out[i]      = x[i] * cos[i] - x[i + half] * sin[i]
+ *     out[i+half] = x[i + half] * cos[i] + x[i] * sin[i]
+ *   Dims [rotary_dim..head_dim-1] pass through unchanged.
+ *
+ * cos/sin tables: [max_pos, rotary_dim/2] BF16.
  */
 
 #include "kernels.h"
 #include <cuda_bf16.h>
 
 /**
- * Apply RoPE in-place to q or k heads.
+ * Apply RoPE in-place to q or k heads (split-half variant).
  * Grid: (tokens * num_heads), Block: (rotary_dim / 2)
- * Each thread handles one (cos, sin) pair.
+ * Each thread handles one pair (x[i], x[i+half]).
  */
 __global__ void rope_kernel(__nv_bfloat16 *__restrict__ qkv,
                             const __nv_bfloat16 *__restrict__ cos_cache,
@@ -28,22 +31,22 @@ __global__ void rope_kernel(__nv_bfloat16 *__restrict__ qkv,
     int token = idx / num_heads;
     int head = idx % num_heads;
     int half = rotary_dim / 2;  // 32
-    int pair = threadIdx.x;     // 0..31
+    int i = threadIdx.x;        // 0..31
 
-    if (token >= tokens || pair >= half) return;
+    if (token >= tokens || i >= half) return;
 
     int64_t pos = positions[token];
-    // Base pointer for this head within the qkv buffer
     long long base = (long long)token * qkv_stride + head_offset + head * head_dim;
 
-    float cos_val = __bfloat162float(cos_cache[(long long)pos * half + pair]);
-    float sin_val = __bfloat162float(sin_cache[(long long)pos * half + pair]);
+    float cos_val = __bfloat162float(cos_cache[(long long)pos * half + i]);
+    float sin_val = __bfloat162float(sin_cache[(long long)pos * half + i]);
 
-    float x0 = __bfloat162float(qkv[base + 2 * pair]);
-    float x1 = __bfloat162float(qkv[base + 2 * pair + 1]);
+    // Split-half rotation: x0 = x[i], x1 = x[i + half]
+    float x0 = __bfloat162float(qkv[base + i]);
+    float x1 = __bfloat162float(qkv[base + half + i]);
 
-    qkv[base + 2 * pair]     = __float2bfloat16(x0 * cos_val - x1 * sin_val);
-    qkv[base + 2 * pair + 1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
+    qkv[base + i]        = __float2bfloat16(x0 * cos_val - x1 * sin_val);
+    qkv[base + half + i] = __float2bfloat16(x1 * cos_val + x0 * sin_val);
 }
 
 void kernel_rope(__nv_bfloat16 *qkv, const __nv_bfloat16 *cos_cache,

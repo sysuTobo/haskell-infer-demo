@@ -313,7 +313,7 @@ EngineHandle *engine_create(const char *model_dir, const EngineConfig *config) {
             load_weight(index, lp + "linear_attn.out_proj.weight", (void**)&lw.gdn_out_proj_w, dev);
             load_weight(index, lp + "linear_attn.norm.weight", (void**)&lw.gdn_norm_w, dev);
             cudaMalloc(&lw.gdn_norm_w_p1, GDN_HD * sizeof(float));
-            kernel_weight_p1(lw.gdn_norm_w_p1, lw.gdn_norm_w, GDN_HD, 0);
+            kernel_cast_bf16_f32(lw.gdn_norm_w_p1, lw.gdn_norm_w, GDN_HD, 0);
             // Tile norm weight from [128] to [6144] (repeat 48 times for v_dim)
             cudaMalloc(&lw.gdn_norm_w_p1_tiled, GDN_V_DIM * sizeof(float));
             {

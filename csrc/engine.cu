@@ -145,6 +145,7 @@ struct EngineHandle {
 
     // Output logits buffer (host-pinned)
     float *d_logits;                // [vocab] on last device
+    int64_t *d_position;            // [1] position scalar on device 0 (for RoPE)
     int seq_len;
 };
 
@@ -227,8 +228,10 @@ EngineHandle *engine_create(const char *model_dir, const EngineConfig *config) {
     cudaMalloc(&eng->final_norm_w_p1, HIDDEN * sizeof(float));
     kernel_weight_p1(eng->final_norm_w_p1, eng->final_norm_w, HIDDEN, eng->ctx[eng->num_devices-1].stream);
 
-    // Allocate logits buffer
+    // Allocate logits buffer and position buffer
     cudaMalloc(&eng->d_logits, VOCAB * sizeof(float));
+    cudaSetDevice(eng->devices[0]);
+    cudaMalloc(&eng->d_position, sizeof(int64_t));
 
     // Generate RoPE tables on each device
     int rope_half = ROTARY_DIM / 2;  // 32
@@ -359,6 +362,10 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
     cudaMemcpy(d_token, &token_id, sizeof(int64_t), cudaMemcpyHostToDevice);
     kernel_embedding(act, eng->embed_w, d_token, HIDDEN, 1, eng->ctx[0].stream);
     cudaFree(d_token);
+
+    // Update position buffer for RoPE (position = current seq_len, 0-based)
+    int64_t pos = (int64_t)eng->seq_len;
+    cudaMemcpy(eng->d_position, &pos, sizeof(int64_t), cudaMemcpyHostToDevice);
     // Sync and check for errors after embedding
     cudaDeviceSynchronize();
     cudaError_t emb_err = cudaGetLastError();
@@ -380,7 +387,9 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
             &tb, eng->ctx[0].workspace, CUDA_R_16BF, 64,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         if (ts != CUBLAS_STATUS_SUCCESS)
+            fprintf(stderr, "[diag] GEMM on dev0 handle failed: %d\n", ts);
         else
+            fprintf(stderr, "[diag] GEMM on dev0 handle OK\n");
     }
 
     // 2. Layers
@@ -418,7 +427,7 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
             aw.input_norm_w_p1 = lw.input_norm_w_p1;
             forward_attention_layer(cublas, stream, act, ws, layer_out, &aw,
                                    eng->kv_caches[attn_idx], eng->cos_cache,
-                                   eng->sin_cache, nullptr, eng->seq_len + 1, &eng->dims);
+                                   eng->sin_cache, eng->d_position, eng->seq_len + 1, &eng->dims);
             attn_idx++;
         } else {
             GdnWeights gw;

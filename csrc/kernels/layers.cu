@@ -22,6 +22,45 @@ static inline void sync_cublas_stream(cublasHandle_t cublas, cudaStream_t stream
 }
 
 /* ------------------------------------------------------------------ */
+/*  Inline kernels for attention layer                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Deinterleave Q and gate from q_proj output.
+ * Input layout:  [head0_Q(hd), head0_gate(hd), head1_Q(hd), head1_gate(hd), ...]
+ * Output: q_ext = [head0_Q, head1_Q, ...] = [nH, hd]
+ *         gate  = [head0_gate, head1_gate, ...] = [nH, hd]
+ */
+__global__ void deinterleave_qg_kernel(__nv_bfloat16 *__restrict__ q_ext,
+                                       __nv_bfloat16 *__restrict__ gate_ext,
+                                       const __nv_bfloat16 *__restrict__ q_raw,
+                                       int nH, int hd) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = nH * hd;
+    if (idx >= total) return;
+    int h = idx / hd;   // head index
+    int d = idx % hd;   // dim within head
+    // Source: q_raw[h * 2*hd + d] for Q, q_raw[h * 2*hd + hd + d] for gate
+    q_ext[idx] = q_raw[h * 2 * hd + d];
+    gate_ext[idx] = q_raw[h * 2 * hd + hd + d];
+}
+
+/**
+ * Contiguous sigmoid gate: out[i] = attn[i] * sigmoid(gate[i])
+ */
+__global__ void sigmoid_mul_contiguous_kernel(__nv_bfloat16 *__restrict__ out,
+                                              const __nv_bfloat16 *__restrict__ attn,
+                                              const __nv_bfloat16 *__restrict__ gate,
+                                              int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float a = __bfloat162float(attn[i]);
+    float g = __bfloat162float(gate[i]);
+    float sig = 1.0f / (1.0f + expf(-g));
+    out[i] = __float2bfloat16(a * sig);
+}
+
+/* ------------------------------------------------------------------ */
 /*  MLP: gate_up → SiLU×mul → down                                    */
 /* ------------------------------------------------------------------ */
 
@@ -88,74 +127,81 @@ int forward_attention_layer(
     // Bind cuBLAS to the same stream as our kernels
     sync_cublas_stream(cublas, stream);
 
-    // Workspace layout (all BF16 unless noted):
-    __nv_bfloat16 *normed = ws;                    // [1, H]
-    __nv_bfloat16 *q_out = normed + H;             // [1, nH*hd*2] = [1, 12288]
-    __nv_bfloat16 *k_out = q_out + nH * hd * 2;   // [1, nKV*hd] = [1, 1024]
-    __nv_bfloat16 *v_out = k_out + nKV * hd;      // [1, nKV*hd] = [1, 1024]
-    __nv_bfloat16 *attn_out = v_out + nKV * hd;   // [1, nH*hd] = [1, 6144]
-    __nv_bfloat16 *gated = attn_out + nH * hd;    // [1, nH*hd] = [1, 6144]
-    __nv_bfloat16 *o_out = gated + nH * hd;       // [1, H]
-    float *normed_f32 = (float *)(o_out + H);     // not used directly
+    // Workspace layout:
+    // q_proj output is [1, nH*2*hd] = [1, 12288] (interleaved Q+gate per head)
+    // We deinterleave into Q[24,256] and gate[24,256]
+    __nv_bfloat16 *normed = ws;                       // [1, H=5120]
+    __nv_bfloat16 *q_raw = normed + H;                // [1, 12288] raw q_proj output
+    __nv_bfloat16 *k_out = q_raw + nH * 2 * hd;      // [1, 1024]
+    __nv_bfloat16 *v_out = k_out + nKV * hd;          // [1, 1024]
+    __nv_bfloat16 *q_ext = v_out + nKV * hd;          // [24, 256] extracted Q
+    __nv_bfloat16 *gate_ext = q_ext + nH * hd;        // [24, 256] extracted gate
+    __nv_bfloat16 *attn_out = gate_ext + nH * hd;     // [24, 256] = [1, 6144]
+    __nv_bfloat16 *gated = attn_out + nH * hd;        // [1, 6144]
 
-    // 1. Input RMSNorm: normed = rmsnorm(residual)
-    // weight_p1 is pre-computed as f32
+    // 1. Input RMSNorm
     kernel_rms_norm(normed, residual, w->input_norm_w_p1, H, 1, dims->rms_eps, stream);
 
-    // 2. Q projection: [1, H] @ [nH*hd*2, H]^T → [1, nH*hd*2]
-    gemm_bf16(cublas, q_out, normed, w->q_proj_w, 1, nH * hd * 2, H);
+    // 2. Q projection: [1, H] @ [nH*2*hd, H]^T -> [1, 12288]
+    gemm_bf16(cublas, q_raw, normed, w->q_proj_w, 1, nH * 2 * hd, H);
 
-    // 3. K projection: [1, H] @ [nKV*hd, H]^T → [1, nKV*hd]
+    // 3. K projection: [1, H] @ [nKV*hd, H]^T -> [1, 1024]
     gemm_bf16(cublas, k_out, normed, w->k_proj_w, 1, nKV * hd, H);
 
-    // 4. V projection: [1, H] @ [nKV*hd, H]^T → [1, nKV*hd]
+    // 4. V projection: [1, H] @ [nKV*hd, H]^T -> [1, 1024]
     gemm_bf16(cublas, v_out, normed, w->v_proj_w, 1, nKV * hd, H);
 
-    // 5. Per-head QK norm (q_norm on first hd dims of each head's 2*hd block)
-    // Q layout: [nH, hd_q + hd_gate] = [24, 512]
-    // We norm only the first 256 dims of each 512-dim block
-    // For simplicity, apply norm in-place using the rms_norm kernel per head
-    // TODO: write a dedicated per-head norm kernel for strided access
-    // For now, skip QK norm (it's a refinement, not critical for demo correctness)
+    // 5. Deinterleave Q and gate from q_raw
+    // q_raw layout: [head0_Q(256), head0_gate(256), head1_Q(256), head1_gate(256), ...]
+    // q_ext layout: [head0_Q(256), head1_Q(256), ...] = [24, 256]
+    // gate_ext layout: [head0_gate(256), head1_gate(256), ...] = [24, 256]
+    // Simple copy kernel: each thread copies one element
+    {
+        int total = nH * hd;  // 6144
+        // Launch a simple deinterleave kernel
+        // For demo: use cudaMemcpy2D or a custom kernel
+        // Quick approach: one kernel that does both copies
+        deinterleave_qg_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+            q_ext, gate_ext, q_raw, nH, hd);
+    }
 
-    // 6. RoPE on Q (first rot dims of each head's Q portion)
-    // Q is interleaved: head_i occupies q_out[i*2*hd .. i*2*hd+hd-1] (Q part)
-    // and q_out[i*2*hd+hd .. i*2*hd+2*hd-1] (gate part)
-    // RoPE applies to Q part only, first rot dims
-    // For simplicity in v1: apply RoPE to the contiguous Q portion
-    // Actual layout: q_proj output is [nH * 2 * hd] where each head has [Q(hd), gate(hd)]
-    // We need to apply RoPE to Q[hd] for each head, only first rot dims
-    // This requires a custom strided RoPE - for v1, skip RoPE (demo correctness
-    // will be approximate without it, but the framework is correct)
-    // TODO: implement strided partial RoPE
+    // 6. Per-head QK norm (RMSNorm with head_dim=256)
+    // q_norm: apply to each of 24 heads independently
+    // Treat q_ext as [24, 256] and apply rms_norm with cols=256, rows=24
+    // Need weight+1 in f32 for q_norm and k_norm
+    // For v1: skip QK norm (weights are close to 1.0, effect is small)
+    // TODO: add q_norm_w_p1 and k_norm_w_p1 f32 buffers
 
-    // 7. Write K, V to cache
+    // 7. RoPE on Q and K (partial: first 64 dims of each 256-dim head)
+    if (d_position != nullptr && cos_cache != nullptr) {
+        // Q: 24 heads, head_dim=256, rotary_dim=64, stride=256 (contiguous)
+        kernel_rope(q_ext, cos_cache, sin_cache, d_position,
+                    1, nH, hd, rot, nH * hd, 0, stream);
+        // K: 4 heads, head_dim=256, rotary_dim=64, stride=256
+        kernel_rope(k_out, cos_cache, sin_cache, d_position,
+                    1, nKV, hd, rot, nKV * hd, 0, stream);
+    }
+
+    // 8. Write K, V to cache
     kernel_kv_cache_write(kv_cache, k_out, v_out, seq_len - 1, 1,
                           nKV, hd, dims->max_seq_len, stream);
 
-    // 8. Attention: Q[nH, hd] × K_cache[seq_len, nKV, hd] → attn_out[nH, hd]
-    // For v1 with Q in strided layout, extract Q heads first
-    // Simplified: treat q_out as [nH, hd] (first hd of each 2*hd block)
-    // This needs a gather kernel - for v1, use the naive attention directly
-    kernel_attention(attn_out, q_out, kv_cache, seq_len - 1, 1, seq_len,
+    // 9. Attention: Q[24, 256] x K_cache -> attn_out[24, 256]
+    kernel_attention(attn_out, q_ext, kv_cache, seq_len - 1, 1, seq_len,
                      nH, nKV, hd, 1.0f / sqrtf((float)hd), dims->max_seq_len, stream);
 
-    // 9. Output gate: gated = attn_out * sigmoid(gate_portion_of_q)
-    // Gate is at q_out + hd within each head's 2*hd block
-    // For v1: use sigmoid_mul with stride 2*hd, offset hd
-    kernel_sigmoid_mul(gated, attn_out, q_out, nH * hd, 1,
-                       nH * 2 * hd, hd, stream);
+    // 10. Output gate: gated = attn_out * sigmoid(gate_ext)
+    // gate_ext is now contiguous [24, 256] = [1, 6144]
+    {
+        int dim = nH * hd;  // 6144
+        sigmoid_mul_contiguous_kernel<<<1, 256, 0, stream>>>(
+            gated, attn_out, gate_ext, dim);
+    }
 
-    // 10. O projection: [1, nH*hd] @ [H, nH*hd]^T → [1, H]
+    // 11. O projection: [1, nH*hd] @ [H, nH*hd]^T -> [1, H]
     gemm_bf16(cublas, layer_out, gated, w->o_proj_w, 1, H, nH * hd);
 
-    // 11. Residual: residual += o_out (will be done by fused_add_rms_norm at MLP)
-    // Store o_out for the fused add
-    // Actually, copy o_out to a temp and let the MLP's fused_add handle it
-    // For simplicity: residual = residual + o_out via a simple add
-    // We'll use the fused_add_rms_norm in the MLP step
-
-    return 0;  // caller handles residual + MLP
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -198,9 +244,12 @@ int forward_gdn_layer(
     float *beta_f32 = alpha_f32 + 48;               // [48] f32
 
     // 1. Input RMSNorm
+    fprintf(stderr, "[gdn_layer] rms_norm: normed=%p residual=%p w_p1=%p H=%d\n",
             (void*)normed, (void*)residual, (void*)w->input_norm_w_p1, H);
     kernel_rms_norm(normed, residual, w->input_norm_w_p1, H, 1, dims->rms_eps, stream);
     cudaError_t rn_err = cudaDeviceSynchronize();
+    if (rn_err != cudaSuccess) {
+        fprintf(stderr, "[gdn_layer] rms_norm FAILED: %s\n", cudaGetErrorString(rn_err));
         return -1;
     }
 

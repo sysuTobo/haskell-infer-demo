@@ -47,6 +47,8 @@ typedef struct {
     const __nv_bfloat16 *o_proj_w;      // [hidden, num_heads*head_dim] = [5120, 6144]
     const __nv_bfloat16 *q_norm_w;      // [head_dim] = [256]
     const __nv_bfloat16 *k_norm_w;      // [head_dim] = [256]
+    const float *q_norm_w_p1;           // [head_dim] f32 (weight+1)
+    const float *k_norm_w_p1;           // [head_dim] f32 (weight+1)
     const float *input_norm_w_p1;       // [hidden] f32
     MlpWeights mlp;
 } AttentionWeights;

@@ -60,6 +60,41 @@ __global__ void sigmoid_mul_contiguous_kernel(__nv_bfloat16 *__restrict__ out,
     out[i] = __float2bfloat16(a * sig);
 }
 
+/**
+ * Compute GDN alpha (decay) and beta (update gate) from projections.
+ * Formula (Mamba-style):
+ *   dt = softplus(a_out + dt_bias)
+ *   alpha = exp(-dt * exp(A_log))
+ *   beta = sigmoid(b_out)
+ * Grid: (1), Block: (num_v_heads=48)
+ */
+__global__ void gdn_compute_alpha_beta_kernel(
+    float *__restrict__ alpha,          // [nVH] output
+    float *__restrict__ beta,           // [nVH] output
+    const __nv_bfloat16 *__restrict__ a_out,  // [nVH] BF16
+    const __nv_bfloat16 *__restrict__ b_out,  // [nVH] BF16
+    const __nv_bfloat16 *__restrict__ A_log,  // [nVH] BF16
+    const __nv_bfloat16 *__restrict__ dt_bias,// [nVH] BF16
+    int nVH) {
+    int h = threadIdx.x;
+    if (h >= nVH) return;
+
+    float a = __bfloat162float(a_out[h]);
+    float b = __bfloat162float(b_out[h]);
+    float a_log = __bfloat162float(A_log[h]);
+    float bias = __bfloat162float(dt_bias[h]);
+
+    // dt = softplus(a + bias) = log(1 + exp(a + bias))
+    float x = a + bias;
+    float dt = (x > 20.0f) ? x : log1pf(expf(x));  // numerically stable softplus
+
+    // alpha = exp(-dt * exp(A_log))
+    alpha[h] = expf(-dt * expf(a_log));
+
+    // beta = sigmoid(b)
+    beta[h] = 1.0f / (1.0f + expf(-b));
+}
+
 /* ------------------------------------------------------------------ */
 /*  MLP: gate_up → SiLU×mul → down                                    */
 /* ------------------------------------------------------------------ */
@@ -165,12 +200,15 @@ int forward_attention_layer(
             q_ext, gate_ext, q_raw, nH, hd);
     }
 
-    // 6. Per-head QK norm (RMSNorm with head_dim=256)
-    // q_norm: apply to each of 24 heads independently
-    // Treat q_ext as [24, 256] and apply rms_norm with cols=256, rows=24
-    // Need weight+1 in f32 for q_norm and k_norm
-    // For v1: skip QK norm (weights are close to 1.0, effect is small)
-    // TODO: add q_norm_w_p1 and k_norm_w_p1 f32 buffers
+    // 6. Per-head QK norm (RMSNorm with head_dim=256, Gemma variant weight+1)
+    // q_ext is [24, 256] contiguous -> rms_norm with cols=256, rows=24
+    if (w->q_norm_w_p1) {
+        kernel_rms_norm(q_ext, q_ext, w->q_norm_w_p1, hd, nH, dims->rms_eps, stream);
+    }
+    // k_out is [4, 256] contiguous -> rms_norm with cols=256, rows=4
+    if (w->k_norm_w_p1) {
+        kernel_rms_norm(k_out, k_out, w->k_norm_w_p1, hd, nKV, dims->rms_eps, stream);
+    }
 
     // 7. RoPE on Q and K (partial: first 64 dims of each 256-dim head)
     if (d_position != nullptr && cos_cache != nullptr) {
@@ -269,14 +307,14 @@ int forward_gdn_layer(
     kernel_causal_conv1d(conv_out, qkv_out, w->conv1d_w, w->conv1d_bias,
                          conv_state, conv_dim, 1, dims->gdn_conv_kernel, stream);
 
-    // 7. Compute alpha and beta from a_out, b_out, A_log
-    // alpha = exp(A_log + a) (decay), beta = sigmoid(b) (update gate)
-    // For v1: copy a_out/b_out to f32 and compute on host... no, do it on device
-    // Simple approach: cast to f32 and use a small kernel
-    // TODO: write a dedicated alpha/beta computation kernel
-    // For now, use the cast kernel and compute in the delta rule kernel
-    kernel_cast_bf16_f32(alpha_f32, a_out, nVH, stream);
-    kernel_cast_bf16_f32(beta_f32, b_out, nVH, stream);
+    // 7. Compute alpha and beta from a_out, b_out, A_log, dt_bias
+    // Formula (Mamba-style gated delta rule):
+    //   dt = softplus(a_out + dt_bias)
+    //   alpha = exp(-dt * exp(A_log))   -- decay in (0, 1)
+    //   beta = sigmoid(b_out)           -- update gate in (0, 1)
+    gdn_compute_alpha_beta_kernel<<<1, nVH, 0, stream>>>(
+        alpha_f32, beta_f32, a_out, b_out,
+        w->A_log, w->dt_bias, nVH);
 
     // 8. Split conv_out into q[0:qk_dim], k[qk_dim:2*qk_dim], v[2*qk_dim:conv_dim]
     const __nv_bfloat16 *q_ptr = conv_out;

@@ -96,6 +96,8 @@ struct LayerWeights {
     __nv_bfloat16 *o_proj_w;        // [hidden, 6144]
     __nv_bfloat16 *q_norm_w;        // [256]
     __nv_bfloat16 *k_norm_w;        // [256]
+    float *q_norm_w_p1;             // derived f32 [256] (weight+1)
+    float *k_norm_w_p1;             // derived f32 [256] (weight+1)
     // GDN-specific
     __nv_bfloat16 *in_proj_qkv_w;   // [10240, hidden]
     __nv_bfloat16 *in_proj_z_w;     // [6144, hidden]
@@ -289,6 +291,11 @@ EngineHandle *engine_create(const char *model_dir, const EngineConfig *config) {
             load_weight(index, lp + "self_attn.o_proj.weight", (void**)&lw.o_proj_w, dev);
             load_weight(index, lp + "self_attn.q_norm.weight", (void**)&lw.q_norm_w, dev);
             load_weight(index, lp + "self_attn.k_norm.weight", (void**)&lw.k_norm_w, dev);
+            // Derive f32 weight+1 for QK norm
+            cudaMalloc(&lw.q_norm_w_p1, HEAD_DIM * sizeof(float));
+            kernel_weight_p1(lw.q_norm_w_p1, lw.q_norm_w, HEAD_DIM, 0);
+            cudaMalloc(&lw.k_norm_w_p1, HEAD_DIM * sizeof(float));
+            kernel_weight_p1(lw.k_norm_w_p1, lw.k_norm_w, HEAD_DIM, 0);
             // KV cache: [2, max_seq, num_kv_heads, head_dim]
             size_t kv_bytes = 2 * config->max_seq_len * NUM_KV_HEADS * HEAD_DIM * sizeof(__nv_bfloat16);
             __nv_bfloat16 *kv;
@@ -424,6 +431,7 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
             aw.q_proj_w = lw.q_proj_w; aw.k_proj_w = lw.k_proj_w;
             aw.v_proj_w = lw.v_proj_w; aw.o_proj_w = lw.o_proj_w;
             aw.q_norm_w = lw.q_norm_w; aw.k_norm_w = lw.k_norm_w;
+            aw.q_norm_w_p1 = lw.q_norm_w_p1; aw.k_norm_w_p1 = lw.k_norm_w_p1;
             aw.input_norm_w_p1 = lw.input_norm_w_p1;
             forward_attention_layer(cublas, stream, act, ws, layer_out, &aw,
                                    eng->kv_caches[attn_idx], eng->cos_cache,

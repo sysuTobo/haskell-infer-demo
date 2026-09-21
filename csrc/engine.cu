@@ -459,6 +459,14 @@ static int forward_token(EngineHandle *eng, int64_t token_id, float *h_logits) {
 
         // Residual add: act += mlp_out
         kernel_residual_add(act, mlp_out, HIDDEN, stream);
+        // Diagnostic: print residual after layer 0 (first token only)
+        if (i == 0 && eng->seq_len == 0) {
+            __nv_bfloat16 h_act[4];
+            cudaMemcpy(h_act, act, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[diag] after_layer0[0:4] = %.6f %.6f %.6f %.6f\n",
+                    __bfloat162float(h_act[0]), __bfloat162float(h_act[1]),
+                    __bfloat162float(h_act[2]), __bfloat162float(h_act[3]));
+        }
     }
 
     // 3. Final norm + lm_head on last device

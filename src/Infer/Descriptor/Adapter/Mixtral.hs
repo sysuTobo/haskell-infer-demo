@@ -106,7 +106,7 @@ moeDenseDescriptorFromConfig cfg tokenizer = do
     , dLayerMixers = replicate numLayers MFullAttention
     , dLayerFfns = map ffnFor [0 .. numLayers - 1]
     , dRoleTemplates = roles
-    , dRoleShards = allReplicated roles
+    , dRoleShards = defaultShards roles
     }
   where
     orElse (Just x) _ = Just x

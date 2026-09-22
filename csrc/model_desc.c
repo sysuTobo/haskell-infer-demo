@@ -500,6 +500,98 @@ int model_desc_role_index(const struct ModelDesc *desc, int role) {
     return -1;
 }
 
+/* Head count a role's output rows are grouped by (0 = the role is not
+ * head-grouped). Mirrors the engine's expected_shape for these roles. */
+static int role_heads(const struct ModelDesc *desc, int role) {
+    switch (role) {
+    case ROLE_ATTN_Q: return desc->num_heads;
+    case ROLE_ATTN_K:
+    case ROLE_ATTN_V: return desc->num_kv_heads;
+    default: return 0;
+    }
+}
+
+/* Which shard rules a role's tensor layout can carry; mirrors the Haskell
+ * validation so a hand-edited descriptor fails on both sides. */
+static int shard_rule_fits_role(int role, int rule) {
+    switch (rule) {
+    case ENGINE_SHARD_NONE: return 1;
+    case ENGINE_SHARD_OUT_HEADS:
+        return role == ROLE_ATTN_Q || role == ROLE_ATTN_K || role == ROLE_ATTN_V;
+    case ENGINE_SHARD_OUT_DIM: return role == ROLE_MLP_GATE || role == ROLE_MLP_UP;
+    case ENGINE_SHARD_IN_DIM: return role == ROLE_ATTN_O || role == ROLE_MLP_DOWN;
+    default: return 0;
+    }
+}
+
+int model_desc_shard_view(const struct ModelDesc *desc, int role,
+                          long long global_rows, long long global_cols, int rank,
+                          struct ShardView *out, char *err, size_t err_len) {
+    if (!desc || !out) {
+        fail(err, err_len, "model_desc_shard_view: null argument");
+        return -1;
+    }
+    out->row_off = 0;
+    out->rows = global_rows;
+    out->col_off = 0;
+    out->cols = global_cols;
+    const int tp = desc->tp_size > 0 ? desc->tp_size : 1;
+    if (tp == 1) return 0;
+    if (rank < 0 || rank >= tp) {
+        fail(err, err_len, "shard view rank %d is outside [0, %d)", rank, tp);
+        return -1;
+    }
+    const int slot = model_desc_role_index(desc, role);
+    const int rule = slot >= 0 && slot < desc->role_shard_count
+                         ? desc->role_shards[slot] : ENGINE_SHARD_NONE;
+    switch (rule) {
+    case ENGINE_SHARD_NONE:
+        return 0;
+    case ENGINE_SHARD_OUT_HEADS: {
+        const int heads = role_heads(desc, role);
+        if (heads <= 0) {
+            fail(err, err_len, "role %s cannot be split by heads", kRoleNames[role]);
+            return -1;
+        }
+        const long long per_head = global_rows / heads;
+        if (per_head * heads != global_rows) {
+            fail(err, err_len, "role %s: rows %lld are not a whole number of heads",
+                 kRoleNames[role], global_rows);
+            return -1;
+        }
+        if (heads % tp != 0) {
+            fail(err, err_len, "role %s: tp_size %d does not divide %d heads",
+                 kRoleNames[role], tp, heads);
+            return -1;
+        }
+        out->rows = per_head * (long long)(heads / tp);
+        out->row_off = out->rows * rank;
+        return 0;
+    }
+    case ENGINE_SHARD_OUT_DIM:
+        if (global_rows % tp != 0) {
+            fail(err, err_len, "role %s: tp_size %d does not divide %lld rows",
+                 kRoleNames[role], tp, global_rows);
+            return -1;
+        }
+        out->rows = global_rows / tp;
+        out->row_off = out->rows * rank;
+        return 0;
+    case ENGINE_SHARD_IN_DIM:
+        if (global_cols % tp != 0) {
+            fail(err, err_len, "role %s: tp_size %d does not divide %lld columns",
+                 kRoleNames[role], tp, global_cols);
+            return -1;
+        }
+        out->cols = global_cols / tp;
+        out->col_off = out->cols * rank;
+        return 0;
+    default:
+        fail(err, err_len, "role %s has an unknown shard rule %d", kRoleNames[role], rule);
+        return -1;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Validation                                                         */
 /* ------------------------------------------------------------------ */
@@ -561,6 +653,11 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
     for (int i = 0; i < d->role_shard_count; ++i) {
         if (d->role_shards[i] < 0 || d->role_shards[i] >= SHARD_KIND_COUNT) {
             fail(err, err_len, "role_shards entry %d is not a known shard rule", i);
+            return -1;
+        }
+        if (!shard_rule_fits_role(d->role_ids[i], d->role_shards[i])) {
+            fail(err, err_len, "role_shards uses a rule role %s cannot carry",
+                 kRoleNames[d->role_ids[i]]);
             return -1;
         }
     }

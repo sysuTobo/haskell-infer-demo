@@ -12,19 +12,26 @@ module Infer.Placement
   ) where
 
 import Data.List (nub)
+import Data.Maybe (fromMaybe)
 
 import Infer.Descriptor
 
 -- | Activation discipline. 'Pipelined' is the layer-wise split: each layer lives
 -- on one device and the residual hops device-to-device once per layer.
--- (Tensor/expert parallel policies join here once implemented.)
-data Policy = Pipelined
+-- 'Replicated' keeps the whole model on every device and splits the weights of
+-- the tensor-parallel roles (see 'defaultShards'); activations are replicated
+-- and reduced after each sharded sublayer. @ep@ is expert parallelism, which is
+-- validated here but lands in a later increment, so it must be 1 for now.
+data Policy = Pipelined | Replicated { rpTp :: Int, rpEp :: Int }
   deriving (Eq, Show)
 
 data Placement = Placement
   { plPolicy :: !Policy
   , plDevices :: [Int]            -- ^ CUDA device ordinals
-  , plLayerDevices :: [Int]       -- ^ per-layer device ordinal (length = num_layers)
+  , plLayerDevices :: [Int]       -- ^ per-layer device ordinal: the owner under
+                                  -- 'Pipelined'; the first device under
+                                  -- 'Replicated', where every device runs every
+                                  -- layer (the engine ignores this array then)
   , plLayersPerDevice :: [[Int]]  -- ^ layer indices per device, in device order
   } deriving (Eq, Show)
 
@@ -40,15 +47,70 @@ placement desc policy devices = do
   case length devices /= length (nub devices) of
     False -> Right ()
     True -> Left "duplicate device ordinals"
+  case policy of
+    Pipelined -> pipelined desc devices
+    Replicated tp ep -> replicated desc tp ep devices
+
+-- | Layer-wise (pipeline) split: every layer is owned by exactly one device.
+pipelined :: Descriptor -> [Int] -> Either String Placement
+pipelined desc devices = do
   case dNumLayers desc < length devices of
     True -> Left ("fewer layers (" ++ show (dNumLayers desc) ++ ") than devices ("
                   ++ show (length devices) ++ ")")
     False -> Right ()
   let assigned = contiguousSplit (dNumLayers desc) devices
       layerDevices = concat (zipWith (\dev ls -> replicate (length ls) dev) devices assigned)
-      result = Placement policy devices layerDevices assigned
+      result = Placement Pipelined devices layerDevices assigned
   validatePlacement desc result
   pure result
+
+-- | Replicated placement: @tp@ ranks holding shards of the same layers on
+-- @tp * ep@ devices, all running the full forward pass. The device list order is
+-- the rank order (rank r = devices !! r).
+replicated :: Descriptor -> Int -> Int -> [Int] -> Either String Placement
+replicated desc tp ep devices = do
+  check (tp < 1) "tp must be at least 1"
+  check (ep < 1) "ep must be at least 1"
+  check (ep /= 1) "expert parallel (ep > 1) is not implemented"
+  check (length devices /= tp * ep)
+    ("replicated placement needs tp * ep = " ++ show (tp * ep)
+     ++ " devices, got " ++ show (length devices))
+  case [msg | msg <- shardSizeProblems desc tp] of
+    [] -> Right ()
+    msg : _ -> Left msg
+  case [i | (i, FMoe) <- zip [0 :: Int ..] (dLayerFfns desc)] of
+    [] -> Right ()
+    i : _ -> Left ("layer " ++ show i ++ " is MoE; tensor parallelism with MoE layers"
+                   ++ " is not implemented yet (expert parallel lands separately)")
+  let layers = [0 .. dNumLayers desc - 1]
+      result = Placement (Replicated tp ep) devices
+                         (replicate (dNumLayers desc) (head devices))
+                         (replicate (length devices) layers)
+  validatePlacement desc result
+  pure result
+  where
+    check True message = Left message
+    check False _ = Right ()
+
+-- | The sharded roles need their split dimension to divide evenly by @tp@.
+shardSizeProblems :: Descriptor -> Int -> [String]
+shardSizeProblems desc tp =
+  concat
+    [ problem "num_heads" (dNumHeads desc) [RAttnQ]
+    , problem "num_kv_heads" (dNumKvHeads desc) [RAttnK, RAttnV]
+    , problem "num_heads * head_dim" (dNumHeads desc * dHeadDim desc) [RAttnO]
+    , problem "intermediate_size" (dIntermediateSize desc) [RMlpGate, RMlpUp, RMlpDown]
+    ]
+  where
+    rule role = fromMaybe ShardNone (lookup role (shardRules desc))
+    problem name size roles
+      | any ((/= ShardNone) . rule) roles && size `mod` tp /= 0 =
+          ["tp " ++ show tp ++ " does not divide " ++ name ++ " (" ++ show size ++ ")"]
+      | otherwise = []
+
+-- | The role table paired with its shard rules.
+shardRules :: Descriptor -> [(Role, ShardKind)]
+shardRules d = zip (map fst (dRoleTemplates d)) (dRoleShards d)
 
 -- | Layers are assigned contiguously: device 0 gets the first @ceil(n/d)@ layers,
 -- and so on, with the remainder spread over the first devices.

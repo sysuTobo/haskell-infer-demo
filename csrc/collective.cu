@@ -36,12 +36,20 @@ int peer_probe_all(const int *devices, int count, int enable) {
                     fprintf(stderr, "[engine] peer access %d->%d not enabled: %s\n",
                             devices[i], devices[j], cudaGetErrorString(enabled));
                 }
+                /* Peer access is process-wide and a second engine re-enables the
+                 * same pairs; that "already enabled" code is sticky and would be
+                 * picked up by the next cudaGetLastError() check, so consume it. */
+                (void)cudaGetLastError();
             }
         }
     }
     fprintf(stderr, "[engine] peer access: %d of %d ordered device pairs reachable%s\n",
             reachable, count * (count - 1),
             reachable ? "" : " (cross-device copies go through the host)");
+    /* Probing reports through stderr, never through the sticky error state: an
+     * expected "already enabled" code or a failed capability query would
+     * otherwise surface as a misleading error on the next checked CUDA call. */
+    (void)cudaGetLastError();
     return reachable;
 }
 

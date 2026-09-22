@@ -81,7 +81,7 @@ qwen3NextDescriptorFromConfig cfg tokenizer = do
     , dHeadDim = headDim
     , dRotaryDim = rotaryDim
     , dRotaryTheta = fromMaybe 1e7 (lookupDouble cfg "rope_theta")
-    , dNormStyle = "plain"
+    , dNormStyle = "gemma"
     , dAttnQkNorm = True
     , dAttnOutputGate = True
     , dQGateInterleave = True
@@ -110,7 +110,7 @@ qwen3NextDescriptorFromConfig cfg tokenizer = do
             then FMoe else FDense
         | i <- [0 .. numLayers - 1] ]
     , dRoleTemplates = weightRoles
-    , dRoleShards = allReplicated weightRoles
+    , dRoleShards = defaultShards weightRoles
     }
   where
     mixerOf :: String -> Either String MixerKind

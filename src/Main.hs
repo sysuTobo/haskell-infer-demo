@@ -44,6 +44,7 @@ data GenOptions = GenOptions
   { genModelDir  :: FilePath
   , genDesc      :: Maybe FilePath
   , genGpus      :: [Int]
+  , genTp        :: Int
   , genMaxSeqLen :: Int
   , genMaxTokens :: Int
   , genPrompt    :: String
@@ -77,6 +78,13 @@ generateCmd = Generate <$> (GenOptions
      <> value [0, 1]
      <> showDefault
      <> help "Comma-separated CUDA device ordinals"
+      )
+  <*> option auto
+      ( long "tp"
+     <> metavar "N"
+     <> value 1
+     <> showDefault
+     <> help "Tensor-parallel ranks: N > 1 keeps the whole model on N devices and loads weight shards"
       )
   <*> option auto
       ( long "max-seq-len"
@@ -252,6 +260,7 @@ runGenerate opts = do
         { rcModelDir  = genModelDir opts
         , rcDescriptor = genDesc opts
         , rcDevices   = genGpus opts
+        , rcTp        = genTp opts
         , rcMaxSeqLen = genMaxSeqLen opts
         , rcMaxTokens = genMaxTokens opts
         , rcPrompt    = genPrompt opts

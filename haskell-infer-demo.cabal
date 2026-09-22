@@ -29,6 +29,7 @@ executable haskell-infer-demo
                       Infer.Descriptor.Adapter.Json
                       Infer.Descriptor.Adapter.Mixtral
                       Infer.Descriptor.Adapter.Qwen35
+                      Infer.Descriptor.Adapter.Qwen3Next
                       Infer.Model
                       Infer.Placement
                       Infer.Runtime
@@ -70,12 +71,14 @@ test-suite infer-tests
                       Infer.Descriptor.Adapter.Json
                       Infer.Descriptor.Adapter.Mixtral
                       Infer.Descriptor.Adapter.Qwen35
+                      Infer.Descriptor.Adapter.Qwen3Next
                       Infer.Model
                       Infer.Placement
   build-depends:
                       base
                     , aeson
                     , bytestring
+                    , directory
                     , scientific >=0.3
                     , text
                     , vector

@@ -117,7 +117,25 @@ receives logits. This keeps the FFI surface small and auditable.
 - Cross-device: `cudaMemcpyPeerAsync` of activation [1, 5120] BF16 (10 KB)
 
 KV cache and GDN state are device-local — no cross-device state sharing.
-This is simpler than tensor parallelism and sufficient for single-request demo.
+
+### Tensor-parallel placement (replicated)
+
+`--tp N` keeps the whole model on every rank and splits only the weights the
+descriptor marks as shardable (the per-role rules a family adapter derives):
+attention q/k/v by head blocks (`out_heads`), o_proj and the MLP down projection
+by input columns (`in_dim`), gate/up by output rows (`out_dim`). Roles without a
+rule — norms, embeddings, GDN, MoE — stay whole: GDN keeps the head counts its
+AOT cubins were compiled with, and MoE keeps complete experts until expert
+parallelism lands. Every rank runs the full forward pass on replicated
+activations and a sublayer whose weights were split all-reduces its partial
+output (leader reduce + broadcast, `collective.cu`) before the residual add, so
+the residual stream stays identical across ranks.
+
+The TP logits are *not* bit-identical to the layer-wise split: split-K GEMM sums
+and the BF16 all-reduce reorder additions. The gate for the equivalence test
+(`tests/test_tp.py`) is identical greedy tokens plus logit RMS ≤ 0.05, well
+inside the engine-vs-PyTorch RMS (0.02–0.04 for this family); the layer-wise
+path itself stays bit-identical to the historical baseline.
 
 ### Model architecture (Qwen3.8-27B)
 
@@ -293,12 +311,12 @@ near-tie argmax; the reference's tied maxima are therefore accepted as a set.
 
 1. More model families (MoE, MLA) through new layer kinds in the descriptor
 2. More GPU targets (sm_89/sm_90a) via multi-arch SASS plus runtime cubin choice
-3. Tensor / expert parallel placement policies alongside the layer-wise split.
-   Note these are *not* numerically inert: layer-wise (pipeline-style) placement
-   does not split intra-layer reductions, but tensor parallel splits the
-   contraction dimension across ranks and expert parallel changes how expert
-   outputs are combined. Once either lands, logits become a function of device
-   count unless a fixed reduction tree is pinned in the execution contract.
+3. Expert parallel placement (shard whole experts across ranks) on top of the two
+   policies that exist today: layer-wise partitioning and replicated tensor
+   parallel. Note the numeric contract: layer-wise placement does not split
+   intra-layer reductions, while tensor parallel splits the contraction dimension
+   across ranks (measured equivalent within the documented RMS gate) and expert
+   parallel changes how expert outputs are combined.
 4. CUDA graph capture for decode, vocab-parallel argmax
 5. Sampling (temperature, top-p), HTTP API, streaming SSE
 6. A training framework (SFT, PPO, GRPO, DAPO, on-policy distillation) on small

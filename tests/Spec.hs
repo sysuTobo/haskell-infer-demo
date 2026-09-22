@@ -70,11 +70,11 @@ qwen38 = Descriptor
       | i <- [0 .. 63] ]
   , dLayerFfns = replicate 64 FDense
   , dRoleTemplates = qwen38Roles
-  , dRoleShards = allReplicated qwen38Roles
+  , dRoleShards = defaultShards qwen38Roles
   }
 
--- | Qwen3.8-27B weight templates; 'allReplicated' turns them into the default
--- (unsharded) role_shards table.
+-- | Qwen3.8-27B weight templates; 'defaultShards' derives the per-role
+-- tensor-parallel rules from them (no-ops while tp_size is 1).
 qwen38Roles :: [(Role, String)]
 qwen38Roles =
       [ (REmbed, "model.language_model.embed_tokens.weight")
@@ -185,22 +185,34 @@ main = hspec $ do
       -- single-rank, fully replicated layout.
       let withoutTp = dropDescriptorKeys ["tp_size", "tp_rank", "role_shards"]
                         (encodeDescriptor qwen38)
-      decodeDescriptor withoutTp `shouldBe` Right qwen38
+      decodeDescriptor withoutTp
+        `shouldBe` Right qwen38 { dRoleShards = allReplicated qwen38Roles }
       dTpSize qwen38 `shouldBe` 1
       dTpRank qwen38 `shouldBe` 0
-      dRoleShards qwen38
-        `shouldBe` replicate (length (dRoleTemplates qwen38)) ShardNone
+
+    it "derives the default shard rules from the role table" $ do
+      let ruleOf role = lookup role (zip (map fst (dRoleTemplates qwen38)) (dRoleShards qwen38))
+      ruleOf RAttnQ `shouldBe` Just ShardOutHeads
+      ruleOf RAttnK `shouldBe` Just ShardOutHeads
+      ruleOf RAttnV `shouldBe` Just ShardOutHeads
+      ruleOf RAttnO `shouldBe` Just ShardInDim
+      ruleOf RMlpGate `shouldBe` Just ShardOutDim
+      ruleOf RMlpUp `shouldBe` Just ShardOutDim
+      ruleOf RMlpDown `shouldBe` Just ShardInDim
+      -- Replicated roles: norms, embeddings and the GDN mixer stay whole.
+      ruleOf REmbed `shouldBe` Just ShardNone
+      ruleOf RInputNorm `shouldBe` Just ShardNone
+      ruleOf RGdnQkv `shouldBe` Just ShardNone
+      ruleOf RGdnOut `shouldBe` Just ShardNone
+
+    it "rejects a shard rule the role cannot carry" $ do
+      validateDescriptor qwen38 { dRoleShards = shardsFor qwen38 [(RGdnOut, ShardInDim)] }
+        `shouldSatisfy` mentions "role_shards uses a rule"
+      validateDescriptor qwen38 { dRoleShards = shardsFor qwen38 [(REmbed, ShardOutDim)] }
+        `shouldSatisfy` mentions "role_shards uses a rule"
 
     it "accepts and round-trips a TP2 descriptor with shard rules" $ do
-      let tp2 = qwen38
-            { dTpSize = 2
-            , dTpRank = 1
-            , dRoleShards = shardsFor qwen38
-                [ (RAttnQ, ShardOutHeads), (RAttnK, ShardOutHeads)
-                , (RAttnV, ShardOutHeads), (RAttnO, ShardInDim)
-                , (RMlpGate, ShardOutDim), (RMlpUp, ShardOutDim)
-                , (RMlpDown, ShardInDim), (RGdnOut, ShardInDim) ]
-            }
+      let tp2 = qwen38 { dTpSize = 2, dTpRank = 1 }
       validateDescriptor tp2 `shouldBe` Right ()
       decodeDescriptor (encodeDescriptor tp2) `shouldBe` Right tp2
       dTpRank tp2 `shouldBe` 1
@@ -269,6 +281,46 @@ main = hspec $ do
                       , dLayerMixers = [MFullAttention]
                       , dLayerFfns = [FDense]
                       } Pipelined [0, 1] `shouldSatisfy` isLeftResult
+
+  describe "Replicated placement (tensor parallel)" $ do
+    it "puts every layer on every rank" $ do
+      case modelDef qwen38 (Replicated 2 1) [0, 1] of
+        Left err -> expectationFailure err
+        Right md -> do
+          let allLayers = [0 .. 63 :: Int]
+          plLayersPerDevice (mdPlacement md) `shouldBe` [allLayers, allLayers]
+          length (plLayerDevices (mdPlacement md)) `shouldBe` 64
+          plPolicy (mdPlacement md) `shouldBe` Replicated 2 1
+
+    it "supports a four-way split of the Qwen3.8 dimensions" $ do
+      -- 24 heads / 4 = 6, 4 kv heads / 4 = 1, 17408 / 4 = 4352.
+      case modelDef qwen38 (Replicated 4 1) [0, 1, 2, 3] of
+        Left err -> expectationFailure err
+        Right md -> length (mdLayers md) `shouldBe` 64
+
+    it "rejects tp that does not divide the sharded dimensions" $ do
+      modelDef qwen38 (Replicated 5 1) [0, 1, 2, 3, 4]
+        `shouldSatisfy` mentions "does not divide num_heads"
+      modelDef qwen38 (Replicated 3 1) [0, 1, 2]
+        `shouldSatisfy` mentions "does not divide num_kv_heads"
+
+    it "leaves an all-whole role table alone at any tp" $ do
+      case modelDef qwen38 { dRoleShards = allReplicated qwen38Roles } (Replicated 5 1)
+             [0, 1, 2, 3, 4] of
+        Left err -> expectationFailure err
+        Right md -> length (plLayersPerDevice (mdPlacement md)) `shouldBe` 5
+
+    it "rejects a device count that does not match tp * ep" $ do
+      modelDef qwen38 (Replicated 2 1) [0] `shouldSatisfy` mentions "devices"
+      modelDef qwen38 (Replicated 2 1) [0, 1, 2] `shouldSatisfy` mentions "devices"
+
+    it "rejects expert parallelism until it is implemented" $ do
+      modelDef qwen38 (Replicated 2 2) [0, 1, 2, 3]
+        `shouldSatisfy` mentions "expert parallel"
+
+    it "rejects MoE layers under tensor parallel" $ do
+      modelDef qwen38 { dLayerFfns = replicate 64 FMoe } (Replicated 2 1) [0, 1]
+        `shouldSatisfy` mentions "MoE"
 
   describe "Config" $ do
     it "defaults to two GPUs and a 4096 context" $ do

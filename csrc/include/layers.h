@@ -129,6 +129,10 @@ struct LayerWeights {
     std::vector<void *> owned;
     /* Buffers cleared by engine_reset (KV cache / GDN conv and SSM state). */
     std::vector<std::pair<void *, size_t>> reset_zero;
+    /* Set when tensor parallelism actually split this sublayer's weights: the
+     * caller then all-reduces the sublayer's partial output across ranks. */
+    bool mixer_sharded = false;
+    bool ffn_sharded = false;
 };
 
 /* Debug taps: which layers get their activations dumped, and where. Enabled by
@@ -141,11 +145,10 @@ struct TapConfig {
 };
 
 void tap_parse_env(TapConfig *taps);
-void tap_dump(const TapConfig *taps, const char *kind, int layer, int device,
-              const __nv_bfloat16 *data, int tokens, const ModelDims *dims);
-/* Row width is explicit (GDN stages are wider than the hidden size) and the
- * producer's stream is synchronized first, so a tap inside a sub-layer cannot
- * race the kernels that wrote it (compute streams are nonblocking). */
+/* Dump one activation as raw float32 [tokens, cols] for comparison against the
+ * reference (tests/synth/taps.py). Row width is explicit (GDN stages are wider
+ * than the hidden size) and the producing stream is synchronized first, so a tap
+ * cannot race the kernels that wrote it (compute streams are nonblocking). */
 void tap_dump_rows(const TapConfig *taps, const char *kind, int layer, int device,
                    cudaStream_t stream, const __nv_bfloat16 *data, int tokens, int cols);
 
@@ -178,6 +181,14 @@ typedef struct {
  * Returns 0 on success or a non-zero kernel error status. */
 int forward_layer(const LayerContext *ctx, const struct LayerWeights *w,
                   const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out);
+
+/* The two halves of a layer, for callers that synchronize between them (tensor
+ * parallelism all-reduces the mixer/ffn output before the residual add). The
+ * partial results are written to layer_out; the residual stream is untouched. */
+int forward_mixer(const LayerContext *ctx, const struct LayerWeights *w,
+                  const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out);
+int forward_ffn(const LayerContext *ctx, const struct LayerWeights *w,
+                const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out);
 
 /* ------------------------------------------------------------------ */
 /* Cross-device primitives (collective.cu)                            */
@@ -250,6 +261,12 @@ struct TensorInfo {
 
 int safetensors_scan_dir(const char *model_dir, std::map<std::string, TensorInfo> &index);
 int safetensors_load_tensor(const TensorInfo &ti, void *dst, int device);
+/* Rectangular slice of a 2-D tensor: rows [row_off, row_off+rows) and, inside
+ * each row, elements [col_off, col_off+cols). Destination rows are contiguous
+ * (cols elements each). Whole-row slices are a single contiguous read. */
+int safetensors_load_tensor_slice(const TensorInfo &ti, void *dst, int device,
+                                  long long row_off, long long rows,
+                                  long long col_off, long long cols);
 /* Row-permuting variant: row i of [dst] receives row order[i] of the tensor.
  * Fused checkpoints store rows in the reference's own grouping, so the engine
  * gathers them into the contiguous views its kernels expect. */

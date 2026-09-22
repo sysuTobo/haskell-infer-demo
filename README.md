@@ -7,8 +7,9 @@ targeting **Qwen3.8-27B** (hybrid Full-Attention + GatedDeltaNet architecture).
 
 - **Haskell orchestration**: model definition, GPU partitioning and generation loop;
   a C ABI connects to the native weight loader and GPU operators.
-- **Multi-GPU layer partitioning**: 64 layers split across 2–8 GPUs (tested on 2× A40 46 GB).
-  Correctness-first; no tensor parallelism.
+- **Multi-GPU placement, two policies**: layer-wise partitioning (each device owns a
+  contiguous block of layers) and replicated tensor parallel (`--tp N`: every rank runs
+  the whole model with its weight shards). Tested on 2× A40 46 GB.
 - **Hybrid architecture support**: 16 full-attention layers (GQA, partial RoPE,
   output gate) + 48 GatedDeltaNet layers (causal conv1d, gated delta rule,
   gated RMSNorm).
@@ -115,6 +116,15 @@ committed snapshot; the C engine stays family-agnostic. `--descriptor FILE` work
 for `generate` too, and `--check-descriptor` makes the engine echo back the
 descriptor it parsed and fails the run if the two sides disagree.
 
+Placement is chosen on the command line: the default is the layer-wise split over
+`--gpus`, and `--tp N` switches to replicated tensor parallel (every device holds
+the whole model with its weight shards):
+
+```bash
+cabal run haskell-infer-demo -- generate --model-dir "$MODEL_DIR" --gpus 0,1 --tp 2 -p "Hello"
+python tests/test_tp.py --library csrc/build-libs/libengine.so --model-dir "$MODEL_DIR" --devices 0,1
+```
+
 Full-model validation uses independently generated reference logits:
 
 ```bash
@@ -195,13 +205,16 @@ migrated from handwritten CUDA to FlashInfer + FLA + causal-conv1d.
 | 6 | Multi-GPU engine, batched chunked prefill (≤128 tokens/chunk) | ✅ 2× A40 |
 | 7 | Tokenizer + CLI + greedy generation + streaming | ✅ coherent text |
 | 8 | End-to-end validation (27B logits, 433-token long sequence) | ✅ 20/20 argmax |
+| 9 | Descriptor-driven families (dense + MoE + Qwen3-Next), multi-arch SASS/PTX, placement policies | ✅ verified on sm_86 (A40); sm_89 operator suite on L20 |
 
 ## Design Decisions
 
 See [docs/design.md](docs/design.md) for the full architecture rationale.
 
 Key choices:
-- **Layer-wise partitioning** over tensor parallelism (correctness first)
+- **Two placement policies** from one descriptor: layer-wise partitioning and
+  replicated tensor parallel whose weight splits come from the descriptor's per-role
+  shard rules (no family knowledge in the engine)
 - **Library-backed operators** with a small native C ABI, not a wrapper around a serving engine
 - **Chunked prefill and recurrent decode** with reusable per-device scratch and state
 - **BF16** throughout (no quantization)

@@ -207,6 +207,56 @@ int safetensors_load_tensor_rows(const TensorInfo &ti, void *dst, int device,
 }
 
 /**
+ * Load a rectangular slice of a 2-D tensor to GPU memory: rows
+ * [row_off, row_off+rows) and, within each row, elements [col_off, col_off+cols).
+ * The destination holds `rows` contiguous rows of `cols` elements. Whole-row
+ * slices are one contiguous read; column slices stage a bounded number of rows
+ * through a host buffer.
+ */
+int safetensors_load_tensor_slice(const TensorInfo &ti, void *dst, int device,
+                                  long long row_off, long long rows,
+                                  long long col_off, long long cols) {
+    if (ti.ndim != 2 || rows <= 0 || cols <= 0) return -3;
+    const long long src_rows = ti.shape[0];
+    const long long src_cols = ti.shape[1];
+    if (row_off < 0 || col_off < 0 || row_off + rows > src_rows || col_off + cols > src_cols)
+        return -3;
+    const long long element = (long long)sizeof(__nv_bfloat16);
+    const long long src_row_bytes = src_cols * element;
+    const long long dst_row_bytes = cols * element;
+    const long long file_offset = ti.file_data_offset + ti.data_start;
+    FILE *f = fopen(ti.file_path.c_str(), "rb");
+    if (!f) return -1;
+    cudaSetDevice(device);
+    if (col_off == 0 && cols == src_cols) {
+        std::vector<char> host_buf((size_t)(rows * src_row_bytes));
+        fseek(f, file_offset + row_off * src_row_bytes, SEEK_SET);
+        size_t read = fread(host_buf.data(), 1, host_buf.size(), f);
+        fclose(f);
+        if ((long long)read != rows * src_row_bytes) return -2;
+        cudaMemcpy(dst, host_buf.data(), host_buf.size(), cudaMemcpyHostToDevice);
+        return 0;
+    }
+    const long long chunk_rows = std::min<long long>(rows, 64);
+    std::vector<char> host_buf((size_t)(chunk_rows * dst_row_bytes));
+    for (long long done = 0; done < rows; done += chunk_rows) {
+        const long long take = std::min(chunk_rows, rows - done);
+        for (long long r = 0; r < take; ++r) {
+            const long long offset = file_offset + (row_off + done + r) * src_row_bytes
+                                     + col_off * element;
+            fseek(f, offset, SEEK_SET);
+            size_t read = fread(host_buf.data() + (size_t)(r * dst_row_bytes), 1,
+                                (size_t)dst_row_bytes, f);
+            if ((long long)read != dst_row_bytes) { fclose(f); return -2; }
+        }
+        cudaMemcpy((char *)dst + done * dst_row_bytes, host_buf.data(),
+                   (size_t)(take * dst_row_bytes), cudaMemcpyHostToDevice);
+    }
+    fclose(f);
+    return 0;
+}
+
+/**
  * Scan model directory for all safetensors files and build a tensor index.
  */
 int safetensors_scan_dir(const char *model_dir, std::map<std::string, TensorInfo> &index) {

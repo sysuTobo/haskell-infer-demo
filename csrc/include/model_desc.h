@@ -161,6 +161,25 @@ int model_desc_validate(const struct ModelDesc *desc, char *err, size_t err_len)
 /* Index of a role in the descriptor's role table, or -1 if absent. */
 int model_desc_role_index(const struct ModelDesc *desc, int role);
 
+/* The slice of a role's tensor one tensor-parallel rank holds. With tp_size 1
+ * (or an ENGINE_SHARD_NONE rule) the view is the whole tensor. */
+struct ShardView {
+    long long row_off;   /* first row of the rank's shard */
+    long long rows;      /* rows the rank holds */
+    long long col_off;   /* first column of the rank's shard */
+    long long cols;      /* columns the rank holds */
+};
+
+/* Compute @rank@'s slice of a role whose checkpoint shape is [global_rows,
+ * global_cols]. The rank is explicit because one engine process holds every
+ * rank (device index == rank); @desc->tp_rank@ stays 0 there. Returns 0 on
+ * success, -1 with a message in err when the rule does not fit the role or the
+ * split is not even. The loader combines the view with the role's expected
+ * shape (engine.cu). */
+int model_desc_shard_view(const struct ModelDesc *desc, int role,
+                          long long global_rows, long long global_cols, int rank,
+                          struct ShardView *out, char *err, size_t err_len);
+
 /* Canonical JSON echo of the parsed descriptor. Returns the number of bytes
  * written (excluding the terminator) or -1 when the buffer is too small. */
 int model_desc_format(const struct ModelDesc *desc, char *buf, int buf_len);

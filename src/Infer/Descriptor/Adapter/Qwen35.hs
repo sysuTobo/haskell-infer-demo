@@ -98,7 +98,7 @@ qwen35DescriptorFromConfig tc tokenizer = do
     , dLayerMixers = mixers
     , dLayerFfns = replicate numLayers FDense
     , dRoleTemplates = weightRoles
-    , dRoleShards = allReplicated weightRoles
+    , dRoleShards = defaultShards weightRoles
     }
   where
     orElse (Just x) _ = Just x

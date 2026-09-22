@@ -74,8 +74,3 @@ void tap_dump_rows(const TapConfig *taps, const char *kind, int layer, int devic
     fwrite(expanded.data(), sizeof(float), elements, file);
     fclose(file);
 }
-
-void tap_dump(const TapConfig *taps, const char *kind, int layer, int device,
-              const __nv_bfloat16 *data, int tokens, const ModelDims *dims) {
-    tap_dump_rows(taps, kind, layer, device, nullptr, data, tokens, dims->hidden_size);
-}

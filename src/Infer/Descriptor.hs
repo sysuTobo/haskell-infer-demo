@@ -26,6 +26,7 @@ module Infer.Descriptor
   , roleName
   , shardName
   , allReplicated
+  , defaultShards
   , kvBytesPerToken
   , attentionLayers
   , gdnLayers
@@ -104,6 +105,43 @@ shardName ShardInDim = "in_dim"
 -- replicated, i.e. the historical single-rank behaviour.
 allReplicated :: [(Role, String)] -> [ShardKind]
 allReplicated = map (const ShardNone)
+
+-- | The shard rules a role table gets by default: the projections whose output
+-- is split by head (@q/k/v@), the row-parallel halves of a dense MLP
+-- (@gate\/up@), their column-parallel counterparts (@o_proj@, MLP @down@), and
+-- replication for everything else (norms, embeddings, GDN, MoE -- expert
+-- sharding is a different rule and lands with expert parallelism).
+--
+-- With @tp_size == 1@ every rule is a no-op, so a replicated descriptor keeps
+-- the historical numerics; the rules only describe how a tensor would be split.
+defaultShards :: [(Role, String)] -> [ShardKind]
+defaultShards = map (defaultShard . fst)
+
+-- | See 'defaultShards'. Keeping this per role (rather than per family) means
+-- every adapter describes the same tensor semantics.
+defaultShard :: Role -> ShardKind
+defaultShard role = case role of
+  RAttnQ -> ShardOutHeads
+  RAttnK -> ShardOutHeads
+  RAttnV -> ShardOutHeads
+  RAttnO -> ShardInDim
+  RMlpGate -> ShardOutDim
+  RMlpUp -> ShardOutDim
+  RMlpDown -> ShardInDim
+  _ -> ShardNone
+
+-- | Which shard rules a role's tensor layout can carry. The engine enforces the
+-- same restriction when it loads a shard.
+shardFitsRole :: Role -> ShardKind -> Bool
+shardFitsRole _ ShardNone = True
+shardFitsRole role ShardOutHeads = role `elem` [RAttnQ, RAttnK, RAttnV]
+shardFitsRole role ShardOutDim = role `elem` [RMlpGate, RMlpUp]
+shardFitsRole role ShardInDim = role `elem` [RAttnO, RMlpDown]
+
+-- | The role table paired with its shard rules (truncated to the shorter side
+-- when a descriptor is malformed; the parallel-length check reports that).
+shardRules :: Descriptor -> [(Role, ShardKind)]
+shardRules d = zip (map fst (dRoleTemplates d)) (dRoleShards d)
 
 -- | Wire name of a role: the constructor with its leading @R@ dropped and the
 -- first letter lowercased (@REmbed@ -> @embed@, @RAttnQNorm@ -> @attnQNorm@).
@@ -461,6 +499,8 @@ checks d =
         "tp_rank must be in [0, tp_size)"
   , err (length (dRoleShards d) /= length (dRoleTemplates d))
         "role_shards must be parallel to role_names/role_templates"
+  , err (not (all (uncurry shardFitsRole) (shardRules d)))
+        "role_shards uses a rule the role cannot carry (out_heads: attn q/k/v; out_dim: mlp gate/up; in_dim: attn o / mlp down)"
   , err (null (dEosTokens d)) "eos_tokens must not be empty"
   , err (any (\t -> t < 0 || t >= dVocabSize d) (dEosTokens d))
         "eos_tokens must be within the vocabulary"

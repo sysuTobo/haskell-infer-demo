@@ -22,6 +22,37 @@ static int with_cuda_error(int status) {
 }
 
 static int run_mixer(const LayerContext *ctx, const struct LayerWeights *w,
+                     const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out);
+static int run_ffn(const LayerContext *ctx, const struct LayerWeights *w,
+                   const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out);
+
+int forward_mixer(const LayerContext *ctx, const struct LayerWeights *w,
+                  const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out) {
+    int status = with_cuda_error(run_mixer(ctx, w, residual, layer_out));
+    if (status != 0) {
+        fprintf(stderr, "[engine] layer %d mixer kind %d failed (status %d)\n",
+                ctx->layer_index, w->plan.mixer, status);
+        return status;
+    }
+    tap_dump_rows(ctx->taps, "mixer", ctx->layer_index, ctx->device, ctx->stream, layer_out,
+                  ctx->tokens, ctx->dims->hidden_size);
+    return 0;
+}
+
+int forward_ffn(const LayerContext *ctx, const struct LayerWeights *w,
+                const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out) {
+    int status = with_cuda_error(run_ffn(ctx, w, residual, layer_out));
+    if (status != 0) {
+        fprintf(stderr, "[engine] layer %d ffn kind %d failed (status %d)\n",
+                ctx->layer_index, w->plan.ffn, status);
+        return status;
+    }
+    tap_dump_rows(ctx->taps, "ffn", ctx->layer_index, ctx->device, ctx->stream, layer_out,
+                  ctx->tokens, ctx->dims->hidden_size);
+    return 0;
+}
+
+static int run_mixer(const LayerContext *ctx, const struct LayerWeights *w,
                      const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out) {
     switch (w->plan.mixer) {
     case ENGINE_MIXER_FULL_ATTN: {
@@ -83,13 +114,8 @@ int forward_layer(const LayerContext *ctx, const struct LayerWeights *w,
                   const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out) {
     const size_t elements = (size_t)ctx->tokens * ctx->dims->hidden_size;
 
-    int status = with_cuda_error(run_mixer(ctx, w, residual, layer_out));
-    if (status != 0) {
-        fprintf(stderr, "[engine] layer %d mixer kind %d failed (status %d)\n",
-                ctx->layer_index, w->plan.mixer, status);
-        return status;
-    }
-    tap_dump(ctx->taps, "mixer", ctx->layer_index, ctx->device, layer_out, ctx->tokens, ctx->dims);
+    int status = forward_mixer(ctx, w, residual, layer_out);
+    if (status != 0) return status;
     kernel_residual_add(const_cast<__nv_bfloat16 *>(residual), layer_out, elements, ctx->stream);
     status = with_cuda_error(0);
     if (status != 0) {
@@ -98,13 +124,8 @@ int forward_layer(const LayerContext *ctx, const struct LayerWeights *w,
         return status;
     }
 
-    status = with_cuda_error(run_ffn(ctx, w, residual, layer_out));
-    if (status != 0) {
-        fprintf(stderr, "[engine] layer %d ffn kind %d failed (status %d)\n",
-                ctx->layer_index, w->plan.ffn, status);
-        return status;
-    }
-    tap_dump(ctx->taps, "ffn", ctx->layer_index, ctx->device, layer_out, ctx->tokens, ctx->dims);
+    status = forward_ffn(ctx, w, residual, layer_out);
+    if (status != 0) return status;
     kernel_residual_add(const_cast<__nv_bfloat16 *>(residual), layer_out, elements, ctx->stream);
     status = with_cuda_error(0);
     if (status != 0) {

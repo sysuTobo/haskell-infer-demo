@@ -179,41 +179,53 @@ struct DeviceCtx {
     cublasHandle_t cublas = nullptr;
     cudaStream_t stream = nullptr;
     cudaEvent_t copy_event = nullptr;   // orders cross-device copies
-    __nv_bfloat16 *residual = nullptr;   // [128, hidden]
+    __nv_bfloat16 *residual = nullptr;   // [max_chunk, hidden]
     __nv_bfloat16 *layer_out = nullptr;  // Never aliases layer/MLP scratch.
     __nv_bfloat16 *workspace = nullptr;
+    __nv_bfloat16 *embed_w = nullptr;       // replicated: one copy per rank
+    __nv_bfloat16 *lm_head_w = nullptr;     // logits device only
+    __nv_bfloat16 *final_norm_w = nullptr;  // logits device only
+    float *d_logits = nullptr;              // logits device only
+    int64_t *token_ids = nullptr;
     __nv_bfloat16 *conv_bias_zero = nullptr;
     int64_t *positions = nullptr;
     void *fla_scratch = nullptr;
     void *moe_scratch = nullptr;
+    __nv_bfloat16 *reduce_staging = nullptr;  // rank-0 all-reduce scratch
     size_t ws_size = 0;
     size_t fla_size = 0;
     size_t moe_ws_size = 0;
 };
 
 struct EngineHandle {
-    ModelDims dims{};
+    ModelDims dims{};            // full (checkpoint) dimensions
+    ModelDims local_dims{};      // rank dimensions: heads and the dense MLP are
+                                 // divided by tp_size; everything else is global
     struct ModelDesc desc{};
     int num_layers = 0;      // layers actually allocated (0 before parsing succeeds)
     int num_devices = 0;
+    bool replicated = false; // tp_size > 1: every rank holds and runs every layer
+    int tp_size = 1;
     std::vector<int> devices;
     std::vector<int> layer_device;      // Internal indices, not CUDA ordinals.
     DeviceCtx *ctx = nullptr;
-    LayerWeights *layers = nullptr;
-    __nv_bfloat16 *embed_w = nullptr;   // First configured device.
-    int64_t *token_ids = nullptr;
-    __nv_bfloat16 *lm_head_w = nullptr; // Last configured device.
-    __nv_bfloat16 *final_norm_w = nullptr;
-    float *d_logits = nullptr;
+    LayerWeights *layers = nullptr;     // num_layers entries, or num_layers * ranks
+                                        // when replicated (layer-major)
     int seq_len = 0;
     bool state_valid = true;
     /* Debug taps: INFER_TAP_LAYERS / INFER_TAP_DIR, see tap.cu. */
     TapConfig taps;
 };
 
-static size_t kv_cache_bytes(const EngineHandle *eng) {
-    return (size_t)2 * eng->dims.max_seq_len * eng->dims.num_kv_heads *
-           eng->dims.head_dim * sizeof(__nv_bfloat16);
+/* Weights of `layer` on device index `dev` (rank index when replicated). */
+static LayerWeights &layer_weights(EngineHandle *eng, int layer, int dev) {
+    return eng->replicated ? eng->layers[layer * eng->num_devices + dev]
+                           : eng->layers[layer];
+}
+
+static size_t kv_cache_bytes(const ModelDims &dims) {
+    return (size_t)2 * dims.max_seq_len * dims.num_kv_heads *
+           dims.head_dim * sizeof(__nv_bfloat16);
 }
 
 static size_t conv_state_bytes(const EngineHandle *eng) {
@@ -267,6 +279,42 @@ static void load_role(const std::map<std::string, TensorInfo> &index,
         throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + ti.name);
     // The loader uploads on the default stream; compute streams are nonblocking.
     check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
+}
+
+/* Load a role honouring the descriptor's shard rule: this rank keeps only its
+ * slice of the checkpoint tensor. `sharded` reports whether the rule actually
+ * split the tensor -- the sublayer then all-reduces its output across ranks. */
+static void load_role_view(const std::map<std::string, TensorInfo> &index,
+                           const struct ModelDesc &desc, int role, int layer,
+                           int device, int rank, __nv_bfloat16 **dst, bool *sharded) {
+    *sharded = false;
+    const int slot = model_desc_role_index(&desc, role);
+    const int rule = slot >= 0 && slot < desc.role_shard_count
+                         ? desc.role_shards[slot] : ENGINE_SHARD_NONE;
+    if (desc.tp_size <= 1 || rule == ENGINE_SHARD_NONE) {
+        load_role(index, desc, role, layer, device, dst);
+        return;
+    }
+    const TensorInfo &ti = find_role(index, desc, role, layer);
+    if (ti.ndim != 2)
+        throw EngineError(ENGINE_ERR_WEIGHTS,
+                          std::string("Cannot shard a non-2-D tensor: ") + ti.name);
+    struct ShardView view;
+    char err[256] = {0};
+    if (model_desc_shard_view(&desc, role, ti.shape[0], ti.shape[1], rank, &view, err,
+                              sizeof(err)) != 0)
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Shard view: ") + err);
+    check_cuda(cudaSetDevice(device), "Set weight device");
+    check_cuda(cudaMalloc(dst, (size_t)(view.rows * view.cols) * sizeof(__nv_bfloat16)),
+               "Allocate weight shard");
+    int status = safetensors_load_tensor_slice(ti, *dst, device, view.row_off, view.rows,
+                                               view.col_off, view.cols);
+    check_cuda(cudaGetLastError(), "Upload weight shard");
+    if (status != 0)
+        throw EngineError(ENGINE_ERR_WEIGHTS,
+                          std::string("Cannot load tensor slice: ") + ti.name);
+    check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
+    *sharded = true;
 }
 
 /* Load a role's rows gathered into the order `order` names (see the fused GDN
@@ -353,6 +401,78 @@ static void load_expert_role(const std::map<std::string, TensorInfo> &index,
         throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + name);
 }
 
+/* MoE weights of one layer on one device. Tensor parallelism rejects MoE
+ * layers (expert parallelism lands separately), so these are always whole. */
+static void load_moe_weights(const std::map<std::string, TensorInfo> &index,
+                             EngineHandle *eng, LayerWeights &lw, int layer, int device) {
+    const int hidden = eng->dims.hidden_size;
+    const int experts = eng->desc.moe_num_experts;
+    const int inner = eng->desc.moe_intermediate_size;
+    const int shared = eng->desc.moe_num_shared_experts;
+    lw.moe_config = MoeConfig{experts, eng->desc.moe_top_k, inner,
+                              eng->desc.moe_norm_topk_prob,
+                              strcmp(eng->desc.moe_router_scoring, "sigmoid") == 0,
+                              (float)eng->desc.moe_routed_scaling_factor,
+                              shared, eng->desc.moe_shared_intermediate_size,
+                              eng->desc.moe_shared_gate_scalar};
+    __nv_bfloat16 *router = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
+    load_role(index, eng->desc, ROLE_MOE_ROUTER, layer, device, &router);
+    const size_t gate_bytes = (size_t)experts * inner * hidden * sizeof(__nv_bfloat16);
+    const size_t down_bytes = (size_t)experts * hidden * inner * sizeof(__nv_bfloat16);
+    check_cuda(cudaMalloc(&gate, gate_bytes), "Allocate expert gate weights");
+    check_cuda(cudaMalloc(&up, gate_bytes), "Allocate expert up weights");
+    check_cuda(cudaMalloc(&down, down_bytes), "Allocate expert down weights");
+    for (int e = 0; e < experts; ++e) {
+        load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_GATE, layer, e, device,
+                         gate + (size_t)e * inner * hidden);
+        load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_UP, layer, e, device,
+                         up + (size_t)e * inner * hidden);
+        load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_DOWN, layer, e, device,
+                         down + (size_t)e * hidden * inner);
+    }
+    check_cuda(cudaStreamSynchronize(nullptr), "Finish expert weight upload");
+    if (shared > 0) {
+        const int shared_inner = eng->desc.moe_shared_intermediate_size;
+        const size_t shared_gate_bytes =
+            (size_t)shared * shared_inner * hidden * sizeof(__nv_bfloat16);
+        const size_t shared_down_bytes =
+            (size_t)shared * hidden * shared_inner * sizeof(__nv_bfloat16);
+        __nv_bfloat16 *sgate = nullptr, *sup = nullptr, *sdown = nullptr;
+        check_cuda(cudaMalloc(&sgate, shared_gate_bytes), "Allocate shared gate");
+        check_cuda(cudaMalloc(&sup, shared_gate_bytes), "Allocate shared up");
+        check_cuda(cudaMalloc(&sdown, shared_down_bytes), "Allocate shared down");
+        for (int e = 0; e < shared; ++e) {
+            load_expert_role(index, eng->desc, ROLE_MOE_SHARED_GATE, layer, e, device,
+                             sgate + (size_t)e * shared_inner * hidden);
+            load_expert_role(index, eng->desc, ROLE_MOE_SHARED_UP, layer, e, device,
+                             sup + (size_t)e * shared_inner * hidden);
+            load_expert_role(index, eng->desc, ROLE_MOE_SHARED_DOWN, layer, e, device,
+                             sdown + (size_t)e * hidden * shared_inner);
+        }
+        lw.moe.shared_gate = sgate;
+        lw.moe.shared_up = sup;
+        lw.moe.shared_down = sdown;
+        lw.owned.push_back(sgate);
+        lw.owned.push_back(sup);
+        lw.owned.push_back(sdown);
+        if (eng->desc.moe_shared_gate_scalar) {
+            __nv_bfloat16 *scalar_w = nullptr;
+            load_role(index, eng->desc, ROLE_MOE_SHARED_GATE_SCALAR, layer, device, &scalar_w);
+            lw.moe.shared_gate_scalar_w = scalar_w;
+            lw.owned.push_back(scalar_w);
+        }
+    }
+    lw.moe.post_norm_w = lw.post_norm_w;
+    lw.moe.router_w = router;
+    lw.moe.experts_gate = gate;
+    lw.moe.experts_up = up;
+    lw.moe.experts_down = down;
+    lw.owned.push_back(router);
+    lw.owned.push_back(gate);
+    lw.owned.push_back(up);
+    lw.owned.push_back(down);
+}
+
 /* Field that receives a role's tensor for the given layer kind. */
 static __nv_bfloat16 **role_target(LayerWeights &lw, int role) {
     switch (role) {
@@ -413,6 +533,17 @@ static void fill_dims(ModelDims &dims, const struct ModelDesc &desc) {
     dims.gdn_conv_kernel = desc.gdn_conv_kernel;
 }
 
+/* Rank dimensions: the sharded roles divide the attention heads and the dense
+ * MLP; everything else (GDN, norms, embeddings) stays whole. */
+static void fill_local_dims(ModelDims &dims, const ModelDims &global, int tp) {
+    dims = global;
+    if (tp > 1) {
+        dims.num_heads = global.num_heads / tp;
+        dims.num_kv_heads = global.num_kv_heads / tp;
+        dims.intermediate_size = global.intermediate_size / tp;
+    }
+}
+
 EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                             int num_devices, const int *devices,
                             const int *layer_devices) {
@@ -450,12 +581,43 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                 throw EngineError(ENGINE_ERR_CONFIG,
                                   "mla mixer layers are not implemented in this build");
         }
+        /* tp_size > 1 selects the replicated policy: every rank holds every
+         * layer with its shard of the weight, all activations are replicated and
+         * a sublayer whose weights were split all-reduces its output. */
+        eng->tp_size = eng->desc.tp_size > 1 ? eng->desc.tp_size : 1;
+        eng->replicated = eng->desc.tp_size > 1;
+        if (eng->replicated) {
+            if (eng->desc.tp_rank != 0)
+                throw EngineError(ENGINE_ERR_CONFIG,
+                                  "this engine process holds every rank; tp_rank must be 0");
+            if (num_devices != eng->tp_size)
+                throw EngineError(ENGINE_ERR_CONFIG,
+                                  "replicated placement needs exactly tp_size devices");
+            if (eng->dims.num_heads % eng->tp_size != 0 ||
+                eng->dims.num_kv_heads % eng->tp_size != 0)
+                throw EngineError(ENGINE_ERR_CONFIG, "tp_size does not divide the attention heads");
+            if (eng->dims.intermediate_size % eng->tp_size != 0)
+                throw EngineError(ENGINE_ERR_CONFIG, "tp_size does not divide intermediate_size");
+            for (int i = 0; i < num_layers; ++i) {
+                if (eng->desc.layer_ffns[i] == ENGINE_FFN_MOE)
+                    throw EngineError(ENGINE_ERR_CONFIG,
+                                      "MoE layers under tensor parallel are not implemented");
+            }
+            fill_local_dims(eng->local_dims, eng->dims, eng->tp_size);
+        } else {
+            eng->local_dims = eng->dims;
+        }
         eng->layer_device.resize(num_layers);
-        for (int i = 0; i < num_layers; ++i) {
-            auto it = std::find(eng->devices.begin(), eng->devices.end(), layer_devices[i]);
-            if (it == eng->devices.end())
-                throw EngineError(ENGINE_ERR_CONFIG, "Layer assigned to an unconfigured device");
-            eng->layer_device[i] = (int)(it - eng->devices.begin());
+        if (eng->replicated) {
+            /* Every device runs every layer; the per-layer owner array is unused. */
+            for (int i = 0; i < num_layers; ++i) eng->layer_device[i] = 0;
+        } else {
+            for (int i = 0; i < num_layers; ++i) {
+                auto it = std::find(eng->devices.begin(), eng->devices.end(), layer_devices[i]);
+                if (it == eng->devices.end())
+                    throw EngineError(ENGINE_ERR_CONFIG, "Layer assigned to an unconfigured device");
+                eng->layer_device[i] = (int)(it - eng->devices.begin());
+            }
         }
 
         peer_probe_all(eng->devices.data(), eng->num_devices, 1);
@@ -468,7 +630,8 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
 
         const int hidden = eng->dims.hidden_size;
         eng->ctx = new DeviceCtx[eng->num_devices]();
-        eng->layers = new LayerWeights[num_layers]();
+        const int layer_slots = eng->replicated ? num_layers * eng->num_devices : num_layers;
+        eng->layers = new LayerWeights[layer_slots]();
         const int max_chunk = eng->dims.max_chunk;
         bool has_gdn = false;
         for (int i = 0; i < num_layers; ++i)
@@ -485,8 +648,14 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             check_cublas(cublasSetStream(ctx.cublas, ctx.stream), "Set cuBLAS stream");
             check_cuda(cudaMalloc(&ctx.residual, activation_bytes), "Allocate residual");
             check_cuda(cudaMalloc(&ctx.layer_out, activation_bytes), "Allocate layer output");
-            ctx.ws_size = layer_workspace_size(max_chunk, &eng->dims);
+            ctx.ws_size = layer_workspace_size(max_chunk, &eng->local_dims);
             check_cuda(cudaMalloc(&ctx.workspace, ctx.ws_size), "Allocate layer workspace");
+            check_cuda(cudaMalloc(&ctx.token_ids, max_chunk * sizeof(int64_t)),
+                       "Allocate token IDs");
+            if (eng->replicated && d == 0) {
+                check_cuda(cudaMalloc(&ctx.reduce_staging, activation_bytes),
+                           "Allocate reduce staging");
+            }
                     ctx.moe_scratch = nullptr;
             if (has_gdn) {
                 ctx.fla_size = kernel_fla_workspace_size(max_chunk, eng->dims.gdn_num_v_heads);
@@ -504,142 +673,105 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             }
         }
 
-        load_role(index, eng->desc, ROLE_EMBED, 0, eng->devices.front(), &eng->embed_w);
-        check_cuda(cudaMalloc(&eng->token_ids, max_chunk * sizeof(int64_t)), "Allocate token IDs");
-        load_role(index, eng->desc, ROLE_LM_HEAD, 0, eng->devices.back(), &eng->lm_head_w);
-        load_role(index, eng->desc, ROLE_FINAL_NORM, 0, eng->devices.back(), &eng->final_norm_w);
-        check_cuda(cudaMalloc(&eng->d_logits, eng->dims.vocab_size * sizeof(float)), "Allocate logits");
+        /* The embedding is replicated on every rank; the logits side of the
+         * model (final norm, LM head, logits buffer) stays on the last device. */
+        for (int d = 0; d < eng->num_devices; ++d) {
+            if (!eng->replicated && d > 0) break;
+            load_role(index, eng->desc, ROLE_EMBED, 0, eng->devices[d], &eng->ctx[d].embed_w);
+        }
+        {
+            DeviceCtx &last = eng->ctx[eng->num_devices - 1];
+            load_role(index, eng->desc, ROLE_LM_HEAD, 0, last.device_id, &last.lm_head_w);
+            load_role(index, eng->desc, ROLE_FINAL_NORM, 0, last.device_id, &last.final_norm_w);
+            check_cuda(cudaMalloc(&last.d_logits, eng->dims.vocab_size * sizeof(float)),
+                       "Allocate logits");
+        }
 
+        const int ranks = eng->replicated ? eng->num_devices : 1;
         for (int i = 0; i < num_layers; ++i) {
-            DeviceCtx &ctx = eng->ctx[eng->layer_device[i]];
-            check_cuda(cudaSetDevice(ctx.device_id), "Load layer device");
-            LayerWeights &lw = eng->layers[i];
-            lw.plan.mixer = eng->desc.layer_mixers[i];
-            lw.plan.ffn = eng->desc.layer_ffns[i];
-            for (int role = 0; role < ROLE_COUNT; ++role) {
-                if (!role_used_by_layer(role, lw.plan.mixer, lw.plan.ffn)) continue;
-                if (model_desc_role_index(&eng->desc, role) < 0) continue;
-                __nv_bfloat16 **target = role_target(lw, role);
-                if (target == nullptr) continue;
-                load_role(index, eng->desc, role, i, ctx.device_id, target);
-                lw.owned.push_back(*target);
-            }
-            if (lw.plan.ffn == ENGINE_FFN_MOE) {
-                const int experts = eng->desc.moe_num_experts;
-                const int inner = eng->desc.moe_intermediate_size;
-                const int shared = eng->desc.moe_num_shared_experts;
-                lw.moe_config = MoeConfig{experts, eng->desc.moe_top_k, inner,
-                                          eng->desc.moe_norm_topk_prob,
-                                          strcmp(eng->desc.moe_router_scoring, "sigmoid") == 0,
-                                          (float)eng->desc.moe_routed_scaling_factor,
-                                          shared, eng->desc.moe_shared_intermediate_size,
-                                          eng->desc.moe_shared_gate_scalar};
-                __nv_bfloat16 *router = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
-                load_role(index, eng->desc, ROLE_MOE_ROUTER, i, ctx.device_id, &router);
-                const size_t gate_bytes = (size_t)experts * inner * hidden * sizeof(__nv_bfloat16);
-                const size_t down_bytes = (size_t)experts * hidden * inner * sizeof(__nv_bfloat16);
-                check_cuda(cudaMalloc(&gate, gate_bytes), "Allocate expert gate weights");
-                check_cuda(cudaMalloc(&up, gate_bytes), "Allocate expert up weights");
-                check_cuda(cudaMalloc(&down, down_bytes), "Allocate expert down weights");
-                for (int e = 0; e < experts; ++e) {
-                    load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_GATE, i, e,
-                                     ctx.device_id, gate + (size_t)e * inner * hidden);
-                    load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_UP, i, e,
-                                     ctx.device_id, up + (size_t)e * inner * hidden);
-                    load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_DOWN, i, e,
-                                     ctx.device_id, down + (size_t)e * hidden * inner);
-                }
-                check_cuda(cudaStreamSynchronize(nullptr), "Finish expert weight upload");
-                if (shared > 0) {
-                    const int shared_inner = eng->desc.moe_shared_intermediate_size;
-                    const size_t shared_gate_bytes =
-                        (size_t)shared * shared_inner * hidden * sizeof(__nv_bfloat16);
-                    const size_t shared_down_bytes =
-                        (size_t)shared * hidden * shared_inner * sizeof(__nv_bfloat16);
-                    __nv_bfloat16 *sgate = nullptr, *sup = nullptr, *sdown = nullptr;
-                    check_cuda(cudaMalloc(&sgate, shared_gate_bytes), "Allocate shared gate");
-                    check_cuda(cudaMalloc(&sup, shared_gate_bytes), "Allocate shared up");
-                    check_cuda(cudaMalloc(&sdown, shared_down_bytes), "Allocate shared down");
-                    for (int e = 0; e < shared; ++e) {
-                        load_expert_role(index, eng->desc, ROLE_MOE_SHARED_GATE, i, e,
-                                         ctx.device_id, sgate + (size_t)e * shared_inner * hidden);
-                        load_expert_role(index, eng->desc, ROLE_MOE_SHARED_UP, i, e,
-                                         ctx.device_id, sup + (size_t)e * shared_inner * hidden);
-                        load_expert_role(index, eng->desc, ROLE_MOE_SHARED_DOWN, i, e,
-                                         ctx.device_id, sdown + (size_t)e * hidden * shared_inner);
+            for (int r = 0; r < ranks; ++r) {
+                const int dev_idx = eng->replicated ? r : eng->layer_device[i];
+                DeviceCtx &ctx = eng->ctx[dev_idx];
+                check_cuda(cudaSetDevice(ctx.device_id), "Load layer device");
+                LayerWeights &lw = layer_weights(eng, i, dev_idx);
+                lw.plan.mixer = eng->desc.layer_mixers[i];
+                lw.plan.ffn = eng->desc.layer_ffns[i];
+                bool mixer_sharded = false, ffn_sharded = false;
+                for (int role = 0; role < ROLE_COUNT; ++role) {
+                    if (!role_used_by_layer(role, lw.plan.mixer, lw.plan.ffn)) continue;
+                    if (model_desc_role_index(&eng->desc, role) < 0) continue;
+                    __nv_bfloat16 **target = role_target(lw, role);
+                    if (target == nullptr) continue;
+                    bool sharded = false;
+                    load_role_view(index, eng->desc, role, i, ctx.device_id, r, target,
+                                   &sharded);
+                    if (sharded) {
+                        if (role == ROLE_ATTN_Q || role == ROLE_ATTN_K ||
+                            role == ROLE_ATTN_V || role == ROLE_ATTN_O)
+                            mixer_sharded = true;
+                        else if (role == ROLE_MLP_GATE || role == ROLE_MLP_UP ||
+                                 role == ROLE_MLP_DOWN)
+                            ffn_sharded = true;
                     }
-                    lw.moe.shared_gate = sgate;
-                    lw.moe.shared_up = sup;
-                    lw.moe.shared_down = sdown;
-                    lw.owned.push_back(sgate);
-                    lw.owned.push_back(sup);
-                    lw.owned.push_back(sdown);
-                    if (eng->desc.moe_shared_gate_scalar) {
-                        __nv_bfloat16 *scalar_w = nullptr;
-                        load_role(index, eng->desc, ROLE_MOE_SHARED_GATE_SCALAR, i,
-                                  ctx.device_id, &scalar_w);
-                        lw.moe.shared_gate_scalar_w = scalar_w;
-                        lw.owned.push_back(scalar_w);
+                    lw.owned.push_back(*target);
+                }
+                lw.mixer_sharded = mixer_sharded;
+                lw.ffn_sharded = ffn_sharded;
+                if (lw.plan.ffn == ENGINE_FFN_MOE) {
+                    load_moe_weights(index, eng, lw, i, ctx.device_id);
+                    if (ctx.moe_scratch == nullptr) {
+                        const size_t bytes = moe_workspace_size(max_chunk, &eng->local_dims,
+                                                                &lw.moe_config);
+                        check_cuda(cudaMalloc(&ctx.moe_scratch, bytes), "Allocate MoE scratch");
+                        ctx.moe_ws_size = bytes;
                     }
                 }
-                lw.moe.post_norm_w = lw.post_norm_w;
-                lw.moe.router_w = router;
-                lw.moe.experts_gate = gate;
-                lw.moe.experts_up = up;
-                lw.moe.experts_down = down;
-                lw.owned.push_back(router);
-                lw.owned.push_back(gate);
-                lw.owned.push_back(up);
-                lw.owned.push_back(down);
-                if (ctx.moe_scratch == nullptr) {
-                    const size_t bytes = moe_workspace_size(max_chunk, &eng->dims, &lw.moe_config);
-                    check_cuda(cudaMalloc(&ctx.moe_scratch, bytes), "Allocate MoE scratch");
-                    ctx.moe_ws_size = bytes;
+                /* A fused qkvz/ba checkpoint stores the reference's own row grouping,
+                 * so its rows are gathered into the kernels' contiguous views. */
+                const int qkvz_slot = model_desc_role_index(&eng->desc, ROLE_GDN_QKVZ);
+                if (qkvz_slot >= 0 && lw.plan.mixer == ENGINE_MIXER_GDN) {
+                    std::vector<int> qkv_order, z_order, b_order, a_order;
+                    fused_gdn_row_orders(eng->dims, qkv_order, z_order, b_order, a_order);
+                    load_role_rows(index, eng->desc, ROLE_GDN_QKVZ, i, ctx.device_id, qkv_order,
+                                   &lw.in_proj_qkv_w);
+                    load_role_rows(index, eng->desc, ROLE_GDN_QKVZ, i, ctx.device_id, z_order,
+                                   &lw.in_proj_z_w);
+                    load_role_rows(index, eng->desc, ROLE_GDN_BA, i, ctx.device_id, b_order,
+                                   &lw.in_proj_b_w);
+                    load_role_rows(index, eng->desc, ROLE_GDN_BA, i, ctx.device_id, a_order,
+                                   &lw.in_proj_a_w);
+                    lw.owned.push_back(lw.in_proj_qkv_w);
+                    lw.owned.push_back(lw.in_proj_z_w);
+                    lw.owned.push_back(lw.in_proj_b_w);
+                    lw.owned.push_back(lw.in_proj_a_w);
                 }
-            }
-            /* A fused qkvz/ba checkpoint stores the reference's own row grouping,
-             * so its rows are gathered into the kernels' contiguous views. */
-            const int qkvz_slot = model_desc_role_index(&eng->desc, ROLE_GDN_QKVZ);
-            if (qkvz_slot >= 0 && lw.plan.mixer == ENGINE_MIXER_GDN) {
-                std::vector<int> qkv_order, z_order, b_order, a_order;
-                fused_gdn_row_orders(eng->dims, qkv_order, z_order, b_order, a_order);
-                load_role_rows(index, eng->desc, ROLE_GDN_QKVZ, i, ctx.device_id, qkv_order,
-                               &lw.in_proj_qkv_w);
-                load_role_rows(index, eng->desc, ROLE_GDN_QKVZ, i, ctx.device_id, z_order,
-                               &lw.in_proj_z_w);
-                load_role_rows(index, eng->desc, ROLE_GDN_BA, i, ctx.device_id, b_order,
-                               &lw.in_proj_b_w);
-                load_role_rows(index, eng->desc, ROLE_GDN_BA, i, ctx.device_id, a_order,
-                               &lw.in_proj_a_w);
-                lw.owned.push_back(lw.in_proj_qkv_w);
-                lw.owned.push_back(lw.in_proj_z_w);
-                lw.owned.push_back(lw.in_proj_b_w);
-                lw.owned.push_back(lw.in_proj_a_w);
-            }
-            if (lw.plan.mixer == ENGINE_MIXER_FULL_ATTN) {
-                check_cuda(cudaMalloc(&lw.kv_cache, kv_cache_bytes(eng)), "Allocate KV cache");
-                check_cuda(cudaMemsetAsync(lw.kv_cache, 0, kv_cache_bytes(eng), ctx.stream), "Zero KV cache");
-                lw.owned.push_back(lw.kv_cache);
-                lw.reset_zero.emplace_back(lw.kv_cache, kv_cache_bytes(eng));
-            } else if (lw.plan.mixer == ENGINE_MIXER_GDN) {
-                check_cuda(cudaMalloc(&lw.gdn_norm_f32, eng->dims.gdn_head_dim * sizeof(float)),
-                           "Allocate GDN norm");
-                kernel_cast_bf16_f32(lw.gdn_norm_f32, lw.gdn_norm_w, eng->dims.gdn_head_dim, ctx.stream);
-                check_cuda(cudaGetLastError(), "Convert GDN norm");
-                lw.owned.push_back(lw.gdn_norm_f32);
-                check_cuda(cudaMalloc(&lw.conv_state, conv_state_bytes(eng)), "Allocate conv state");
-                check_cuda(cudaMemsetAsync(lw.conv_state, 0, conv_state_bytes(eng), ctx.stream),
-                           "Zero conv state");
-                check_cuda(cudaMalloc(&lw.ssm_state, ssm_state_bytes(eng)), "Allocate SSM state");
-                check_cuda(cudaMemsetAsync(lw.ssm_state, 0, ssm_state_bytes(eng), ctx.stream),
-                           "Zero SSM state");
-                lw.owned.push_back(lw.conv_state);
-                lw.owned.push_back(lw.ssm_state);
-                lw.reset_zero.emplace_back(lw.conv_state, conv_state_bytes(eng));
-                lw.reset_zero.emplace_back(lw.ssm_state, ssm_state_bytes(eng));
-            } else {
-                throw EngineError(ENGINE_ERR_CONFIG,
-                                  "Layer kind is not implemented in this build");
+                if (lw.plan.mixer == ENGINE_MIXER_FULL_ATTN) {
+                    check_cuda(cudaMalloc(&lw.kv_cache, kv_cache_bytes(eng->local_dims)),
+                               "Allocate KV cache");
+                    check_cuda(cudaMemsetAsync(lw.kv_cache, 0, kv_cache_bytes(eng->local_dims),
+                                               ctx.stream), "Zero KV cache");
+                    lw.owned.push_back(lw.kv_cache);
+                    lw.reset_zero.emplace_back(lw.kv_cache, kv_cache_bytes(eng->local_dims));
+                } else if (lw.plan.mixer == ENGINE_MIXER_GDN) {
+                    check_cuda(cudaMalloc(&lw.gdn_norm_f32, eng->dims.gdn_head_dim * sizeof(float)),
+                               "Allocate GDN norm");
+                    kernel_cast_bf16_f32(lw.gdn_norm_f32, lw.gdn_norm_w, eng->dims.gdn_head_dim, ctx.stream);
+                    check_cuda(cudaGetLastError(), "Convert GDN norm");
+                    lw.owned.push_back(lw.gdn_norm_f32);
+                    check_cuda(cudaMalloc(&lw.conv_state, conv_state_bytes(eng)), "Allocate conv state");
+                    check_cuda(cudaMemsetAsync(lw.conv_state, 0, conv_state_bytes(eng), ctx.stream),
+                               "Zero conv state");
+                    check_cuda(cudaMalloc(&lw.ssm_state, ssm_state_bytes(eng)), "Allocate SSM state");
+                    check_cuda(cudaMemsetAsync(lw.ssm_state, 0, ssm_state_bytes(eng), ctx.stream),
+                               "Zero SSM state");
+                    lw.owned.push_back(lw.conv_state);
+                    lw.owned.push_back(lw.ssm_state);
+                    lw.reset_zero.emplace_back(lw.conv_state, conv_state_bytes(eng));
+                    lw.reset_zero.emplace_back(lw.ssm_state, ssm_state_bytes(eng));
+                } else {
+                    throw EngineError(ENGINE_ERR_CONFIG,
+                                      "Layer kind is not implemented in this build");
+                }
             }
             if (i % 16 == 0) fprintf(stderr, "[engine] Loaded layer %d/%d\n", i, num_layers);
         }
@@ -685,6 +817,161 @@ static __nv_bfloat16 *move_activation(EngineHandle *eng, int from, int to, int t
     return eng->ctx[to].residual;
 }
 
+static LayerContext make_layer_context(EngineHandle *eng, int layer, int dev_idx,
+                                       int tokens, bool with_taps) {
+    DeviceCtx &ctx = eng->ctx[dev_idx];
+    LayerContext lctx;
+    lctx.cublas = ctx.cublas;
+    lctx.stream = ctx.stream;
+    lctx.workspace = ctx.workspace;
+    lctx.conv_bias_zero = ctx.conv_bias_zero;
+    lctx.positions = ctx.positions;
+    lctx.fla_scratch = ctx.fla_scratch;
+    lctx.moe_scratch = ctx.moe_scratch;
+    lctx.tokens = tokens;
+    lctx.seq_len = eng->seq_len + tokens;
+    lctx.layer_index = layer;
+    lctx.device = ctx.device_id;
+    lctx.dims = eng->replicated ? &eng->local_dims : &eng->dims;
+    lctx.taps = with_taps ? &eng->taps : nullptr;
+    return lctx;
+}
+
+static void residual_add_device(EngineHandle *eng, int dev_idx, size_t elements) {
+    DeviceCtx &ctx = eng->ctx[dev_idx];
+    check_cuda(cudaSetDevice(ctx.device_id), "Select residual device");
+    kernel_residual_add(ctx.residual, ctx.layer_out, (int)elements, ctx.stream);
+    check_cuda(cudaGetLastError(), "Residual add");
+}
+
+/* Sum every rank's layer_out in place (leader reduce + broadcast). */
+static int allreduce_activation(EngineHandle *eng, int tokens) {
+    const size_t elements = (size_t)tokens * eng->dims.hidden_size;
+    std::vector<__nv_bfloat16 *> buffers(eng->num_devices);
+    std::vector<cudaStream_t> streams(eng->num_devices);
+    std::vector<cudaEvent_t> events(eng->num_devices);
+    for (int d = 0; d < eng->num_devices; ++d) {
+        buffers[d] = eng->ctx[d].layer_out;
+        streams[d] = eng->ctx[d].stream;
+        events[d] = eng->ctx[d].copy_event;
+    }
+    return allreduce_sum_bf16(eng->devices.data(), streams.data(), events.data(),
+                              eng->num_devices, buffers.data(), eng->ctx[0].reduce_staging,
+                              elements);
+}
+
+/* Final norm + LM head for the last row of `act`, downloaded to h_logits. */
+static void compute_logits(EngineHandle *eng, DeviceCtx &last, const __nv_bfloat16 *act,
+                           int tokens, float *h_logits) {
+    // Public API returns only the final row; avoid [max_chunk,vocab] logits.
+    const __nv_bfloat16 *final_row = act + (size_t)(tokens - 1) * eng->dims.hidden_size;
+    if (eng->dims.norm_style == 1) {
+        kernel_rms_norm_plain(last.workspace, final_row, last.final_norm_w,
+                              eng->dims.hidden_size, 1, eng->dims.rms_eps, last.stream);
+    } else {
+        kernel_gemma_rms_norm(last.workspace, final_row, last.final_norm_w,
+                              eng->dims.hidden_size, 1, eng->dims.rms_eps, last.stream);
+    }
+    check_cuda(cudaGetLastError(), "Final norm");
+    check_forward(gemm_bf16_f32out(last.cublas, last.d_logits, last.workspace,
+                  last.lm_head_w, 1, eng->dims.vocab_size, eng->dims.hidden_size), "LM head");
+    check_cuda(cudaMemcpyAsync(h_logits, last.d_logits, eng->dims.vocab_size * sizeof(float),
+                               cudaMemcpyDeviceToHost, last.stream), "Download logits");
+}
+
+/* Layer-wise placement: the residual hops device-to-device once per layer. */
+static void forward_pipelined(EngineHandle *eng, const int64_t *token_ids, int tokens,
+                              float *h_logits) {
+    DeviceCtx &first = eng->ctx[0];
+    check_cuda(cudaSetDevice(first.device_id), "Select embedding device");
+    check_cuda(cudaMemcpyAsync(first.token_ids, token_ids, tokens * sizeof(int64_t),
+                               cudaMemcpyHostToDevice, first.stream), "Upload token IDs");
+    check_cuda(cudaStreamSynchronize(first.stream), "Finish token upload");
+    kernel_embedding(first.residual, first.embed_w, first.token_ids, eng->dims.hidden_size,
+                     tokens, first.stream);
+    check_cuda(cudaGetLastError(), "Embedding");
+
+    int current = 0;
+    for (int i = 0; i < eng->num_layers; ++i) {
+        const int dev_idx = eng->layer_device[i];
+        __nv_bfloat16 *act = move_activation(eng, current, dev_idx, tokens);
+        current = dev_idx;
+        DeviceCtx &ctx = eng->ctx[dev_idx];
+        LayerContext lctx = make_layer_context(eng, i, dev_idx, tokens, true);
+        check_forward(forward_layer(&lctx, &eng->layers[i], act, ctx.layer_out), "Layer forward");
+        tap_dump_rows(&eng->taps, "layer", i, ctx.device_id, ctx.stream, act, tokens,
+                      eng->dims.hidden_size);
+    }
+
+    if (h_logits) {
+        const int last_idx = eng->num_devices - 1;
+        __nv_bfloat16 *act = move_activation(eng, current, last_idx, tokens);
+        current = last_idx;
+        DeviceCtx &last = eng->ctx[last_idx];
+        check_cuda(cudaSetDevice(last.device_id), "Select logits device");
+        compute_logits(eng, last, act, tokens, h_logits);
+    }
+    check_cuda(cudaSetDevice(eng->devices[current]), "Select final forward device");
+    check_cuda(cudaStreamSynchronize(eng->ctx[current].stream), "Finish forward");
+}
+
+/* Replicated placement (tensor parallel): every rank holds the whole model with
+ * its weight shards, activations are replicas, and a sublayer whose weights were
+ * split all-reduces its partial output before the residual add. */
+static void forward_replicated(EngineHandle *eng, const int64_t *token_ids, int tokens,
+                               float *h_logits) {
+    for (int d = 0; d < eng->num_devices; ++d) {
+        DeviceCtx &ctx = eng->ctx[d];
+        check_cuda(cudaSetDevice(ctx.device_id), "Select embedding device");
+        check_cuda(cudaMemcpyAsync(ctx.token_ids, token_ids, tokens * sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, ctx.stream), "Upload token IDs");
+        check_cuda(cudaStreamSynchronize(ctx.stream), "Finish token upload");
+        kernel_embedding(ctx.residual, ctx.embed_w, ctx.token_ids, eng->dims.hidden_size,
+                         tokens, ctx.stream);
+        check_cuda(cudaGetLastError(), "Embedding");
+    }
+
+    const size_t elements = (size_t)tokens * eng->dims.hidden_size;
+    for (int i = 0; i < eng->num_layers; ++i) {
+        const LayerWeights &wa = layer_weights(eng, i, 0);
+        const bool reduce_mixer = wa.mixer_sharded;
+        const bool reduce_ffn = wa.ffn_sharded;
+        for (int phase = 0; phase < 2; ++phase) {
+            const bool is_mixer = phase == 0;
+            for (int d = 0; d < eng->num_devices; ++d) {
+                DeviceCtx &ctx = eng->ctx[d];
+                check_cuda(cudaSetDevice(ctx.device_id), "Select layer device");
+                LayerContext lctx = make_layer_context(eng, i, d, tokens, d == 0);
+                const LayerWeights &w = layer_weights(eng, i, d);
+                int status = is_mixer
+                    ? forward_mixer(&lctx, &w, ctx.residual, ctx.layer_out)
+                    : forward_ffn(&lctx, &w, ctx.residual, ctx.layer_out);
+                check_forward(status, is_mixer ? "Layer mixer" : "Layer feed-forward");
+            }
+            if ((is_mixer ? reduce_mixer : reduce_ffn) && eng->num_devices > 1) {
+                int status = allreduce_activation(eng, tokens);
+                if (status != 0)
+                    throw EngineError(ENGINE_ERR_CUDA, "All-reduce failed");
+            }
+            for (int d = 0; d < eng->num_devices; ++d) residual_add_device(eng, d, elements);
+        }
+        tap_dump_rows(&eng->taps, "layer", i, eng->ctx[0].device_id, eng->ctx[0].stream,
+                      eng->ctx[0].residual, tokens, eng->dims.hidden_size);
+    }
+
+    if (h_logits) {
+        const int last_idx = eng->num_devices - 1;
+        DeviceCtx &last = eng->ctx[last_idx];
+        check_cuda(cudaSetDevice(last.device_id), "Select logits device");
+        compute_logits(eng, last, last.residual, tokens, h_logits);
+    }
+    for (int d = 0; d < eng->num_devices; ++d) {
+        DeviceCtx &ctx = eng->ctx[d];
+        check_cuda(cudaSetDevice(ctx.device_id), "Select final forward device");
+        check_cuda(cudaStreamSynchronize(ctx.stream), "Finish forward");
+    }
+}
+
 static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
                            int tokens, float *h_logits) {
     std::vector<int64_t> positions(eng->dims.max_chunk);
@@ -697,61 +984,11 @@ static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
         // Finish staging host arrays before any subsequent operation can throw.
         check_cuda(cudaStreamSynchronize(ctx.stream), "Finish position upload");
     }
-    DeviceCtx &first = eng->ctx[0];
-    check_cuda(cudaSetDevice(first.device_id), "Select embedding device");
-    check_cuda(cudaMemcpyAsync(eng->token_ids, token_ids, tokens * sizeof(int64_t),
-                               cudaMemcpyHostToDevice, first.stream), "Upload token IDs");
-    check_cuda(cudaStreamSynchronize(first.stream), "Finish token upload");
-    kernel_embedding(first.residual, eng->embed_w, eng->token_ids, eng->dims.hidden_size,
-                     tokens, first.stream);
-    check_cuda(cudaGetLastError(), "Embedding");
-
-    int current = 0;
-    for (int i = 0; i < eng->num_layers; ++i) {
-        const int dev_idx = eng->layer_device[i];
-        __nv_bfloat16 *act = move_activation(eng, current, dev_idx, tokens);
-        current = dev_idx;
-        DeviceCtx &ctx = eng->ctx[dev_idx];
-        LayerContext lctx;
-        lctx.cublas = ctx.cublas;
-        lctx.stream = ctx.stream;
-        lctx.workspace = ctx.workspace;
-        lctx.conv_bias_zero = ctx.conv_bias_zero;
-        lctx.positions = ctx.positions;
-        lctx.fla_scratch = ctx.fla_scratch;
-        lctx.moe_scratch = ctx.moe_scratch;
-        lctx.tokens = tokens;
-        lctx.seq_len = eng->seq_len + tokens;
-        lctx.layer_index = i;
-        lctx.device = ctx.device_id;
-        lctx.dims = &eng->dims;
-        lctx.taps = &eng->taps;
-        check_forward(forward_layer(&lctx, &eng->layers[i], act, ctx.layer_out), "Layer forward");
-        tap_dump(&eng->taps, "layer", i, ctx.device_id, act, tokens, &eng->dims);
+    if (eng->replicated) {
+        forward_replicated(eng, token_ids, tokens, h_logits);
+    } else {
+        forward_pipelined(eng, token_ids, tokens, h_logits);
     }
-
-    if (h_logits) {
-        const int last_idx = eng->num_devices - 1;
-        __nv_bfloat16 *act = move_activation(eng, current, last_idx, tokens);
-        current = last_idx;
-        DeviceCtx &last = eng->ctx[last_idx];
-        // Public API returns only the final row; avoid [128,vocab] logits.
-        __nv_bfloat16 *final_row = act + (size_t)(tokens - 1) * eng->dims.hidden_size;
-        if (eng->dims.norm_style == 1) {
-            kernel_rms_norm_plain(last.workspace, final_row, eng->final_norm_w,
-                                  eng->dims.hidden_size, 1, eng->dims.rms_eps, last.stream);
-        } else {
-            kernel_gemma_rms_norm(last.workspace, final_row, eng->final_norm_w,
-                                  eng->dims.hidden_size, 1, eng->dims.rms_eps, last.stream);
-        }
-        check_cuda(cudaGetLastError(), "Final norm");
-        check_forward(gemm_bf16_f32out(last.cublas, eng->d_logits, last.workspace,
-                      eng->lm_head_w, 1, eng->dims.vocab_size, eng->dims.hidden_size), "LM head");
-        check_cuda(cudaMemcpyAsync(h_logits, eng->d_logits, eng->dims.vocab_size * sizeof(float),
-                                   cudaMemcpyDeviceToHost, last.stream), "Download logits");
-    }
-    check_cuda(cudaSetDevice(eng->devices[current]), "Select final forward device");
-    check_cuda(cudaStreamSynchronize(eng->ctx[current].stream), "Finish forward");
     eng->seq_len += tokens;
 }
 
@@ -834,8 +1071,8 @@ void engine_reset(EngineHandle *eng) {
             DeviceCtx &ctx = eng->ctx[d];
             check_cuda(cudaSetDevice(ctx.device_id), "Select reset device");
             for (int i = 0; i < eng->num_layers; ++i) {
-                if (eng->layer_device[i] != d) continue;
-                for (const auto &buffer : eng->layers[i].reset_zero) {
+                if (!eng->replicated && eng->layer_device[i] != d) continue;
+                for (const auto &buffer : layer_weights(eng, i, d).reset_zero) {
                     check_cuda(cudaMemsetAsync(buffer.first, 0, buffer.second, ctx.stream),
                                "Reset layer state");
                 }
@@ -868,22 +1105,13 @@ void engine_destroy(EngineHandle *eng) {
         }
     }
     if (eng->layers) {
-        for (int i = 0; i < eng->num_layers; ++i) {
-            cleanup_cuda(cudaSetDevice(eng->devices[eng->layer_device[i]]));
+        const int slots = eng->replicated ? eng->num_layers * eng->num_devices : eng->num_layers;
+        for (int i = 0; i < slots; ++i) {
+            const int dev_idx = eng->replicated ? i % eng->num_devices : eng->layer_device[i];
+            cleanup_cuda(cudaSetDevice(eng->devices[dev_idx]));
             for (void *ptr : eng->layers[i].owned)
                 if (ptr) cleanup_cuda(cudaFree(ptr));
         }
-    }
-    if (eng->embed_w || eng->token_ids) {
-        cleanup_cuda(cudaSetDevice(eng->devices.front()));
-        if (eng->embed_w) cleanup_cuda(cudaFree(eng->embed_w));
-        if (eng->token_ids) cleanup_cuda(cudaFree(eng->token_ids));
-    }
-    if (eng->lm_head_w || eng->final_norm_w || eng->d_logits) {
-        cleanup_cuda(cudaSetDevice(eng->devices.back()));
-        if (eng->lm_head_w) cleanup_cuda(cudaFree(eng->lm_head_w));
-        if (eng->final_norm_w) cleanup_cuda(cudaFree(eng->final_norm_w));
-        if (eng->d_logits) cleanup_cuda(cudaFree(eng->d_logits));
     }
     if (eng->ctx) {
         for (int d = 0; d < eng->num_devices; ++d) {
@@ -891,7 +1119,9 @@ void engine_destroy(EngineHandle *eng) {
             if (ctx.device_id < 0) continue;
             cleanup_cuda(cudaSetDevice(ctx.device_id));
             void *buffers[] = {ctx.residual, ctx.layer_out, ctx.workspace, ctx.conv_bias_zero,
-                               ctx.positions, ctx.fla_scratch, ctx.moe_scratch};
+                               ctx.positions, ctx.fla_scratch, ctx.moe_scratch,
+                               ctx.token_ids, ctx.embed_w, ctx.lm_head_w, ctx.final_norm_w,
+                               ctx.d_logits, ctx.reduce_staging};
             for (void *ptr : buffers) if (ptr) cleanup_cuda(cudaFree(ptr));
             if (ctx.cublas) {
                 cublasStatus_t status = cublasDestroy(ctx.cublas);

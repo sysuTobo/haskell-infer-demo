@@ -59,17 +59,22 @@ loadDescriptor cfg = case rcDescriptor cfg of
 -- | Initialize the runtime: load descriptor, tokenizer, engine (weights + state).
 initRuntime :: RuntimeConfig -> IO Runtime
 initRuntime cfg = do
-  desc <- loadDescriptor cfg
+  base <- loadDescriptor cfg
+  let policy = if rcTp cfg > 1 then Replicated (rcTp cfg) 1 else Pipelined
+      desc = case policy of
+        Replicated tp _ -> base { dTpSize = tp }
+        Pipelined -> base
   putStrLn $ "Descriptor: " ++ dFamily desc ++ " (" ++ dModelType desc ++ "), "
     ++ show (dNumLayers desc) ++ " layers, hidden " ++ show (dHiddenSize desc)
     ++ ", vocab " ++ show (dVocabSize desc)
 
-  model <- case modelDef desc Pipelined (rcDevices cfg) of
+  model <- case modelDef desc policy (rcDevices cfg) of
     Left err -> do
       putStrLn $ "ERROR: " ++ err
       exitFailure
     Right md -> return md
-  putStrLn $ "  Layers per device: " ++ show (plLayersPerDevice (mdPlacement model))
+  putStrLn $ "  Placement (" ++ show (plPolicy (mdPlacement model)) ++ "): "
+    ++ show (plLayersPerDevice (mdPlacement model))
 
   putStrLn $ "Loading tokenizer from " ++ rcModelDir cfg ++ "/tokenizer.json"
   mTok <- loadTokenizer (rcModelDir cfg ++ "/tokenizer.json")

@@ -157,17 +157,18 @@ static void test_good(void) {
 }
 
 /* The good descriptor with tensor parallelism enabled (tp_size 2, rank 1) and a
- * role_shards table exercising the whole vocabulary. The table is parallel to
- * role_names (23 entries). */
+ * role_shards table exercising the whole rule vocabulary on the roles that can
+ * carry it (q/k/v by heads, o/down by input dim, gate/up by output dim; the
+ * rest replicated). The table is parallel to role_names (23 entries). */
 static void build_tp2(char *buf, size_t buf_len) {
     copy_desc(buf, buf_len);
     set_literal(buf, "\"num_layers\":2,",
         "\"num_layers\":2,"
         "\"tp_size\":2,\"tp_rank\":1,"
-        "\"role_shards\":[\"none\",\"out_dim\",\"none\",\"none\",\"none\","
+        "\"role_shards\":[\"none\",\"none\",\"none\",\"none\",\"none\","
         "\"out_dim\",\"out_dim\",\"in_dim\",\"out_heads\",\"out_heads\","
-        "\"out_heads\",\"in_dim\",\"none\",\"none\",\"out_heads\",\"none\","
-        "\"none\",\"none\",\"none\",\"none\",\"none\",\"in_dim\",\"none\"],");
+        "\"out_heads\",\"in_dim\",\"none\",\"none\",\"none\",\"none\","
+        "\"none\",\"none\",\"none\",\"none\",\"none\",\"none\",\"none\"],");
 }
 
 static void test_tp(void) {
@@ -226,6 +227,70 @@ static void test_tp(void) {
     build_tp2(buf, sizeof(buf));
     set_literal(buf, "\"out_heads\"", "\"out_heds\"");
     test_rejects(buf, "unknown name", "unknown shard rule name is rejected");
+
+    /* Rules the role's layout cannot carry. */
+    build_tp2(buf, sizeof(buf));
+    set_literal(buf, "\"role_shards\":[\"none\",\"none\"",
+                    "\"role_shards\":[\"out_dim\",\"none\"");
+    test_rejects(buf, "cannot carry", "out_dim on the embedding is rejected");
+    snprintf(buf, sizeof(buf), "%s", kGoodDesc);
+    set_literal(buf, "\"num_layers\":2,",
+        "\"num_layers\":2,\"tp_size\":2,\"tp_rank\":0,\"role_shards\":["
+        "\"none\",\"none\",\"none\",\"none\",\"none\",\"none\",\"none\",\"none\","
+        "\"out_heads\",\"out_heads\",\"out_heads\",\"in_dim\",\"none\",\"none\","
+        "\"out_heads\",\"none\",\"none\",\"none\",\"none\",\"none\",\"none\","
+        "\"none\",\"none\"],");
+    test_rejects(buf, "cannot carry", "out_heads on a GDN projection is rejected");
+}
+
+/* The rank's slice of a tensor, as the loader computes it. With tp_size 2:
+ * q rows = num_heads * head_dim * 2 (fused gate) = 16 -> 8 rows per rank;
+ * gate/up [16,8] -> 8 rows per rank; down [8,16] -> 8 columns per rank; every
+ * replicated role keeps the whole tensor. Both ranks are checked because the
+ * slice must come from the explicit rank, not from desc.tp_rank (one engine
+ * process holds every rank and keeps tp_rank at 0). */
+static void test_shard_view(void) {
+    char buf[8192];
+    struct ModelDesc desc;
+    char err[256] = {0};
+    struct ShardView view;
+    build_tp2(buf, sizeof(buf));
+    int rc = model_desc_parse(buf, &desc, err, sizeof(err));
+    check(rc == 0, err[0] ? err : "TP2 descriptor is rejected");
+    check(desc.tp_rank == 1, "the fixture still carries a non-zero tp_rank");
+
+    rc = model_desc_shard_view(&desc, ROLE_ATTN_Q, 16, 8, 0, &view, err, sizeof(err));
+    check(rc == 0 && view.row_off == 0 && view.rows == 8 && view.col_off == 0 && view.cols == 8,
+          "rank 0 keeps the first q head block");
+    rc = model_desc_shard_view(&desc, ROLE_ATTN_Q, 16, 8, 1, &view, err, sizeof(err));
+    check(rc == 0 && view.row_off == 8 && view.rows == 8 && view.col_off == 0 && view.cols == 8,
+          "rank 1 keeps the second q head block");
+
+    rc = model_desc_shard_view(&desc, ROLE_ATTN_K, 4, 8, 1, &view, err, sizeof(err));
+    check(rc != 0 && strstr(err, "does not divide") != NULL,
+          "a head count that does not divide tp_size is rejected");
+
+    rc = model_desc_shard_view(&desc, ROLE_MLP_UP, 16, 8, 1, &view, err, sizeof(err));
+    check(rc == 0 && view.row_off == 8 && view.rows == 8 && view.col_off == 0 && view.cols == 8,
+          "mlpUp shard is the rank's row block");
+
+    rc = model_desc_shard_view(&desc, ROLE_MLP_DOWN, 8, 16, 1, &view, err, sizeof(err));
+    check(rc == 0 && view.row_off == 0 && view.rows == 8 && view.col_off == 8 && view.cols == 8,
+          "mlpDown shard is the rank's column block");
+
+    rc = model_desc_shard_view(&desc, ROLE_GDN_QKV, 12, 8, 1, &view, err, sizeof(err));
+    check(rc == 0 && view.row_off == 0 && view.rows == 12 && view.col_off == 0 && view.cols == 8,
+          "a replicated role keeps the whole tensor");
+
+    rc = model_desc_shard_view(&desc, ROLE_ATTN_Q, 16, 8, 2, &view, err, sizeof(err));
+    check(rc != 0 && strstr(err, "rank") != NULL, "a rank outside [0, tp_size) is rejected");
+
+    copy_desc(buf, sizeof(buf));
+    rc = model_desc_parse(buf, &desc, err, sizeof(err));
+    check(rc == 0, err[0] ? err : "single-rank descriptor is rejected");
+    rc = model_desc_shard_view(&desc, ROLE_ATTN_Q, 16, 8, 0, &view, err, sizeof(err));
+    check(rc == 0 && view.row_off == 0 && view.rows == 16 && view.cols == 8,
+          "tp_size 1 yields the whole tensor");
 }
 
 
@@ -406,6 +471,7 @@ static void test_errors(void) {
 int main(void) {
     test_good();
     test_tp();
+    test_shard_view();
     test_moe();
     test_errors();
     if (failures == 0) {

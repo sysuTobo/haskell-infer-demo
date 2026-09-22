@@ -36,7 +36,7 @@ add_custom_command(
 )
 
 add_library(engine SHARED
-    engine.cu memory.cu safetensors_loader.cu model_desc.c layer_dispatch.cu collective.cu
+    engine.cu memory.cu safetensors_loader.cu model_desc.c layer_dispatch.cu collective.cu moe.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu
@@ -69,6 +69,9 @@ if(BUILD_TESTS)
     add_executable(test_collective ../tests/kernels/test_collective.cu)
     target_link_libraries(test_collective PRIVATE engine)
     add_test(NAME test_collective COMMAND test_collective)
+    add_executable(test_moe ../tests/kernels/test_moe.cu)
+    target_link_libraries(test_moe PRIVATE engine)
+    add_test(NAME test_moe COMMAND test_moe)
     add_library(kernel_test_bridge SHARED ../tests/kernels/kernel_bridge.cu)
     target_link_libraries(kernel_test_bridge PRIVATE engine)
     add_test(NAME test_library_ops COMMAND ${Python3_EXECUTABLE}

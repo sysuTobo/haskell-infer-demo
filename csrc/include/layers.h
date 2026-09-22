@@ -7,14 +7,16 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
+#include "moe.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <string>
 #include <vector>
 
 /* Model dimensions (shared across all layers). Filled from the model descriptor;
- * no per-family constants live on the C side. */
-typedef struct {
+ * no per-family constants live on the C side. Named so moe.h can forward-declare
+ * it without including this header (the two are mutually dependent). */
+typedef struct ModelDims {
     int hidden_size;
     int intermediate_size;
     int num_heads;
@@ -92,6 +94,9 @@ typedef struct {
  * lifecycle (destroy frees, reset zeroes) needs no per-kind bookkeeping. */
 struct LayerWeights {
     LayerPlan plan;
+    /* MoE feed-forward (used when plan.ffn is moe). */
+    MoeWeights moe;
+    MoeConfig moe_config;
     __nv_bfloat16 *input_norm_w;
     __nv_bfloat16 *post_norm_w;
     __nv_bfloat16 *gate_proj_w;
@@ -131,6 +136,7 @@ typedef struct {
     __nv_bfloat16 *conv_bias_zero;
     const int64_t *positions;
     void *fla_scratch;
+    void *moe_scratch;
     int tokens;
     int seq_len;              /* sequence length including the current tokens */
     int layer_index;          /* for diagnostics only */

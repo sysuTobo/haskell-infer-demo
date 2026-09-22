@@ -3,6 +3,7 @@
 #include "kernels.h"
 #include "layers.h"
 #include "model_desc.h"
+#include "moe.h"
 #include "flashinfer_ops.h"
 #include "fla_ops.h"
 
@@ -123,6 +124,12 @@ static ExpectedShape expected_shape(int role, const struct ModelDesc &d) {
         return {2, {hidden, d.gdn_value_dim, 0}};
     case ROLE_GDN_NORM:
         return {1, {d.gdn_head_dim, 0, 0}};
+    case ROLE_MOE_ROUTER:
+        return {2, {d.moe_num_experts, hidden, 0}};
+    case ROLE_MOE_EXPERT_GATE: case ROLE_MOE_EXPERT_UP:
+        return {2, {d.moe_intermediate_size, hidden, 0}};
+    case ROLE_MOE_EXPERT_DOWN:
+        return {2, {hidden, d.moe_intermediate_size, 0}};
     default:
         return {0, {0, 0, 0}};
     }
@@ -136,11 +143,17 @@ static int role_owner(int role) {
     }
 }
 
-/* Roles a layer needs, given its mixer kind. */
-static bool role_used_by_mixer(int role, int mixer) {
-    if (role == ROLE_INPUT_NORM || role == ROLE_POST_NORM ||
-        role == ROLE_MLP_GATE || role == ROLE_MLP_UP || role == ROLE_MLP_DOWN)
+/* Roles a layer needs, given its mixer and feed-forward kinds. The feed-forward
+ * roles are mutually exclusive: a dense layer has no router/expert tensors and an
+ * MoE layer has no dense MLP tensors. */
+static bool role_used_by_layer(int role, int mixer, int ffn) {
+    if (role == ROLE_INPUT_NORM || role == ROLE_POST_NORM)
         return true;
+    if (role == ROLE_MLP_GATE || role == ROLE_MLP_UP || role == ROLE_MLP_DOWN)
+        return ffn == ENGINE_FFN_DENSE;
+    if (role == ROLE_MOE_ROUTER || role == ROLE_MOE_EXPERT_GATE ||
+        role == ROLE_MOE_EXPERT_UP || role == ROLE_MOE_EXPERT_DOWN)
+        return ffn == ENGINE_FFN_MOE;
     if (mixer == ENGINE_MIXER_FULL_ATTN)
         return role == ROLE_ATTN_Q || role == ROLE_ATTN_K || role == ROLE_ATTN_V ||
                role == ROLE_ATTN_O || role == ROLE_ATTN_Q_NORM || role == ROLE_ATTN_K_NORM;
@@ -162,8 +175,10 @@ struct DeviceCtx {
     __nv_bfloat16 *conv_bias_zero = nullptr;
     int64_t *positions = nullptr;
     void *fla_scratch = nullptr;
+    void *moe_scratch = nullptr;
     size_t ws_size = 0;
     size_t fla_size = 0;
+    size_t moe_ws_size = 0;
 };
 
 struct EngineHandle {
@@ -234,6 +249,37 @@ static void load_role(const std::map<std::string, TensorInfo> &index,
         throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + name);
     // The loader uploads on the default stream; compute streams are nonblocking.
     check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
+}
+
+/* Load one expert's tensor straight into its slot of a fused [E, ...] buffer. */
+static void load_expert_role(const std::map<std::string, TensorInfo> &index,
+                             const struct ModelDesc &desc, int role, int layer,
+                             int expert, int device, __nv_bfloat16 *dst) {
+    int slot = model_desc_role_index(&desc, role);
+    if (slot < 0)
+        throw EngineError(ENGINE_ERR_WEIGHTS,
+                          std::string("Descriptor has no template for role ") +
+                              std::to_string(role));
+    char name[ENGINE_TEMPLATE_MAX];
+    model_desc_expand(desc.role_templates[slot], layer, expert, name, sizeof(name));
+    auto it = index.find(name);
+    if (it == index.end())
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Tensor not found: ") + name);
+    const TensorInfo &ti = it->second;
+    if (ti.dtype != 0)
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Tensor is not BF16: ") + name);
+    ExpectedShape want = expected_shape(role, desc);
+    bool shape_ok = ti.ndim == want.ndim;
+    for (int i = 0; shape_ok && i < want.ndim; ++i) shape_ok = ti.shape[i] == want.dims[i];
+    if (!shape_ok)
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Unexpected shape for ") + name);
+    long long elements = 1;
+    for (int i = 0; i < ti.ndim; ++i) elements *= ti.shape[i];
+    check_cuda(cudaSetDevice(device), "Set expert weight device");
+    int status = safetensors_load_tensor(ti, dst, device);
+    check_cuda(cudaGetLastError(), "Upload expert weight");
+    if (status != 0)
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + name);
 }
 
 /* Field that receives a role's tensor for the given layer kind. */
@@ -323,9 +369,6 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
         }
         const int num_layers = eng->desc.num_layers;
         for (int i = 0; i < num_layers; ++i) {
-            if (eng->desc.layer_ffns[i] == ENGINE_FFN_MOE)
-                throw EngineError(ENGINE_ERR_CONFIG,
-                                  "moe feed-forward layers are not implemented in this build");
             if (eng->desc.layer_mixers[i] == ENGINE_MIXER_MLA)
                 throw EngineError(ENGINE_ERR_CONFIG,
                                   "mla mixer layers are not implemented in this build");
@@ -364,6 +407,7 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             check_cuda(cudaMalloc(&ctx.layer_out, activation_bytes), "Allocate layer output");
             ctx.ws_size = layer_workspace_size(max_chunk, &eng->dims);
             check_cuda(cudaMalloc(&ctx.workspace, ctx.ws_size), "Allocate layer workspace");
+                    ctx.moe_scratch = nullptr;
             ctx.fla_size = kernel_fla_workspace_size(max_chunk, eng->dims.gdn_num_v_heads);
             check_cuda(cudaMalloc(&ctx.fla_scratch, ctx.fla_size), "Allocate FLA scratch");
             check_cuda(cudaMalloc(&ctx.positions, max_chunk * sizeof(int64_t)), "Allocate positions");
@@ -387,11 +431,48 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             lw.plan.mixer = eng->desc.layer_mixers[i];
             lw.plan.ffn = eng->desc.layer_ffns[i];
             for (int role = 0; role < ROLE_COUNT; ++role) {
-                if (!role_used_by_mixer(role, lw.plan.mixer)) continue;
+                if (!role_used_by_layer(role, lw.plan.mixer, lw.plan.ffn)) continue;
                 __nv_bfloat16 **target = role_target(lw, role);
                 if (target == nullptr) continue;
                 load_role(index, eng->desc, role, i, ctx.device_id, target);
                 lw.owned.push_back(*target);
+            }
+            if (lw.plan.ffn == ENGINE_FFN_MOE) {
+                const int experts = eng->desc.moe_num_experts;
+                const int inner = eng->desc.moe_intermediate_size;
+                lw.moe_config = MoeConfig{experts, eng->desc.moe_top_k, inner,
+                                          eng->desc.moe_norm_topk_prob,
+                                          strcmp(eng->desc.moe_router_scoring, "sigmoid") == 0,
+                                          (float)eng->desc.moe_routed_scaling_factor};
+                __nv_bfloat16 *router = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
+                load_role(index, eng->desc, ROLE_MOE_ROUTER, i, ctx.device_id, &router);
+                const size_t gate_bytes = (size_t)experts * inner * hidden * sizeof(__nv_bfloat16);
+                const size_t down_bytes = (size_t)experts * hidden * inner * sizeof(__nv_bfloat16);
+                check_cuda(cudaMalloc(&gate, gate_bytes), "Allocate expert gate weights");
+                check_cuda(cudaMalloc(&up, gate_bytes), "Allocate expert up weights");
+                check_cuda(cudaMalloc(&down, down_bytes), "Allocate expert down weights");
+                for (int e = 0; e < experts; ++e) {
+                    load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_GATE, i, e,
+                                     ctx.device_id, gate + (size_t)e * inner * hidden);
+                    load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_UP, i, e,
+                                     ctx.device_id, up + (size_t)e * inner * hidden);
+                    load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_DOWN, i, e,
+                                     ctx.device_id, down + (size_t)e * hidden * inner);
+                }
+                check_cuda(cudaStreamSynchronize(nullptr), "Finish expert weight upload");
+                lw.moe.router_w = router;
+                lw.moe.experts_gate = gate;
+                lw.moe.experts_up = up;
+                lw.moe.experts_down = down;
+                lw.owned.push_back(router);
+                lw.owned.push_back(gate);
+                lw.owned.push_back(up);
+                lw.owned.push_back(down);
+                if (ctx.moe_scratch == nullptr) {
+                    const size_t bytes = moe_workspace_size(max_chunk, &eng->dims, &lw.moe_config);
+                    check_cuda(cudaMalloc(&ctx.moe_scratch, bytes), "Allocate MoE scratch");
+                    ctx.moe_ws_size = bytes;
+                }
             }
             if (lw.plan.mixer == ENGINE_MIXER_FULL_ATTN) {
                 check_cuda(cudaMalloc(&lw.kv_cache, kv_cache_bytes(eng)), "Allocate KV cache");
@@ -496,6 +577,7 @@ static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
         lctx.conv_bias_zero = ctx.conv_bias_zero;
         lctx.positions = ctx.positions;
         lctx.fla_scratch = ctx.fla_scratch;
+        lctx.moe_scratch = ctx.moe_scratch;
         lctx.tokens = tokens;
         lctx.seq_len = eng->seq_len + tokens;
         lctx.layer_index = i;
@@ -659,7 +741,7 @@ void engine_destroy(EngineHandle *eng) {
             if (ctx.device_id < 0) continue;
             cleanup_cuda(cudaSetDevice(ctx.device_id));
             void *buffers[] = {ctx.residual, ctx.layer_out, ctx.workspace, ctx.conv_bias_zero,
-                               ctx.positions, ctx.fla_scratch};
+                               ctx.positions, ctx.fla_scratch, ctx.moe_scratch};
             for (void *ptr : buffers) if (ptr) cleanup_cuda(cudaFree(ptr));
             if (ctx.cublas) {
                 cublasStatus_t status = cublasDestroy(ctx.cublas);

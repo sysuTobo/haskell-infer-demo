@@ -45,6 +45,7 @@ inline float round_bf16(float value) {
 
 inline Bf16 bf16(float value) { return __float2bfloat16_rn(value); }
 inline double value(Bf16 x) { return __bfloat162float(x); }
+inline double value(int x) { return x; }  // integer arrays (ids, indices) are comparable too
 inline double value(float x) { return x; }
 inline double value(double x) { return x; }
 

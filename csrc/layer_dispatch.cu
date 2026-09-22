@@ -67,6 +67,12 @@ static int run_ffn(const LayerContext *ctx, const struct LayerWeights *w,
         return forward_mlp(ctx->cublas, ctx->stream, residual, ctx->workspace, layer_out,
                            &mw, ctx->tokens, ctx->dims);
     }
+    case ENGINE_FFN_MOE: {
+        MoeScratch scratch{ctx->moe_scratch, 0};
+        MoeConfig config = w->moe_config;
+        return forward_moe_ffn(ctx->cublas, ctx->stream, residual, layer_out, &w->moe,
+                               &config, scratch, ctx->tokens, ctx->dims);
+    }
     default:
         throw std::runtime_error("unsupported ffn kind " + std::to_string(w->plan.ffn));
     }

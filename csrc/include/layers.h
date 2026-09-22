@@ -131,6 +131,19 @@ struct LayerWeights {
     std::vector<std::pair<void *, size_t>> reset_zero;
 };
 
+/* Debug taps: which layers get their activations dumped, and where. Enabled by
+ * INFER_TAP_LAYERS=0,1,2 and INFER_TAP_DIR=<dir>; shared by the engine's layer
+ * loop (kind "layer", the residual stream) and the sub-layer sites in
+ * layer_dispatch.cu (kind "mixer" / "ffn"). */
+struct TapConfig {
+    std::vector<int> layers;
+    std::string dir;
+};
+
+void tap_parse_env(TapConfig *taps);
+void tap_dump(const TapConfig *taps, const char *kind, int layer, int device,
+              const __nv_bfloat16 *data, int tokens, const ModelDims *dims);
+
 /* Per-invocation context: device handles, scratch and sequence position. */
 typedef struct {
     cublasHandle_t cublas;
@@ -143,7 +156,9 @@ typedef struct {
     int tokens;
     int seq_len;              /* sequence length including the current tokens */
     int layer_index;          /* for diagnostics only */
+    int device;               /* CUDA ordinal, for diagnostics only */
     const ModelDims *dims;
+    const TapConfig *taps;
 } LayerContext;
 
 /* norm -> mixer -> residual -> norm -> ffn -> residual, dispatched on the plan.

@@ -36,7 +36,7 @@ add_custom_command(
 )
 
 add_library(engine SHARED
-    engine.cu memory.cu safetensors_loader.cu model_desc.c layer_dispatch.cu collective.cu moe.cu
+    engine.cu memory.cu safetensors_loader.cu model_desc.c layer_dispatch.cu collective.cu moe.cu tap.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu

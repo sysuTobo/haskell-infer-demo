@@ -88,6 +88,7 @@ int forward_layer(const LayerContext *ctx, const struct LayerWeights *w,
                 ctx->layer_index, w->plan.mixer, status);
         return status;
     }
+    tap_dump(ctx->taps, "mixer", ctx->layer_index, ctx->device, layer_out, ctx->tokens, ctx->dims);
     kernel_residual_add(const_cast<__nv_bfloat16 *>(residual), layer_out, elements, ctx->stream);
     status = with_cuda_error(0);
     if (status != 0) {
@@ -102,6 +103,7 @@ int forward_layer(const LayerContext *ctx, const struct LayerWeights *w,
                 ctx->layer_index, w->plan.ffn, status);
         return status;
     }
+    tap_dump(ctx->taps, "ffn", ctx->layer_index, ctx->device, layer_out, ctx->tokens, ctx->dims);
     kernel_residual_add(const_cast<__nv_bfloat16 *>(residual), layer_out, elements, ctx->stream);
     status = with_cuda_error(0);
     if (status != 0) {

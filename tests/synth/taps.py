@@ -4,16 +4,22 @@ compare them against the engine's taps (`INFER_TAP_LAYERS` / `INFER_TAP_DIR`).
   python tests/synth/taps.py dump --model-dir DIR --out DIR --prompt 1,2,3,4,5
   python tests/synth/taps.py compare --ours DIR --theirs DIR
 
-Both sides write raw float32 [tokens, hidden] as layer_<i>_seq<s>_tok<n>.f32, so
-the first layer whose numbers diverge points at the sublayer to fix.
+Both sides write raw float32 [tokens, hidden] as <kind>_<i>_seq<s>_tok<n>.f32,
+with kind `layer` (residual stream after the decoder layer), `mixer` (the token
+mixer's output, before its residual add) or `ffn` (the feed-forward's output),
+so the first tap whose numbers diverge points at the sub-layer to fix.
 """
 
 import argparse
+import re
 from pathlib import Path
 
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM
+
+KINDS = ("layer", "mixer", "ffn")
+TAP_NAME = re.compile(r"^(layer|mixer|ffn)_(\d+)_seq\d+_tok\d+\.f32$")
 
 
 def dump(args):
@@ -26,34 +32,48 @@ def dump(args):
     tokens = len(prompt)
     captured = {}
 
-    def hook(index):
+    def hook(name):
         def run(_module, _inputs, output):
             hidden = output[0] if isinstance(output, tuple) else output
             if hidden.dim() == 3:  # (batch, tokens, hidden)
                 hidden = hidden[0]
-            captured[index] = hidden.detach().float().cpu().numpy()
+            captured[name] = hidden.detach().float().cpu().numpy()
 
         return run
 
     layers = model.model.layers
-    handles = [layer.register_forward_hook(hook(i)) for i, layer in enumerate(layers)]
+    handles = []
+    for index, layer in enumerate(layers):
+        handles.append(layer.register_forward_hook(hook(f"layer_{index:02d}")))
+        # GDN layers mix tokens with `linear_attn`, attention layers with `self_attn`.
+        mixer = getattr(layer, "linear_attn", None) or layer.self_attn
+        handles.append(mixer.register_forward_hook(hook(f"mixer_{index:02d}")))
+        handles.append(layer.mlp.register_forward_hook(hook(f"ffn_{index:02d}")))
     with torch.inference_mode():
         model(input_ids=torch.tensor([prompt], dtype=torch.long, device=model.device))
     for handle in handles:
         handle.remove()
 
-    for index, hidden in sorted(captured.items()):
+    for name, hidden in sorted(captured.items()):
         assert hidden.shape == (tokens, model.config.hidden_size), hidden.shape
-        path = out / f"layer_{index:02d}_seq0_tok{tokens}.f32"
+        path = out / f"{name}_seq0_tok{tokens}.f32"
         path.write_bytes(hidden.astype(np.float32).tobytes())
         print(f"wrote {path} rms={float(np.sqrt((hidden ** 2).mean())):.5f}")
-    print(f"dumped {len(captured)} layers for prompt {prompt}")
+    print(f"dumped {len(captured)} taps for prompt {prompt}")
+
+
+def tap_rank(name):
+    """Order taps layer-major, in the order a layer computes them."""
+    match = TAP_NAME.match(name)
+    return int(match.group(2)), KINDS.index(match.group(1))
 
 
 def compare(args):
     ours, theirs = Path(args.ours), Path(args.theirs)
-    names = sorted({p.name for p in ours.glob("layer_*.f32")} &
-                   {p.name for p in theirs.glob("layer_*.f32")})
+    names = sorted(({p.name for p in ours.glob("*.f32")} &
+                    {p.name for p in theirs.glob("*.f32")}),
+                   key=lambda name: tap_rank(name) if TAP_NAME.match(name) else (1 << 30, 0))
+    names = [name for name in names if TAP_NAME.match(name)]
     if not names:
         print("no overlapping tap files")
         return 1
@@ -73,9 +93,9 @@ def compare(args):
         if worst is None and rms / scale > 0.02:
             worst = name
     if worst is None:
-        print("all layers agree within 2% of the reference scale")
+        print("all taps agree within 2% of the reference scale")
         return 0
-    print(f"first layer diverging beyond 2%: {worst}")
+    print(f"first tap diverging beyond 2%: {worst}")
     return 1
 
 

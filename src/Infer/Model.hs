@@ -1,69 +1,51 @@
--- | Model architecture definition: layer types and the 64-layer structure.
+-- | Model definition: the layer plan derived from a descriptor and a placement.
 --
--- Qwen3.8-27B is a hybrid architecture: every 4th layer is full attention,
--- the rest are GatedDeltaNet (GDN). This module defines the layer ADT and
--- constructs the full model description.
+-- A layer is a (mixer, feed-forward) pair plus the device that runs it. Nothing
+-- here is architecture-specific: the mixer/FFN kinds come from the descriptor.
 module Infer.Model
-  ( LayerType(..)
-  , Layer(..)
+  ( Layer(..)
   , ModelDef(..)
-  , qwen38_27bModel
+  , modelDef
   , isAttentionLayer
   , isGdnLayer
   , attentionLayerIndices
   , gdnLayerIndices
   ) where
 
-import Infer.Config
+import Infer.Descriptor
+import Infer.Placement
 
--- | The two layer types in the hybrid architecture.
-data LayerType
-  = FullAttention  -- ^ Standard multi-head attention with GQA, RoPE, output gate
-  | GatedDeltaNet  -- ^ GatedDeltaNet: causal conv1d + delta rule + gated norm
-  deriving (Eq, Show, Enum, Bounded)
-
--- | A single transformer layer with its type and global index.
+-- | A single transformer layer.
 data Layer = Layer
-  { layerIndex :: !Int       -- ^ Global layer index (0..63)
-  , layerType  :: !LayerType
-  , layerDevice :: !Int      -- ^ Assigned GPU device ordinal
+  { layerIndex :: !Int
+  , layerMixer :: !MixerKind   -- ^ token-mixing sublayer
+  , layerFfn :: !FfnKind       -- ^ feed-forward sublayer
+  , layerDevice :: !Int        -- ^ Device ordinal that owns the weights and state
   } deriving (Eq, Show)
 
--- | Complete model definition.
+-- | Complete model definition: descriptor + placement + per-layer plan.
 data ModelDef = ModelDef
-  { mdConfig  :: ModelConfig
-  , mdLayers  :: [Layer]     -- ^ All 64 layers in order
-  , mdPartition :: GpuPartition
-  }
+  { mdDescriptor :: !Descriptor
+  , mdPlacement :: !Placement
+  , mdLayers :: [Layer]
+  } deriving (Eq, Show)
 
--- | Construct the Qwen3.8-27B model definition with a given GPU partition.
-qwen38_27bModel :: [Int] -> ModelDef
-qwen38_27bModel devices = ModelDef
-  { mdConfig    = cfg
-  , mdLayers    = layers
-  , mdPartition = partition
-  }
-  where
-    cfg = qwen38_27bConfig
-    partition = computePartition (mcNumLayers cfg) devices
-    layerDevs = gpLayerDevices partition
-    layers = zipWith mkLayer [0 .. mcNumLayers cfg - 1] layerDevs
-    mkLayer i dev = Layer
-      { layerIndex  = i
-      , layerType   = if isAttentionIndex cfg i then FullAttention else GatedDeltaNet
-      , layerDevice = dev
-      }
-
--- | A layer is full attention if (index + 1) is divisible by the interval.
--- Layer indices are 0-based: layers 3, 7, 11, ..., 63 are attention.
-isAttentionIndex :: ModelConfig -> Int -> Bool
-isAttentionIndex cfg i = (i + 1) `mod` mcFullAttnInterval cfg == 0
+-- | Build the layer plan for a descriptor and policy on the given devices.
+modelDef :: Descriptor -> Policy -> [Int] -> Either String ModelDef
+modelDef desc policy devices = do
+  place <- placement desc policy devices
+  let indices = zip3 [0 ..] (dLayerMixers desc) (dLayerFfns desc)
+      layers =
+        [ Layer i mixer ffn (plLayerDevices place !! i)
+        | (i, mixer, ffn) <- indices
+        ]
+  pure ModelDef { mdDescriptor = desc, mdPlacement = place, mdLayers = layers }
 
 isAttentionLayer :: Layer -> Bool
-isAttentionLayer l = layerType l == FullAttention
+isAttentionLayer l = layerMixer l == MFullAttention
 
 isGdnLayer :: Layer -> Bool
-isGdnLayer l = layerType l == GatedDeltaNet
+isGdnLayer l = layerMixer l == MGatedDeltaNet
 
 attentionLayerIndices :: ModelDef -> [Int]
 attentionLayerIndices md = [layerIndex l | l <- mdLayers md, isAttentionLayer l]

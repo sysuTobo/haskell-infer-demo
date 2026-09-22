@@ -30,37 +30,42 @@ typedef struct EngineHandle EngineHandle;
 /* ------------------------------------------------------------------ */
 
 /**
- * Layer-to-device assignment. Haskell computes the partition and passes
- * an array where layer_devices[i] = CUDA device ordinal for layer i.
+ * The engine is created from a *descriptor* (flat JSON, see model_desc.h) that
+ * carries the architecture, plus a layer placement:
+ *
+ *   devices        - CUDA device ordinals to use, length num_devices
+ *   layer_devices  - device ordinal owning each layer, length num_layers
+ *
+ * The descriptor is the single source of truth for model dimensions: the C side
+ * holds no per-family constants. A hand-packed struct was deliberately avoided:
+ * the descriptor spans variable-length per-layer data (layer kinds, expert
+ * counts) and previously had to be mirrored field-for-field in Haskell, C and
+ * two Python tests.
  */
-typedef struct {
-    int num_layers;          /* total transformer layers (64 for Qwen3.8-27B) */
-    int num_devices;         /* number of GPUs to use */
-    const int *devices;      /* device ordinals, length num_devices */
-    const int *layer_devices;/* per-layer device assignment, length num_layers */
-    int max_seq_len;         /* maximum context length (e.g. 4096) */
-} EngineConfig;
 
 /* ------------------------------------------------------------------ */
 /*  Lifecycle                                                         */
 /* ------------------------------------------------------------------ */
 
 /**
- * Create an engine: allocate GPU memory, load weights, initialize state.
+ * Create an engine: parse the descriptor, allocate GPU memory, load weights,
+ * initialize state.
  *
- * @param model_dir   Path to the model directory containing safetensors
- *                    shards and config.json.
- * @param config      Layer partition and runtime configuration.
- * @return            Opaque handle, or NULL on failure.
+ * @param model_dir      Path to the model directory (safetensors shards).
+ * @param descriptor_json Flat JSON architecture descriptor.
+ * @param num_devices    Number of devices in @devices (>= 1).
+ * @param devices        CUDA device ordinals, length num_devices.
+ * @param layer_devices  Per-layer device ordinal, length descriptor num_layers.
+ * @return               Opaque handle, or NULL on failure.
  *
- * Weight loading: the engine reads safetensors files from model_dir,
- * maps each tensor to its target device based on config.layer_devices,
- * and uploads via cudaMemcpyAsync. Host-side mmap is released after upload.
- *
- * Derived weights (GemmaRMSNorm weight+1, RoPE cos/sin tables) are
- * computed on-device after loading.
+ * Weight loading: the engine reads safetensors files from model_dir, expands the
+ * descriptor's weight-name templates, validates each tensor shape against the
+ * role, and uploads to the owning device. Derived weights (GemmaRMSNorm weight+1,
+ * RoPE cos/sin tables) are computed on-device after loading.
  */
-EngineHandle *engine_create(const char *model_dir, const EngineConfig *config);
+EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
+                            int num_devices, const int *devices,
+                            const int *layer_devices);
 
 /**
  * Destroy the engine and free all GPU memory.
@@ -125,6 +130,18 @@ int engine_vocab_size(const EngineHandle *engine);
  * Get the number of tokens processed so far in the current sequence.
  */
 int engine_seq_len(const EngineHandle *engine);
+
+/**
+ * Descriptor wire-format version supported by this library.
+ */
+int engine_desc_version(void);
+
+/**
+ * Write the canonical form of the descriptor the engine parsed into buf.
+ * Returns the number of bytes written (excluding the NUL terminator), or a
+ * negative error code when buf is too small.
+ */
+int engine_describe(const EngineHandle *engine, char *buf, int buf_len);
 
 /* ------------------------------------------------------------------ */
 /*  Error codes                                                       */

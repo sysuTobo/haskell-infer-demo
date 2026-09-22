@@ -2,12 +2,14 @@
 #include "engine.h"
 #include "kernels.h"
 #include "layers.h"
+#include "model_desc.h"
 #include "flashinfer_ops.h"
 #include "fla_ops.h"
 
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <new>
 #include <stdexcept>
@@ -69,20 +71,90 @@ int engine_hello_gpu(int device, int value) {
     return h;
 }
 
-static const int MAX_LAYERS = 64;
-static const int HIDDEN = 5120;
-static const int INTERMEDIATE = 17408;
-static const int VOCAB = 248320;
-static const int NUM_HEADS = 24;
-static const int NUM_KV_HEADS = 4;
-static const int HEAD_DIM = 256;
-static const int ROTARY_DIM = 64;
-static const int CONV_DIM = 10240;
-static const int GDN_V_DIM = 6144;
-static const int GDN_VH = 48;
-static const int GDN_KH = 16;
-static const int GDN_HD = 128;
-static const int ATTN_INTERVAL = 4;
+/* ------------------------------------------------------------------ */
+/* Weight roles                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Where a role's tensor lives: on the layer's own device (0), the first
+ * configured device (1, embedding) or the last one (2, output head). The
+ * convention is family-independent, so it lives here rather than in the
+ * descriptor. */
+enum RoleOwner { OWNER_LAYER = 0, OWNER_FIRST = 1, OWNER_LAST = 2 };
+
+/* Expected tensor shape per role, in terms of the model dimensions. */
+struct ExpectedShape {
+    int ndim;
+    long long dims[3];
+};
+
+static ExpectedShape expected_shape(int role, const struct ModelDesc &d) {
+    const long long hidden = d.hidden_size;
+    const long long q_rows = (long long)d.num_heads * d.head_dim *
+                             (d.attn_output_gate ? 2 : 1);
+    const long long kv_rows = (long long)d.num_kv_heads * d.head_dim;
+    switch (role) {
+    case ROLE_EMBED: case ROLE_LM_HEAD:
+        return {2, {d.vocab_size, hidden, 0}};
+    case ROLE_FINAL_NORM: case ROLE_INPUT_NORM: case ROLE_POST_NORM:
+        return {1, {hidden, 0, 0}};
+    case ROLE_MLP_GATE: case ROLE_MLP_UP:
+        return {2, {d.intermediate_size, hidden, 0}};
+    case ROLE_MLP_DOWN:
+        return {2, {hidden, d.intermediate_size, 0}};
+    case ROLE_ATTN_Q:
+        return {2, {q_rows, hidden, 0}};
+    case ROLE_ATTN_K: case ROLE_ATTN_V:
+        return {2, {kv_rows, hidden, 0}};
+    case ROLE_ATTN_O:
+        return {2, {hidden, (long long)d.num_heads * d.head_dim, 0}};
+    case ROLE_ATTN_Q_NORM: case ROLE_ATTN_K_NORM:
+        return {1, {d.head_dim, 0, 0}};
+    case ROLE_GDN_QKV:
+        return {2, {d.gdn_conv_dim, hidden, 0}};
+    case ROLE_GDN_Z:
+        return {2, {d.gdn_value_dim, hidden, 0}};
+    case ROLE_GDN_A: case ROLE_GDN_B:
+        return {2, {d.gdn_num_v_heads, hidden, 0}};
+    case ROLE_GDN_CONV1D:
+        return {3, {d.gdn_conv_dim, 1, d.gdn_conv_kernel}};
+    case ROLE_GDN_DT_BIAS: case ROLE_GDN_A_LOG:
+        return {1, {d.gdn_num_v_heads, 0, 0}};
+    case ROLE_GDN_OUT:
+        return {2, {hidden, d.gdn_value_dim, 0}};
+    case ROLE_GDN_NORM:
+        return {1, {d.gdn_head_dim, 0, 0}};
+    default:
+        return {0, {0, 0, 0}};
+    }
+}
+
+static int role_owner(int role) {
+    switch (role) {
+    case ROLE_EMBED: return OWNER_FIRST;
+    case ROLE_LM_HEAD: case ROLE_FINAL_NORM: return OWNER_LAST;
+    default: return OWNER_LAYER;
+    }
+}
+
+/* Roles a layer needs, given its mixer kind. */
+static bool role_used_by_mixer(int role, int mixer) {
+    if (role == ROLE_INPUT_NORM || role == ROLE_POST_NORM ||
+        role == ROLE_MLP_GATE || role == ROLE_MLP_UP || role == ROLE_MLP_DOWN)
+        return true;
+    if (mixer == ENGINE_MIXER_FULL_ATTN)
+        return role == ROLE_ATTN_Q || role == ROLE_ATTN_K || role == ROLE_ATTN_V ||
+               role == ROLE_ATTN_O || role == ROLE_ATTN_Q_NORM || role == ROLE_ATTN_K_NORM;
+    if (mixer == ENGINE_MIXER_GDN)
+        return role == ROLE_GDN_QKV || role == ROLE_GDN_Z || role == ROLE_GDN_A ||
+               role == ROLE_GDN_B || role == ROLE_GDN_CONV1D || role == ROLE_GDN_DT_BIAS ||
+               role == ROLE_GDN_A_LOG || role == ROLE_GDN_OUT || role == ROLE_GDN_NORM;
+    return false;
+}
+
+struct RoleSlot {
+    int role;
+    __nv_bfloat16 **target;         /* field in LayerWeights, or null for globals */
+};
 
 struct LayerWeights {
     bool is_attention;
@@ -110,6 +182,9 @@ struct LayerWeights {
     __nv_bfloat16 *kv_cache;
     __nv_bfloat16 *conv_state;
     float *ssm_state;
+
+    /* Maps the descriptor's roles onto the fields above for this layer. */
+    std::vector<RoleSlot> slots;
 };
 
 struct DeviceCtx {
@@ -128,6 +203,8 @@ struct DeviceCtx {
 
 struct EngineHandle {
     ModelDims dims{};
+    struct ModelDesc desc{};
+    int num_layers = 0;      // layers actually allocated (0 before parsing succeeds)
     int num_devices = 0;
     std::vector<int> devices;
     std::vector<int> layer_device;      // Internal indices, not CUDA ordinals.
@@ -142,70 +219,150 @@ struct EngineHandle {
     bool state_valid = true;
 };
 
-static bool is_attention_layer(int i) { return (i + 1) % ATTN_INTERVAL == 0; }
-
 static size_t kv_cache_bytes(const EngineHandle *eng) {
-    return (size_t)2 * eng->dims.max_seq_len * NUM_KV_HEADS * HEAD_DIM * sizeof(__nv_bfloat16);
+    return (size_t)2 * eng->dims.max_seq_len * eng->dims.num_kv_heads *
+           eng->dims.head_dim * sizeof(__nv_bfloat16);
 }
 
-static size_t conv_state_bytes() { return (size_t)CONV_DIM * 3 * sizeof(__nv_bfloat16); }
-static size_t ssm_state_bytes() { return (size_t)GDN_VH * GDN_HD * GDN_HD * sizeof(float); }
+static size_t conv_state_bytes(const EngineHandle *eng) {
+    return (size_t)eng->dims.gdn_conv_dim * (eng->dims.gdn_conv_kernel - 1) *
+           sizeof(__nv_bfloat16);
+}
 
-static void load_weight(const std::map<std::string, TensorInfo> &index,
-                        const std::string &name, __nv_bfloat16 **dst,
-                        int device, size_t elements) {
+static size_t ssm_state_bytes(const EngineHandle *eng) {
+    return (size_t)eng->dims.gdn_num_v_heads * eng->dims.gdn_head_dim *
+           eng->dims.gdn_head_dim * sizeof(float);
+}
+
+/* Load a tensor by role: expand the template, validate the shape, upload. */
+static void load_role(const std::map<std::string, TensorInfo> &index,
+                      const struct ModelDesc &desc, int role, int layer,
+                      int device, __nv_bfloat16 **dst) {
+    int slot = model_desc_role_index(&desc, role);
+    if (slot < 0)
+        throw EngineError(ENGINE_ERR_WEIGHTS,
+                          std::string("Descriptor has no template for role ") +
+                              std::to_string(role));
+    char name[ENGINE_TEMPLATE_MAX];
+    model_desc_expand(desc.role_templates[slot], layer, 0, name, sizeof(name));
     auto it = index.find(name);
     if (it == index.end())
-        throw EngineError(ENGINE_ERR_WEIGHTS, "Tensor not found: " + name);
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Tensor not found: ") + name);
     const TensorInfo &ti = it->second;
-    const size_t bytes = elements * sizeof(__nv_bfloat16);
-    if (ti.dtype != 0 || ti.data_start < 0 || ti.data_end < ti.data_start ||
-        (unsigned long long)(ti.data_end - ti.data_start) != bytes)
-        throw EngineError(ENGINE_ERR_WEIGHTS, "Unexpected tensor dtype/size: " + name);
+    if (ti.dtype != 0)
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Tensor is not BF16: ") + name);
+    ExpectedShape want = expected_shape(role, desc);
+    bool shape_ok = ti.ndim == want.ndim;
+    for (int i = 0; shape_ok && i < want.ndim; ++i) shape_ok = ti.shape[i] == want.dims[i];
+    if (!shape_ok)
+        throw EngineError(ENGINE_ERR_WEIGHTS,
+                          std::string("Unexpected shape for ") + name + " (" +
+                              std::to_string(ti.ndim) + " dims)");
+    long long elements = 1;
+    for (int i = 0; i < ti.ndim; ++i) elements *= ti.shape[i];
+    const size_t bytes = (size_t)elements * sizeof(__nv_bfloat16);
     check_cuda(cudaSetDevice(device), "Set weight device");
     check_cuda(cudaMalloc(dst, bytes), "Allocate weight");
     int status = safetensors_load_tensor(ti, *dst, device);
     check_cuda(cudaGetLastError(), "Upload weight");
     if (status != 0)
-        throw EngineError(ENGINE_ERR_WEIGHTS, "Cannot load tensor: " + name);
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + name);
     // The loader uploads on the default stream; compute streams are nonblocking.
     check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
 }
 
-EngineHandle *engine_create(const char *model_dir, const EngineConfig *config) {
+/* Field that receives a role's tensor for the given layer kind. */
+static __nv_bfloat16 **role_target(LayerWeights &lw, int role) {
+    switch (role) {
+    case ROLE_INPUT_NORM: return &lw.input_norm_w;
+    case ROLE_POST_NORM: return &lw.post_norm_w;
+    case ROLE_MLP_GATE: return &lw.gate_proj_w;
+    case ROLE_MLP_UP: return &lw.up_proj_w;
+    case ROLE_MLP_DOWN: return &lw.down_proj_w;
+    case ROLE_ATTN_Q: return &lw.q_proj_w;
+    case ROLE_ATTN_K: return &lw.k_proj_w;
+    case ROLE_ATTN_V: return &lw.v_proj_w;
+    case ROLE_ATTN_O: return &lw.o_proj_w;
+    case ROLE_ATTN_Q_NORM: return &lw.q_norm_w;
+    case ROLE_ATTN_K_NORM: return &lw.k_norm_w;
+    case ROLE_GDN_QKV: return &lw.in_proj_qkv_w;
+    case ROLE_GDN_Z: return &lw.in_proj_z_w;
+    case ROLE_GDN_A: return &lw.in_proj_a_w;
+    case ROLE_GDN_B: return &lw.in_proj_b_w;
+    case ROLE_GDN_CONV1D: return &lw.conv1d_w;
+    case ROLE_GDN_DT_BIAS: return &lw.dt_bias;
+    case ROLE_GDN_A_LOG: return &lw.A_log;
+    case ROLE_GDN_OUT: return &lw.gdn_out_proj_w;
+    case ROLE_GDN_NORM: return &lw.gdn_norm_w;
+    default: return nullptr;
+    }
+}
+
+/* Roles whose tensors are loaded once, outside the layer loop. */
+struct GlobalRole {
+    int role;
+    __nv_bfloat16 **target;   /* points into EngineHandle */
+};
+
+static void fill_dims(ModelDims &dims, const struct ModelDesc &desc) {
+    dims = ModelDims{};
+    dims.hidden_size = desc.hidden_size;
+    dims.intermediate_size = desc.intermediate_size;
+    dims.num_heads = desc.num_heads;
+    dims.num_kv_heads = desc.num_kv_heads;
+    dims.head_dim = desc.head_dim;
+    dims.rotary_dim = desc.rotary_dim;
+    dims.num_layers = desc.num_layers;
+    dims.vocab_size = desc.vocab_size;
+    dims.rms_eps = (float)desc.rms_eps;
+    dims.rope_theta = (float)desc.rotary_theta;
+    dims.max_seq_len = desc.max_seq_len;
+    dims.gdn_conv_dim = desc.gdn_conv_dim;
+    dims.gdn_value_dim = desc.gdn_value_dim;
+    dims.gdn_num_v_heads = desc.gdn_num_v_heads;
+    dims.gdn_num_k_heads = desc.gdn_num_k_heads;
+    dims.gdn_head_dim = desc.gdn_head_dim;
+    dims.gdn_conv_kernel = desc.gdn_conv_kernel;
+}
+
+EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
+                            int num_devices, const int *devices,
+                            const int *layer_devices) {
     g_error_buf[0] = '\0';
     EngineHandle *eng = nullptr;
+    char desc_error[256] = {0};
     try {
-        if (!model_dir || !*model_dir || !config || config->num_layers != MAX_LAYERS ||
-            config->num_devices < 1 || !config->devices || !config->layer_devices ||
-            config->max_seq_len < 1)
+        if (!model_dir || !*model_dir || !descriptor_json || num_devices < 1 ||
+            !devices || !layer_devices)
             throw EngineError(ENGINE_ERR_CONFIG, "Invalid engine configuration");
-        int device_count = 0;
-        check_cuda(cudaGetDeviceCount(&device_count), "Get device count");
-        if (config->num_devices > device_count)
-            throw EngineError(ENGINE_ERR_CONFIG, "Too many configured devices");
 
         eng = new EngineHandle();
-        eng->num_devices = config->num_devices;
-        eng->devices.assign(config->devices, config->devices + config->num_devices);
-        for (int d = 0; d < eng->num_devices; ++d) {
+        if (model_desc_parse(descriptor_json, &eng->desc, desc_error, sizeof(desc_error)) != 0)
+            throw EngineError(ENGINE_ERR_CONFIG, std::string("Bad descriptor: ") + desc_error);
+        fill_dims(eng->dims, eng->desc);
+        eng->num_layers = eng->desc.num_layers;
+
+        int device_count = 0;
+        check_cuda(cudaGetDeviceCount(&device_count), "Get device count");
+        if (num_devices > device_count)
+            throw EngineError(ENGINE_ERR_CONFIG, "Too many configured devices");
+        eng->num_devices = num_devices;
+        eng->devices.assign(devices, devices + num_devices);
+        for (int d = 0; d < num_devices; ++d) {
             int ordinal = eng->devices[d];
             if (ordinal < 0 || ordinal >= device_count ||
                 std::find(eng->devices.begin(), eng->devices.begin() + d, ordinal) !=
                     eng->devices.begin() + d)
                 throw EngineError(ENGINE_ERR_CONFIG, "Invalid or duplicate CUDA device ordinal");
         }
-        eng->layer_device.resize(MAX_LAYERS);
-        for (int i = 0; i < MAX_LAYERS; ++i) {
-            // Haskell's layer_devices contains CUDA ordinals, including for [1,0].
-            auto it = std::find(eng->devices.begin(), eng->devices.end(), config->layer_devices[i]);
+        const int num_layers = eng->desc.num_layers;
+        eng->layer_device.resize(num_layers);
+        for (int i = 0; i < num_layers; ++i) {
+            auto it = std::find(eng->devices.begin(), eng->devices.end(), layer_devices[i]);
             if (it == eng->devices.end())
                 throw EngineError(ENGINE_ERR_CONFIG, "Layer assigned to an unconfigured device");
             eng->layer_device[i] = (int)(it - eng->devices.begin());
         }
-        eng->dims = {HIDDEN, INTERMEDIATE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,
-                     ROTARY_DIM, MAX_LAYERS, ATTN_INTERVAL, VOCAB, 1e-6f, 1e7f,
-                     config->max_seq_len, CONV_DIM, GDN_VH, GDN_KH, GDN_HD, 4};
 
         std::map<std::string, TensorInfo> index;
         int nt = safetensors_scan_dir(model_dir, index);
@@ -213,9 +370,10 @@ EngineHandle *engine_create(const char *model_dir, const EngineConfig *config) {
             throw EngineError(ENGINE_ERR_WEIGHTS, std::string("No safetensors found in ") + model_dir);
         fprintf(stderr, "[engine] Scanned %d tensors from %s\n", nt, model_dir);
 
+        const int hidden = eng->dims.hidden_size;
         eng->ctx = new DeviceCtx[eng->num_devices]();
-        eng->layers = new LayerWeights[MAX_LAYERS]();
-        const size_t activation_bytes = (size_t)ENGINE_BATCH_TOKENS * HIDDEN * sizeof(__nv_bfloat16);
+        eng->layers = new LayerWeights[num_layers]();
+        const size_t activation_bytes = (size_t)ENGINE_BATCH_TOKENS * hidden * sizeof(__nv_bfloat16);
         for (int d = 0; d < eng->num_devices; ++d) {
             DeviceCtx &ctx = eng->ctx[d];
             ctx.device_id = eng->devices[d];
@@ -227,66 +385,51 @@ EngineHandle *engine_create(const char *model_dir, const EngineConfig *config) {
             check_cuda(cudaMalloc(&ctx.layer_out, activation_bytes), "Allocate layer output");
             ctx.ws_size = layer_workspace_size(ENGINE_BATCH_TOKENS, &eng->dims);
             check_cuda(cudaMalloc(&ctx.workspace, ctx.ws_size), "Allocate layer workspace");
-            ctx.fla_size = kernel_fla_workspace_size(ENGINE_BATCH_TOKENS, GDN_VH);
+            ctx.fla_size = kernel_fla_workspace_size(ENGINE_BATCH_TOKENS, eng->dims.gdn_num_v_heads);
             check_cuda(cudaMalloc(&ctx.fla_scratch, ctx.fla_size), "Allocate FLA scratch");
             check_cuda(cudaMalloc(&ctx.positions, ENGINE_BATCH_TOKENS * sizeof(int64_t)), "Allocate positions");
-            check_cuda(cudaMalloc(&ctx.conv_bias_zero, CONV_DIM * sizeof(__nv_bfloat16)), "Allocate conv bias");
-            check_cuda(cudaMemsetAsync(ctx.conv_bias_zero, 0, CONV_DIM * sizeof(__nv_bfloat16), ctx.stream),
+            check_cuda(cudaMalloc(&ctx.conv_bias_zero, eng->dims.gdn_conv_dim * sizeof(__nv_bfloat16)),
+                       "Allocate conv bias");
+            check_cuda(cudaMemsetAsync(ctx.conv_bias_zero, 0,
+                                       eng->dims.gdn_conv_dim * sizeof(__nv_bfloat16), ctx.stream),
                        "Zero conv bias");
         }
 
-        const std::string P = "model.language_model.";
-        load_weight(index, P + "embed_tokens.weight", &eng->embed_w,
-                    eng->devices.front(), (size_t)VOCAB * HIDDEN);
+        load_role(index, eng->desc, ROLE_EMBED, 0, eng->devices.front(), &eng->embed_w);
         check_cuda(cudaMalloc(&eng->token_ids, ENGINE_BATCH_TOKENS * sizeof(int64_t)), "Allocate token IDs");
-        load_weight(index, "lm_head.weight", &eng->lm_head_w,
-                    eng->devices.back(), (size_t)VOCAB * HIDDEN);
-        load_weight(index, P + "norm.weight", &eng->final_norm_w, eng->devices.back(), HIDDEN);
-        check_cuda(cudaMalloc(&eng->d_logits, VOCAB * sizeof(float)), "Allocate logits");
+        load_role(index, eng->desc, ROLE_LM_HEAD, 0, eng->devices.back(), &eng->lm_head_w);
+        load_role(index, eng->desc, ROLE_FINAL_NORM, 0, eng->devices.back(), &eng->final_norm_w);
+        check_cuda(cudaMalloc(&eng->d_logits, eng->dims.vocab_size * sizeof(float)), "Allocate logits");
 
-        for (int i = 0; i < MAX_LAYERS; ++i) {
+        for (int i = 0; i < num_layers; ++i) {
             DeviceCtx &ctx = eng->ctx[eng->layer_device[i]];
             check_cuda(cudaSetDevice(ctx.device_id), "Load layer device");
             LayerWeights &lw = eng->layers[i];
-            lw.is_attention = is_attention_layer(i);
-            const std::string lp = P + "layers." + std::to_string(i) + ".";
-            auto load = [&](const std::string &suffix, __nv_bfloat16 **dst, size_t elements) {
-                load_weight(index, lp + suffix, dst, ctx.device_id, elements);
-            };
-            load("input_layernorm.weight", &lw.input_norm_w, HIDDEN);
-            load("post_attention_layernorm.weight", &lw.post_norm_w, HIDDEN);
-            load("mlp.gate_proj.weight", &lw.gate_proj_w, (size_t)INTERMEDIATE * HIDDEN);
-            load("mlp.up_proj.weight", &lw.up_proj_w, (size_t)INTERMEDIATE * HIDDEN);
-            load("mlp.down_proj.weight", &lw.down_proj_w, (size_t)HIDDEN * INTERMEDIATE);
-
+            const int mixer = eng->desc.layer_mixers[i];
+            lw.is_attention = mixer == ENGINE_MIXER_FULL_ATTN;
+            for (int role = 0; role < ROLE_COUNT; ++role) {
+                if (!role_used_by_mixer(role, mixer)) continue;
+                __nv_bfloat16 **target = role_target(lw, role);
+                if (target == nullptr) continue;
+                load_role(index, eng->desc, role, i, ctx.device_id, target);
+                lw.slots.push_back(RoleSlot{role, target});
+            }
             if (lw.is_attention) {
-                load("self_attn.q_proj.weight", &lw.q_proj_w, (size_t)2 * NUM_HEADS * HEAD_DIM * HIDDEN);
-                load("self_attn.k_proj.weight", &lw.k_proj_w, (size_t)NUM_KV_HEADS * HEAD_DIM * HIDDEN);
-                load("self_attn.v_proj.weight", &lw.v_proj_w, (size_t)NUM_KV_HEADS * HEAD_DIM * HIDDEN);
-                load("self_attn.o_proj.weight", &lw.o_proj_w, (size_t)HIDDEN * NUM_HEADS * HEAD_DIM);
-                load("self_attn.q_norm.weight", &lw.q_norm_w, HEAD_DIM);
-                load("self_attn.k_norm.weight", &lw.k_norm_w, HEAD_DIM);
                 check_cuda(cudaMalloc(&lw.kv_cache, kv_cache_bytes(eng)), "Allocate KV cache");
                 check_cuda(cudaMemsetAsync(lw.kv_cache, 0, kv_cache_bytes(eng), ctx.stream), "Zero KV cache");
             } else {
-                load("linear_attn.in_proj_qkv.weight", &lw.in_proj_qkv_w, (size_t)CONV_DIM * HIDDEN);
-                load("linear_attn.in_proj_z.weight", &lw.in_proj_z_w, (size_t)GDN_V_DIM * HIDDEN);
-                load("linear_attn.in_proj_a.weight", &lw.in_proj_a_w, (size_t)GDN_VH * HIDDEN);
-                load("linear_attn.in_proj_b.weight", &lw.in_proj_b_w, (size_t)GDN_VH * HIDDEN);
-                load("linear_attn.conv1d.weight", &lw.conv1d_w, (size_t)CONV_DIM * 4);
-                load("linear_attn.dt_bias", &lw.dt_bias, GDN_VH);
-                load("linear_attn.A_log", &lw.A_log, GDN_VH);
-                load("linear_attn.out_proj.weight", &lw.gdn_out_proj_w, (size_t)HIDDEN * GDN_V_DIM);
-                load("linear_attn.norm.weight", &lw.gdn_norm_w, GDN_HD);
-                check_cuda(cudaMalloc(&lw.gdn_norm_f32, GDN_HD * sizeof(float)), "Allocate GDN norm");
-                kernel_cast_bf16_f32(lw.gdn_norm_f32, lw.gdn_norm_w, GDN_HD, ctx.stream);
+                check_cuda(cudaMalloc(&lw.gdn_norm_f32, eng->dims.gdn_head_dim * sizeof(float)),
+                           "Allocate GDN norm");
+                kernel_cast_bf16_f32(lw.gdn_norm_f32, lw.gdn_norm_w, eng->dims.gdn_head_dim, ctx.stream);
                 check_cuda(cudaGetLastError(), "Convert GDN norm");
-                check_cuda(cudaMalloc(&lw.conv_state, conv_state_bytes()), "Allocate conv state");
-                check_cuda(cudaMemsetAsync(lw.conv_state, 0, conv_state_bytes(), ctx.stream), "Zero conv state");
-                check_cuda(cudaMalloc(&lw.ssm_state, ssm_state_bytes()), "Allocate SSM state");
-                check_cuda(cudaMemsetAsync(lw.ssm_state, 0, ssm_state_bytes(), ctx.stream), "Zero SSM state");
+                check_cuda(cudaMalloc(&lw.conv_state, conv_state_bytes(eng)), "Allocate conv state");
+                check_cuda(cudaMemsetAsync(lw.conv_state, 0, conv_state_bytes(eng), ctx.stream),
+                           "Zero conv state");
+                check_cuda(cudaMalloc(&lw.ssm_state, ssm_state_bytes(eng)), "Allocate SSM state");
+                check_cuda(cudaMemsetAsync(lw.ssm_state, 0, ssm_state_bytes(eng), ctx.stream),
+                           "Zero SSM state");
             }
-            if (i % 16 == 0) fprintf(stderr, "[engine] Loaded layer %d/%d\n", i, MAX_LAYERS);
+            if (i % 16 == 0) fprintf(stderr, "[engine] Loaded layer %d/%d\n", i, num_layers);
         }
         for (int d = 0; d < eng->num_devices; ++d) {
             check_cuda(cudaSetDevice(eng->devices[d]), "Synchronize loaded device");
@@ -303,6 +446,16 @@ EngineHandle *engine_create(const char *model_dir, const EngineConfig *config) {
     return nullptr;
 }
 
+int engine_desc_version(void) { return ENGINE_DESC_VERSION; }
+
+int engine_describe(const EngineHandle *eng, char *buf, int buf_len) {
+    if (!eng || !buf || buf_len <= 0) {
+        set_error("engine_describe: invalid arguments");
+        return ENGINE_ERR_CONFIG;
+    }
+    return model_desc_format(&eng->desc, buf, buf_len);
+}
+
 static __nv_bfloat16 *move_activation(EngineHandle *eng, int from, int to, int tokens) {
     if (from != to) {
         DeviceCtx &src = eng->ctx[from];
@@ -312,7 +465,7 @@ static __nv_bfloat16 *move_activation(EngineHandle *eng, int from, int to, int t
         check_cuda(cudaStreamSynchronize(src.stream), "Finish activation source");
         check_cuda(cudaSetDevice(dst.device_id), "Select activation destination");
         check_cuda(cudaMemcpyPeerAsync(dst.residual, dst.device_id, src.residual, src.device_id,
-                                      (size_t)tokens * HIDDEN * sizeof(__nv_bfloat16), dst.stream),
+                                      (size_t)tokens * eng->dims.hidden_size * sizeof(__nv_bfloat16), dst.stream),
                    "Copy activation between devices");
     } else {
         check_cuda(cudaSetDevice(eng->devices[to]), "Select layer device");
@@ -337,11 +490,12 @@ static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
     check_cuda(cudaMemcpyAsync(eng->token_ids, token_ids, tokens * sizeof(int64_t),
                                cudaMemcpyHostToDevice, first.stream), "Upload token IDs");
     check_cuda(cudaStreamSynchronize(first.stream), "Finish token upload");
-    kernel_embedding(first.residual, eng->embed_w, eng->token_ids, HIDDEN, tokens, first.stream);
+    kernel_embedding(first.residual, eng->embed_w, eng->token_ids, eng->dims.hidden_size,
+                     tokens, first.stream);
     check_cuda(cudaGetLastError(), "Embedding");
 
     int current = 0;
-    for (int i = 0; i < MAX_LAYERS; ++i) {
+    for (int i = 0; i < eng->num_layers; ++i) {
         const int dev_idx = eng->layer_device[i];
         __nv_bfloat16 *act = move_activation(eng, current, dev_idx, tokens);
         current = dev_idx;
@@ -376,12 +530,12 @@ static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
                           ctx.layer_out, &gw, lw.conv_state, lw.ssm_state, ctx.fla_scratch,
                           tokens, &eng->dims), "GDN layer");
         }
-        kernel_residual_add(act, ctx.layer_out, tokens * HIDDEN, ctx.stream);
+        kernel_residual_add(act, ctx.layer_out, tokens * eng->dims.hidden_size, ctx.stream);
         check_cuda(cudaGetLastError(), "Layer residual add");
         MlpWeights mw{lw.gate_proj_w, lw.up_proj_w, lw.down_proj_w, lw.post_norm_w};
         check_forward(forward_mlp(ctx.cublas, ctx.stream, act, ctx.workspace, ctx.layer_out,
                       &mw, tokens, &eng->dims), "MLP");
-        kernel_residual_add(act, ctx.layer_out, tokens * HIDDEN, ctx.stream);
+        kernel_residual_add(act, ctx.layer_out, tokens * eng->dims.hidden_size, ctx.stream);
         check_cuda(cudaGetLastError(), "MLP residual add");
     }
 
@@ -391,12 +545,13 @@ static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
         current = last_idx;
         DeviceCtx &last = eng->ctx[last_idx];
         // Public API returns only the final row; avoid [128,vocab] logits.
-        kernel_gemma_rms_norm(last.workspace, act + (size_t)(tokens - 1) * HIDDEN,
-                              eng->final_norm_w, HIDDEN, 1, eng->dims.rms_eps, last.stream);
+        kernel_gemma_rms_norm(last.workspace, act + (size_t)(tokens - 1) * eng->dims.hidden_size,
+                              eng->final_norm_w, eng->dims.hidden_size, 1, eng->dims.rms_eps,
+                              last.stream);
         check_cuda(cudaGetLastError(), "Final norm");
         check_forward(gemm_bf16_f32out(last.cublas, eng->d_logits, last.workspace,
-                      eng->lm_head_w, 1, VOCAB, HIDDEN), "LM head");
-        check_cuda(cudaMemcpyAsync(h_logits, eng->d_logits, VOCAB * sizeof(float),
+                      eng->lm_head_w, 1, eng->dims.vocab_size, eng->dims.hidden_size), "LM head");
+        check_cuda(cudaMemcpyAsync(h_logits, eng->d_logits, eng->dims.vocab_size * sizeof(float),
                                    cudaMemcpyDeviceToHost, last.stream), "Download logits");
     }
     check_cuda(cudaSetDevice(eng->devices[current]), "Select final forward device");
@@ -419,8 +574,8 @@ static int validate_inputs(const EngineHandle *eng, const int64_t *ids, int toke
         return ENGINE_ERR_SEQ_FULL;
     }
     for (int t = 0; t < tokens; ++t) {
-        if (ids[t] < 0 || ids[t] >= VOCAB) {
-            set_error("Token ID at offset %d is outside [0, %d)", t, VOCAB);
+        if (ids[t] < 0 || ids[t] >= eng->dims.vocab_size) {
+            set_error("Token ID at offset %d is outside [0, %d)", t, eng->dims.vocab_size);
             return ENGINE_ERR_CONFIG;
         }
     }
@@ -482,14 +637,14 @@ void engine_reset(EngineHandle *eng) {
         for (int d = 0; d < eng->num_devices; ++d) {
             DeviceCtx &ctx = eng->ctx[d];
             check_cuda(cudaSetDevice(ctx.device_id), "Select reset device");
-            for (int i = 0; i < MAX_LAYERS; ++i) {
+            for (int i = 0; i < eng->num_layers; ++i) {
                 if (eng->layer_device[i] != d) continue;
                 LayerWeights &lw = eng->layers[i];
                 if (lw.is_attention) {
                     check_cuda(cudaMemsetAsync(lw.kv_cache, 0, kv_cache_bytes(eng), ctx.stream), "Reset KV cache");
                 } else {
-                    check_cuda(cudaMemsetAsync(lw.conv_state, 0, conv_state_bytes(), ctx.stream), "Reset conv state");
-                    check_cuda(cudaMemsetAsync(lw.ssm_state, 0, ssm_state_bytes(), ctx.stream), "Reset SSM state");
+                    check_cuda(cudaMemsetAsync(lw.conv_state, 0, conv_state_bytes(eng), ctx.stream), "Reset conv state");
+                    check_cuda(cudaMemsetAsync(lw.ssm_state, 0, ssm_state_bytes(eng), ctx.stream), "Reset SSM state");
                 }
             }
             check_cuda(cudaStreamSynchronize(ctx.stream), "Finish reset");
@@ -520,7 +675,7 @@ void engine_destroy(EngineHandle *eng) {
         }
     }
     if (eng->layers) {
-        for (int i = 0; i < MAX_LAYERS; ++i) {
+        for (int i = 0; i < eng->num_layers; ++i) {
             cleanup_cuda(cudaSetDevice(eng->devices[eng->layer_device[i]]));
             LayerWeights &lw = eng->layers[i];
             void *buffers[] = {lw.input_norm_w, lw.post_norm_w, lw.gate_proj_w, lw.up_proj_w,

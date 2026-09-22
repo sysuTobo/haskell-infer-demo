@@ -3,13 +3,17 @@
 
 -- | FFI bindings to the C engine API (csrc/include/engine.h).
 --
+-- The engine is created from a *descriptor*: a flat JSON document describing the
+-- architecture (see "Infer.Descriptor"). Passing data instead of a hand-packed
+-- struct keeps a single authoring point for the model layout and removes the
+-- byte-offset marshalling that used to be duplicated across Haskell, C and the
+-- Python tests.
+--
 -- All functions are synchronous and must be called from the same OS thread
--- that created the engine (CUDA context affinity). Use
--- @System.Posix.Thread.runInBoundThread@ if calling from Haskell threads.
+-- that created the engine (CUDA context affinity).
 module Infer.FFI.Engine
   ( -- * Engine handle
     EngineHandle
-  , EngineConfig(..)
     -- * Lifecycle
   , engineCreate
   , engineDestroy
@@ -20,38 +24,32 @@ module Infer.FFI.Engine
     -- * Queries
   , engineVocabSize
   , engineSeqLen
+  , engineDescVersion
+  , engineDescribe
     -- * Errors
   , engineLastError
     -- * Hello-world (Phase 1)
   , engineHelloGpu
   ) where
 
-import Foreign.Ptr
-import Foreign.C.Types
-import Foreign.C.String
-import Foreign.Marshal.Array
-import Foreign.Marshal.Alloc
-import Foreign.Storable
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as BSC
 import Data.Int (Int64)
+import Foreign.C.String
+import Foreign.C.Types
+import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Marshal.Array (allocaArray, peekArray, withArray)
+import Foreign.Ptr
 
 -- | Opaque engine handle.
 type EngineHandle = ()
-
--- | Engine configuration mirroring the C @EngineConfig@ struct.
-data EngineConfig = EngineConfig
-  { ecNumLayers      :: !Int
-  , ecNumDevices     :: !Int
-  , ecDevices        :: [Int]   -- ^ Device ordinals
-  , ecLayerDevices   :: [Int]   -- ^ Per-layer device assignment
-  , ecMaxSeqLen      :: !Int
-  }
 
 -- -----------------------------------------------------------------------
 -- Raw FFI imports
 -- -----------------------------------------------------------------------
 
 foreign import ccall unsafe "engine.h engine_create"
-  c_engine_create :: CString -> Ptr () -> IO (Ptr EngineHandle)
+  c_engine_create :: CString -> CString -> CInt -> Ptr CInt -> Ptr CInt -> IO (Ptr EngineHandle)
 
 foreign import ccall unsafe "engine.h engine_destroy"
   c_engine_destroy :: Ptr EngineHandle -> IO ()
@@ -71,6 +69,12 @@ foreign import ccall unsafe "engine.h engine_vocab_size"
 foreign import ccall unsafe "engine.h engine_seq_len"
   c_engine_seq_len :: Ptr EngineHandle -> IO CInt
 
+foreign import ccall unsafe "engine.h engine_desc_version"
+  c_engine_desc_version :: IO CInt
+
+foreign import ccall unsafe "engine.h engine_describe"
+  c_engine_describe :: Ptr EngineHandle -> CString -> CInt -> IO CInt
+
 foreign import ccall unsafe "engine.h engine_last_error"
   c_engine_last_error :: IO CString
 
@@ -81,31 +85,23 @@ foreign import ccall unsafe "engine.h engine_hello_gpu"
 -- Haskell wrappers
 -- -----------------------------------------------------------------------
 
--- | Create an engine. Returns 'Nothing' on failure (check 'engineLastError').
-engineCreate :: FilePath -> EngineConfig -> IO (Maybe (Ptr EngineHandle))
-engineCreate modelDir cfg =
-  withCString modelDir $ \cDir ->
-    -- Allocate the C EngineConfig struct
-    -- struct layout: { int num_layers; int num_devices; const int *devices;
-    --                  const int *layer_devices; int max_seq_len; }
-    allocaBytes (5 * sizeOf (0 :: CInt) + 2 * sizeOf (nullPtr :: Ptr CInt)) $ \pCfg -> do
-      -- We need to marshal the config struct manually
-      withArray (map fromIntegral (ecDevices cfg) :: [CInt]) $ \pDevices ->
-        withArray (map fromIntegral (ecLayerDevices cfg) :: [CInt]) $ \pLayerDev -> do
-          pokeByteOff pCfg 0 (fromIntegral (ecNumLayers cfg) :: CInt)
-          pokeByteOff pCfg 4 (fromIntegral (ecNumDevices cfg) :: CInt)
-          pokeByteOff pCfg 8 pDevices
-          pokeByteOff pCfg (8 + sizeOf (nullPtr :: Ptr CInt)) pLayerDev
-          pokeByteOff pCfg (8 + 2 * sizeOf (nullPtr :: Ptr CInt))
-            (fromIntegral (ecMaxSeqLen cfg) :: CInt)
-          ptr <- c_engine_create cDir pCfg
+-- | Create an engine from a model directory, a descriptor JSON document and a
+-- layer placement (@devices@ plus a device ordinal per layer).
+-- Returns 'Nothing' on failure (check 'engineLastError').
+engineCreate :: FilePath -> ByteString -> [Int] -> [Int] -> IO (Maybe (Ptr EngineHandle))
+engineCreate modelDir descriptorJson devices layerDevices =
+  BSC.useAsCString descriptorJson $ \cDesc ->
+    withCString modelDir $ \cDir ->
+      withArray (map fromIntegral devices) $ \pDevices ->
+        withArray (map fromIntegral layerDevices) $ \pLayerDevices -> do
+          ptr <- c_engine_create cDir cDesc (fromIntegral (length devices)) pDevices pLayerDevices
           if ptr == nullPtr then return Nothing else return (Just ptr)
 
 engineDestroy :: Ptr EngineHandle -> IO ()
 engineDestroy = c_engine_destroy
 
 -- | Prefill: process tokens and get logits for the last position.
--- The output logits are returned as a list of Floats (length = vocab_size).
+-- @vocabSize@ must come from 'engineVocabSize'.
 enginePrefill :: Ptr EngineHandle -> [Int64] -> Int -> IO (Either String [Float])
 enginePrefill h tokens vocabSize =
   withArray tokens $ \pTokens ->
@@ -140,6 +136,24 @@ engineVocabSize h = fromIntegral <$> c_engine_vocab_size h
 
 engineSeqLen :: Ptr EngineHandle -> IO Int
 engineSeqLen h = fromIntegral <$> c_engine_seq_len h
+
+-- | Descriptor wire-format version supported by the linked engine.
+engineDescVersion :: IO Int
+engineDescVersion = fromIntegral <$> c_engine_desc_version
+
+-- | Round-trip the descriptor the engine actually parsed. Used to prove that C
+-- and Haskell agree on the model layout.
+engineDescribe :: Ptr EngineHandle -> IO (Either String ByteString)
+engineDescribe h =
+  allocaBytes bufSize $ \buf -> do
+    written <- c_engine_describe h buf (fromIntegral bufSize)
+    if written < 0
+      then do
+        err <- engineLastError
+        return (Left err)
+      else Right <$> BSC.packCStringLen (buf, fromIntegral written)
+  where
+    bufSize = 64 * 1024
 
 engineLastError :: IO String
 engineLastError = c_engine_last_error >>= peekCString

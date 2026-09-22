@@ -19,17 +19,19 @@ targeting **Qwen3.8-27B** (hybrid Full-Attention + GatedDeltaNet architecture).
 
 ```
 Haskell (GHC 9.6)
-├── Config.hs        Model dimensions, GPU partition
-├── Model.hs         Layer type ADT (Attention | GDN)
-├── Runtime.hs       Engine lifecycle, weight loading
-├── Generation.hs    Greedy decode loop, streaming output
-├── Safetensors.hs   Weight file parser (mmap)
-├── Tokenizer.hs     FFI → Rust tokenizer
-└── FFI/Engine.hs    FFI → C engine API
+├── Descriptor.hs        Model descriptor: typed record + flat JSON codec
+├── Descriptor/Adapter/  Family adapters (HF config.json → descriptor)
+├── Placement.hs         Placement policies (layer-wise today)
+├── Model.hs             Per-layer plan: (mixer, ffn, device)
+├── Runtime.hs           Engine lifecycle, weight loading
+├── Generation.hs        Greedy decode loop, streaming output
+├── Tokenizer.hs         FFI → Rust tokenizer
+└── FFI/Engine.hs        FFI → C engine API
          │
          │ foreign import ccall
          ▼
 C/CUDA (sm_86, CUDA 12.9)
+├── model_desc.c     Strict parser for the descriptor (no family knowledge)
 ├── engine.cu        Multi-GPU forward, bounded chunked prefill
 ├── triton/          FLA-derived chunk kernels and upstream FLA decode AOT
 └── kernels/
@@ -79,6 +81,23 @@ library so rebuilding CUDA does not leave a stale statically linked engine.
 Runtime requires neither Python nor PyTorch. `CUDA_ARCH` defaults to `86`;
 other architectures need separate compilation and numerical validation.
 
+### Model descriptor
+
+What the engine knows about an architecture travels in one flat JSON document,
+derived by a family adapter from the checkpoint's `config.json`:
+
+```bash
+# Dump (and commit) the canonical descriptor for a model directory
+cabal run haskell-infer-demo -- descriptor --model-dir "$MODEL_DIR" --write descriptors/qwen38-27b.json
+# Inspect a descriptor and the placement it implies, without loading weights
+cabal run haskell-infer-demo -- show-config --descriptor descriptors/qwen38-27b.json --gpus 0,1
+```
+
+Adding a family means adding an adapter (`src/Infer/Descriptor/Adapter/`) plus a
+committed snapshot; the C engine stays family-agnostic. `--descriptor FILE` works
+for `generate` too, and `--check-descriptor` makes the engine echo back the
+descriptor it parsed and fails the run if the two sides disagree.
+
 Full-model validation uses independently generated reference logits:
 
 ```bash
@@ -93,7 +112,8 @@ equal highest BF16 reference logits are treated as ties.
 
 ## Tests
 
-- `ctest --test-dir csrc/build-libs` — operator-level GPU regressions:
+- `ctest --test-dir csrc/build-libs` — `test_model_desc` (CPU: descriptor parsing,
+  validation, canonical echo) plus the operator-level GPU regressions:
   `test_attention` (causal GQA, KV write, output gate), `test_gdn` (FLA recurrent
   decode, causal-conv1d, gated norm), `test_library_ops` (FLA chunk pipeline
   T=1..128 vs PyTorch recurrent on both GPUs, GemmaRMSNorm, partial RoPE).
@@ -102,6 +122,11 @@ equal highest BF16 reference logits are treated as ties.
   self-consistency.
 - `tests/test_longseq.py` — 433-token prompt chunk-split consistency plus
   128-token generation coherence (repetition-rate and tail-degradation checks).
+- `tests/capture_logits.py` — records greedy logits for fixed prompts and compares
+  two captures bitwise; the gate for refactors that must not change numerics.
+- `cabal test infer-tests` — descriptor round-trip, layer plan and placement
+  (no GPU); with `INFER_MODEL_DIR` set it also checks the adapter still
+  reproduces `descriptors/*.json`.
 
 ## Usage
 
@@ -109,8 +134,8 @@ equal highest BF16 reference logits are treated as ties.
 # Phase 1: FFI verification (no model weights needed)
 cabal run haskell-infer-demo -- hello-gpu --device 0 --value 42
 
-# Show model configuration
-cabal run haskell-infer-demo -- show-config
+# Show model configuration (descriptor + placement; no weights needed)
+cabal run haskell-infer-demo -- show-config --descriptor descriptors/qwen38-27b.json
 
 # Generate text (requires model weights)
 cabal run haskell-infer-demo -- generate \

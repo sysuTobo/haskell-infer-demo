@@ -10,26 +10,27 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Model dimensions (shared across all layers) */
+/* Model dimensions (shared across all layers). Filled from the model descriptor;
+ * no per-family constants live on the C side. */
 typedef struct {
-    int hidden_size;          // 5120
-    int intermediate_size;    // 17408
-    int num_heads;            // 24
-    int num_kv_heads;         // 4
-    int head_dim;             // 256
-    int rotary_dim;           // 64
-    int num_layers;           // 64
-    int full_attn_interval;   // 4
-    int vocab_size;           // 248320
-    float rms_eps;            // 1e-6
-    float rope_theta;         // 1e7
-    int max_seq_len;          // 4096
+    int hidden_size;
+    int intermediate_size;
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    int rotary_dim;
+    int num_layers;
+    int vocab_size;
+    float rms_eps;
+    float rope_theta;
+    int max_seq_len;
     // GDN
-    int gdn_conv_dim;         // 10240
-    int gdn_num_v_heads;      // 48
-    int gdn_num_k_heads;      // 16
-    int gdn_head_dim;         // 128
-    int gdn_conv_kernel;      // 4
+    int gdn_conv_dim;
+    int gdn_value_dim;
+    int gdn_num_v_heads;
+    int gdn_num_k_heads;
+    int gdn_head_dim;
+    int gdn_conv_kernel;
 } ModelDims;
 
 static constexpr int ENGINE_BATCH_TOKENS = 128;

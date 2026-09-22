@@ -9,12 +9,11 @@ module Infer.Generation
   ) where
 
 import Data.Int (Int64)
-import Data.List (elemIndex, foldl')
+import Data.List (foldl')
 import Data.Ord (comparing)
 import Foreign.Ptr (Ptr)
 import System.IO (hFlush, stdout)
 
-import Infer.Config
 import Infer.FFI.Engine
 import Infer.Tokenizer
 
@@ -27,12 +26,12 @@ argmax xs = fromIntegral (fst (maximumBy' (comparing snd) (zip [0..] xs)))
     maximumBy' cmp (x:xs') = foldl' (\acc y -> if cmp acc y == LT then y else acc) x xs'
 
 -- | Generate tokens greedily (non-streaming, returns all tokens at once).
-generate :: Ptr EngineHandle -> ModelConfig -> Tokenizer -> [Int64] -> Int -> IO [Int64]
-generate engine cfg tok prompt maxNew = do
+-- The vocabulary size comes from 'Infer.FFI.Engine.engineVocabSize'.
+generate :: Ptr EngineHandle -> Int -> [Int] -> [Int64] -> Int -> IO [Int64]
+generate engine vocab eosTokens prompt maxNew = do
   engineReset engine
-  let vs = mcVocabSize cfg
   -- Prefill
-  result <- enginePrefill engine prompt vs
+  result <- enginePrefill engine prompt vocab
   case result of
     Left err -> do
       putStrLn $ "Prefill error: " ++ err
@@ -43,24 +42,23 @@ generate engine cfg tok prompt maxNew = do
   where
     go acc _ 0 = return (reverse acc)
     go acc lastTok n = do
-      result <- engineDecode engine lastTok (mcVocabSize cfg)
+      result <- engineDecode engine lastTok vocab
       case result of
         Left err -> do
           putStrLn $ "Decode error: " ++ err
           return (reverse acc)
         Right logits -> do
           let nextTok = argmax logits
-          if fromIntegral nextTok `elem` mcEosTokens cfg
+          if fromIntegral nextTok `elem` eosTokens
             then return (reverse (nextTok : acc))
             else go (nextTok : acc) nextTok (n - 1)
 
 -- | Generate tokens with streaming output (prints each token as it's decoded).
-generateStreaming :: Ptr EngineHandle -> ModelConfig -> Tokenizer -> [Int64] -> Int -> IO [Int64]
-generateStreaming engine cfg tok prompt maxNew = do
+generateStreaming :: Ptr EngineHandle -> Int -> [Int] -> Tokenizer -> [Int64] -> Int -> IO [Int64]
+generateStreaming engine vocab eosTokens tok prompt maxNew = do
   engineReset engine
-  let vs = mcVocabSize cfg
   -- Prefill
-  result <- enginePrefill engine prompt vs
+  result <- enginePrefill engine prompt vocab
   case result of
     Left err -> do
       putStrLn $ "Prefill error: " ++ err
@@ -74,14 +72,14 @@ generateStreaming engine cfg tok prompt maxNew = do
       putStrLn ""  -- newline after streaming
       return (reverse acc)
     go acc lastTok n = do
-      result <- engineDecode engine lastTok (mcVocabSize cfg)
+      result <- engineDecode engine lastTok vocab
       case result of
         Left err -> do
           putStrLn $ "\nDecode error: " ++ err
           return (reverse acc)
         Right logits -> do
           let nextTok = argmax logits
-          if fromIntegral nextTok `elem` mcEosTokens cfg
+          if fromIntegral nextTok `elem` eosTokens
             then do
               putStrLn ""
               return (reverse (nextTok : acc))

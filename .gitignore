@@ -41,3 +41,7 @@ weights/
 
 # Logs
 *.log
+
+# Captured logits / references (large npz; regenerate with tests/capture_logits.py)
+tests/golden/
+*.npz

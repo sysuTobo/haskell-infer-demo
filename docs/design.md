@@ -10,7 +10,7 @@ Qwen3.8-27B (hybrid Full-Attention + GatedDeltaNet, 64 layers, ~50 GiB BF16).
 
 - Single request at a time (no batching)
 - Greedy decoding only (no sampling)
-- 2–8 GPUs (L20 46 GB, sm_89), layer-wise partitioning
+- 2–8 GPUs, layer-wise partitioning (verified on 2× A40 46 GB, sm_86)
 - Pure text (no vision/multimodal)
 - CLI interface with streaming output
 - Correctness over performance
@@ -38,12 +38,35 @@ Qwen3.8-27B (hybrid Full-Attention + GatedDeltaNet, 64 layers, ~50 GiB BF16).
 - The tokenizer ecosystem is in Rust/Python; Rust gives us a C ABI with zero
   runtime dependency beyond libstdc++.
 
+### Model descriptor
+
+Everything the engine needs to know about an architecture travels in one *flat*
+JSON document, the model descriptor, produced by a family adapter in Haskell
+(`src/Infer/Descriptor/Adapter/`) from the checkpoint's `config.json`:
+
+- dimensions (hidden/intermediate/vocab, head counts, RoPE, norms, GDN layout);
+- `layer_mixers` / `layer_ffns`: an explicit per-layer kind list, so C never
+  infers the layout arithmetically;
+- `role_templates`: the weight-name template for each role (`%d` = layer,
+  `%e` = expert), which replaces the string-building loop that used to live in C.
+
+The C side (`csrc/model_desc.c`) parses it strictly: unknown keys, missing keys,
+wrong types and inconsistent dimensions are hard errors. Roles and their expected
+tensor shapes are compiled into C; which tensors a family has is data. Committed
+snapshots live in `descriptors/`, and a test re-derives them from the model
+directory so a transformers upgrade shows up as a failing test rather than wrong
+logits after a ten-minute load.
+
+The descriptor is deliberately *not* a C struct: it spans variable-length
+per-layer data, and a struct had to be mirrored field-for-field in Haskell, C and
+two Python tests.
+
 ### FFI boundary
 
 The C API (`engine.h`) is model-level, not op-level:
 
 ```c
-EngineHandle *engine_create(model_dir, config);
+EngineHandle *engine_create(model_dir, descriptor_json, num_devices, devices, layer_devices);
 int engine_prefill(engine, token_ids, n, out_logits);
 int engine_decode(engine, token_id, out_logits);
 void engine_reset(engine);
@@ -116,22 +139,25 @@ future optimization.
 ### Weight loading
 
 Safetensors format: 8-byte LE header length → JSON header → raw BF16 data.
+The C loader (`safetensors_loader.cu`) scans the shards, expands the descriptor's
+role templates, validates each tensor's shape against the role's expectation in
+terms of the model dimensions, and uploads it to the owning device.
 
-Haskell parses the header (aeson), mmaps the data section, and passes
-pointers to the C engine which uploads to the correct device via
-`cudaMemcpyAsync`.
+Weight placement is a role property, not a family property:
+- embedding → first configured device
+- final norm and `lm_head` → last configured device
+- everything else → the device owning that layer
 
-Weight name mapping (from kern reference):
-- `model.language_model.embed_tokens.weight` → device 0
-- `model.language_model.layers.{i}.*` → device per partition
-- `lm_head.weight` → last device
-- `model.language_model.norm.weight` → last device (converted to weight+1 f32)
+With the template scheme, the Qwen3.5 layout (`model.language_model.` prefix,
+`lm_head` unprefixed, `linear_attn.*` for GDN layers) is data in the descriptor
+rather than code in the engine.
 
 Derived weights computed on-device after loading:
 - `weight_p1 = float(norm_weight) + 1.0` (GemmaRMSNorm)
+- the GDN gated-norm weight cast to F32 (raw weight: this variant does *not* add 1)
 - RoPE cos/sin tables (generated from theta and max_position)
 
-### Memory budget (2× L20, 4096 context)
+### Memory budget (2× A40, 4096 context)
 
 Per device:
 - Weights: ~25 GiB (half of 50 GiB)
@@ -142,17 +168,18 @@ Per device:
 
 ## Testing strategy
 
-| Level | Method | Pass criteria |
-|-------|--------|---------------|
-| Kernel | CUDA unit test vs CPU reference | ≤1 ulp BF16 |
-| Layer | Fixed input, compare vs PyTorch eager | max abs diff < 1e-2 |
-| Logits | Short prompt prefill vs HF/vLLM | top-1 token match |
-| E2E | 5 prose prompts × 200 tokens greedy | ≥50 token prefix match |
-| Multi-GPU | Same prompt on 2/4/8 GPUs | byte-identical output |
+| Level | Test | Pass criteria |
+|-------|------|---------------|
+| Descriptor | `ctest -R test_model_desc` (CPU) + Haskell spec | strict parse, reject bad/missing keys, adapter reproduces the snapshot |
+| Kernel | `ctest`: test_attention / test_gdn / test_library_ops | vs CPU/PyTorch reference, BF16 tolerances |
+| Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set, logit rms ≤ 0.1 |
+| Chunking | same prompt, different prefill splits | top-1 equal, rms ≤ 5 (state-loss guard) |
+| Refactor | `tests/capture_logits.py --compare` | bitwise identical (same build, same prompt) |
+| Long sequence | `tests/test_longseq.py` | chunk-split self-consistency + no repetition collapse |
 
-Note: we do NOT require bit-exact match with vLLM. cuBLAS algorithm selection
-on thin shapes (N=96) causes 1-ulp differences that flip near-tie argmax.
-This is documented in the kern project's Qwen3.8 bringup.
+Note: we do NOT require bit-exact match with PyTorch. BF16 operator reassociation
+and cuBLAS algorithm selection move individual logits by ~1e-2, which can flip a
+near-tie argmax; the reference's tied maxima are therefore accepted as a set.
 
 ## What this demo is NOT
 
@@ -165,10 +192,8 @@ This is documented in the kern project's Qwen3.8 bringup.
 
 ## Future work
 
-1. Chunked prefill for GDN (reuse FLA algorithm)
-2. Flash attention for full-attention layers
-3. CUDA graph capture for decode
-4. Tensor parallelism for lower latency
-5. Sampling (temperature, top-p)
-6. HTTP API (servant/wai)
-7. Streaming SSE output
+1. More model families (MoE, MLA) through new layer kinds in the descriptor
+2. More GPU targets (sm_89/sm_90a) via multi-arch SASS plus runtime cubin choice
+3. Tensor / expert parallel placement policies alongside the layer-wise split
+4. CUDA graph capture for decode, vocab-parallel argmax
+5. Sampling (temperature, top-p), HTTP API, streaming SSE

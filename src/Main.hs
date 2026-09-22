@@ -1,20 +1,24 @@
 -- | CLI entry point for the Haskell inference demo.
 --
 -- Usage:
---   haskell-infer-demo --model-dir /path/to/Qwen3.8-27B --gpus 0,1 --prompt "Hello"
---   haskell-infer-demo --hello-gpu 0    # Phase 1 FFI verification
+--   haskell-infer-demo generate --model-dir /path/to/Qwen3.8-27B --gpus 0,1 -p "Hello"
+--   haskell-infer-demo show-config --descriptor descriptors/qwen38-27b.json
+--   haskell-infer-demo descriptor --model-dir /path/to/model [--write FILE]
+--   haskell-infer-demo hello-gpu -d 0 -v 42
 module Main (main) where
 
-import Data.Int (Int64)
+import qualified Data.ByteString as BS
 import Data.List (intercalate)
-import Data.Maybe (fromMaybe)
 import Options.Applicative
 import System.Exit (exitFailure, exitSuccess)
 import Text.Read (readMaybe)
 
 import Infer.Config
+import Infer.Descriptor
 import Infer.FFI.Engine
 import Infer.Generation
+import Infer.Model
+import Infer.Placement
 import Infer.Runtime
 import Infer.Tokenizer
 
@@ -29,22 +33,30 @@ data Options = Options
 data Command
   = Generate GenOptions
   | HelloGpu Int Int
-  | ShowConfig
+  | ShowConfig ConfigSource [Int]
+  | DumpDescriptor FilePath (Maybe FilePath)
+
+-- | Where a descriptor comes from: an explicit JSON file, or a model directory
+-- whose config.json is read by the family adapter.
+data ConfigSource = FromFile FilePath | FromDir FilePath
 
 data GenOptions = GenOptions
   { genModelDir  :: FilePath
+  , genDesc      :: Maybe FilePath
   , genGpus      :: [Int]
   , genMaxSeqLen :: Int
   , genMaxTokens :: Int
   , genPrompt    :: String
   , genStreaming :: Bool
+  , genCheckDesc :: Bool
   }
 
 optionsParser :: Parser Options
 optionsParser = Options <$> hsubparser
   ( command "generate" (info generateCmd (progDesc "Generate text from a prompt"))
  <> command "hello-gpu" (info helloGpuCmd (progDesc "Phase 1: FFI verification"))
- <> command "show-config" (info showConfigCmd (progDesc "Print model configuration"))
+ <> command "show-config" (info showConfigCmd (progDesc "Print the model descriptor"))
+ <> command "descriptor" (info descriptorCmd (progDesc "Dump the canonical descriptor for a model dir"))
   )
 
 generateCmd :: Parser Command
@@ -54,6 +66,11 @@ generateCmd = Generate <$> (GenOptions
      <> metavar "DIR"
      <> help "Path to model directory (containing safetensors + tokenizer.json)"
       )
+  <*> optional (strOption
+      ( long "descriptor"
+     <> metavar "FILE"
+     <> help "Descriptor JSON overriding the model directory's config.json"
+      ))
   <*> option parseGpuList
       ( long "gpus"
      <> metavar "0,1,..."
@@ -84,6 +101,10 @@ generateCmd = Generate <$> (GenOptions
   <*> switch
       ( long "stream"
      <> help "Stream tokens as they are generated"
+      )
+  <*> switch
+      ( long "check-descriptor"
+     <> help "Round-trip the descriptor through the engine and compare"
       ))
 
 helloGpuCmd :: Parser Command
@@ -104,7 +125,41 @@ helloGpuCmd = HelloGpu
       )
 
 showConfigCmd :: Parser Command
-showConfigCmd = pure ShowConfig
+showConfigCmd = ShowConfig
+  <$> configSource
+  <*> option parseGpuList
+      ( long "gpus"
+     <> metavar "0,1,..."
+     <> value [0, 1]
+     <> showDefault
+     <> help "Comma-separated CUDA device ordinals (for placement preview)"
+      )
+
+descriptorCmd :: Parser Command
+descriptorCmd = DumpDescriptor
+  <$> strOption
+      ( long "model-dir"
+     <> metavar "DIR"
+     <> help "Model directory whose config.json is adapted"
+      )
+  <*> optional (strOption
+      ( long "write"
+     <> metavar "FILE"
+     <> help "Write the canonical descriptor to FILE instead of stdout"
+      ))
+
+configSource :: Parser ConfigSource
+configSource =
+      (FromFile <$> strOption
+        ( long "descriptor"
+       <> metavar "FILE"
+       <> help "Descriptor JSON (no model directory needed)"
+        ))
+  <|> (FromDir <$> strOption
+        ( long "model-dir"
+       <> metavar "DIR"
+       <> help "Derive the descriptor from DIR/config.json"
+        ))
 
 parseGpuList :: ReadM [Int]
 parseGpuList = eitherReader $ \s ->
@@ -140,49 +195,99 @@ runHelloGpu device value = do
       putStrLn $ "Error: " ++ err
       exitFailure
 
-runShowConfig :: IO ()
-runShowConfig = do
-  let cfg = qwen38_27bConfig
-  putStrLn "Qwen3.8-27B Configuration:"
-  putStrLn $ "  Layers:            " ++ show (mcNumLayers cfg)
-  putStrLn $ "  Hidden size:       " ++ show (mcHiddenSize cfg)
-  putStrLn $ "  Intermediate size: " ++ show (mcIntermediateSize cfg)
-  putStrLn $ "  Vocab size:        " ++ show (mcVocabSize cfg)
-  putStrLn $ "  Num heads:         " ++ show (mcNumHeads cfg)
-  putStrLn $ "  Num KV heads:      " ++ show (mcNumKvHeads cfg)
-  putStrLn $ "  Head dim:          " ++ show (mcHeadDim cfg)
-  putStrLn $ "  Rotary dim:        " ++ show (mcRotaryDim cfg)
-  putStrLn $ "  Full attn interval:" ++ show (mcFullAttnInterval cfg)
-  putStrLn $ "  GDN v-heads:       " ++ show (mcGdnNumVHeads cfg)
-  putStrLn $ "  GDN head dim:      " ++ show (mcGdnHeadDim cfg)
-  putStrLn $ "  EOS tokens:        " ++ show (mcEosTokens cfg)
+-- | Print the descriptor and the placement it implies.
+runShowConfig :: ConfigSource -> [Int] -> IO ()
+runShowConfig source devices = do
+  desc <- loadFor source
+  putStrLn $ "Descriptor " ++ show (dVersion desc) ++ ": " ++ dFamily desc
+    ++ " (" ++ dModelType desc ++ ")"
+  putStrLn $ "  Layers:            " ++ show (dNumLayers desc)
+  putStrLn $ "  Hidden size:       " ++ show (dHiddenSize desc)
+  putStrLn $ "  Intermediate size: " ++ show (dIntermediateSize desc)
+  putStrLn $ "  Vocab size:        " ++ show (dVocabSize desc)
+  putStrLn $ "  Num heads:         " ++ show (dNumHeads desc)
+  putStrLn $ "  Num KV heads:      " ++ show (dNumKvHeads desc)
+  putStrLn $ "  Head dim:          " ++ show (dHeadDim desc)
+  putStrLn $ "  Rotary dim:        " ++ show (dRotaryDim desc)
+  putStrLn $ "  Output gate:       " ++ show (dAttnOutputGate desc)
+  putStrLn $ "  GDN v-heads:       " ++ show (dGdnNumVHeads desc)
+  putStrLn $ "  GDN head dim:      " ++ show (dGdnHeadDim desc)
+  putStrLn $ "  EOS tokens:        " ++ show (dEosTokens desc)
+  putStrLn $ "  Max seq len:       " ++ show (dMaxSeqLen desc)
   putStrLn ""
-  putStrLn "Layer types (A=attention, G=GDN):"
-  let layerStr = [if isAttentionIdx cfg i then 'A' else 'G' | i <- [0..63]]
-  putStrLn $ "  " ++ intercalate " " (chunksOf 16 layerStr)
+  putStrLn "Layer layout (A=full_attn, G=gdn, M=mla):"
+  putStrLn $ "  " ++ intercalate " " (chunksOf 16 (map mixerLetter (dLayerMixers desc)))
+  putStrLn ""
+  case modelDef desc Pipelined devices of
+    Left err -> putStrLn $ "Placement error: " ++ err
+    Right md -> do
+      putStrLn $ "Placement (" ++ show (plPolicy (mdPlacement md)) ++ "):"
+      putStrLn $ "  Layers per device: " ++ show (plLayersPerDevice (mdPlacement md))
   where
-    isAttentionIdx c i = (i + 1) `mod` mcFullAttnInterval c == 0
-    chunksOf n [] = []
+    mixerLetter MFullAttention = 'A'
+    mixerLetter MGatedDeltaNet = 'G'
+    mixerLetter MMlaAttention = 'M'
+    chunksOf _ [] = []
     chunksOf n xs = take n xs : chunksOf n (drop n xs)
+
+-- | Dump the canonical descriptor produced by the family adapter.
+runDumpDescriptor :: FilePath -> Maybe FilePath -> IO ()
+runDumpDescriptor modelDir writeTo = do
+  desc <- loadFor (FromDir modelDir)
+  let bytes = encodeDescriptor desc
+  case writeTo of
+    Nothing -> BS.putStr bytes >> putStrLn ""
+    Just path -> do
+      BS.writeFile path bytes
+      putStrLn $ "Wrote " ++ path ++ " (" ++ show (BS.length bytes) ++ " bytes)"
+
+loadFor :: ConfigSource -> IO Descriptor
+loadFor source = loadDescriptor $ case source of
+  FromFile path -> defaultRuntimeConfig { rcDescriptor = Just path }
+  FromDir dir -> defaultRuntimeConfig { rcModelDir = dir }
 
 runGenerate :: GenOptions -> IO ()
 runGenerate opts = do
   let cfg = RuntimeConfig
         { rcModelDir  = genModelDir opts
+        , rcDescriptor = genDesc opts
         , rcDevices   = genGpus opts
         , rcMaxSeqLen = genMaxSeqLen opts
         , rcMaxTokens = genMaxTokens opts
         , rcPrompt    = genPrompt opts
         }
 
-  -- Initialize runtime
   rt <- initRuntime cfg
-  let mc = runtimeModelConfig rt
-      engine = runtimeEngine rt
+  let engine = runtimeEngine rt
       tok = rtTokenizer rt
+      vocab = rtVocabSize rt
+      desc = runtimeDescriptor rt
 
-  -- Tokenize prompt
-  putStrLn $ "Tokenizing prompt..."
+  if genCheckDesc opts
+    then do
+      echoed <- engineDescribe engine
+      case echoed of
+        Left err -> do
+          putStrLn $ "ERROR: engine_describe failed: " ++ err
+          shutdownRuntime rt
+          exitFailure
+        Right text -> case decodeDescriptor text of
+          Left err -> do
+            putStrLn $ "ERROR: engine descriptor echo is not decodable: " ++ err
+            shutdownRuntime rt
+            exitFailure
+          Right echoedDesc ->
+            if echoedDesc == desc
+              then putStrLn "Descriptor round-trip: OK"
+              else do
+                putStrLn "Descriptor round-trip: MISMATCH"
+                putStrLn $ "  sent: " ++ show desc
+                putStrLn $ "  echo: " ++ show echoedDesc
+                shutdownRuntime rt
+                exitFailure
+    else return ()
+
+  putStrLn "Tokenizing prompt..."
   promptTokens <- encode tok (genPrompt opts)
   putStrLn $ "  " ++ show (length promptTokens) ++ " tokens"
 
@@ -193,14 +298,12 @@ runGenerate opts = do
       exitFailure
     else return ()
 
-  -- Generate
   putStrLn $ "Generating (max " ++ show (genMaxTokens opts) ++ " tokens)..."
   putStrLn "---"
   outputTokens <- if genStreaming opts
-    then generateStreaming engine mc tok promptTokens (genMaxTokens opts)
+    then generateStreaming engine vocab (dEosTokens desc) tok promptTokens (genMaxTokens opts)
     else do
-      toks <- generate engine mc tok promptTokens (genMaxTokens opts)
-      -- Print all at once
+      toks <- generate engine vocab (dEosTokens desc) promptTokens (genMaxTokens opts)
       text <- decode tok toks
       putStrLn text
       return toks
@@ -208,7 +311,6 @@ runGenerate opts = do
   putStrLn "---"
   putStrLn $ "Generated " ++ show (length outputTokens) ++ " tokens"
 
-  -- Cleanup
   shutdownRuntime rt
 
 -- -----------------------------------------------------------------------
@@ -220,7 +322,8 @@ main = do
   opts <- execParser optsInfo
   case optCommand opts of
     HelloGpu device value -> runHelloGpu device value
-    ShowConfig -> runShowConfig
+    ShowConfig source devices -> runShowConfig source devices
+    DumpDescriptor dir writeTo -> runDumpDescriptor dir writeTo
     Generate genOpts -> runGenerate genOpts
   where
     optsInfo = info (optionsParser <**> helper)

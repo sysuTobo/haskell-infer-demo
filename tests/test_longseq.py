@@ -4,16 +4,7 @@ from collections import Counter
 
 import numpy as np
 
-
-class EngineConfig(ctypes.Structure):
-    _fields_ = [("num_layers", ctypes.c_int), ("num_devices", ctypes.c_int),
-                ("devices", ctypes.POINTER(ctypes.c_int)),
-                ("layer_devices", ctypes.POINTER(ctypes.c_int)),
-                ("max_seq_len", ctypes.c_int)]
-
-
-def ptr(a):
-    return ctypes.c_void_p(a.ctypes.data)
+from engine_bindings import bind, create_engine, load_descriptor, ptr
 
 
 def repetition_rate(ids, n=4):
@@ -64,6 +55,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--library", required=True)
     ap.add_argument("--model-dir", required=True)
+    ap.add_argument("--desc", default="descriptors/qwen38-27b.json")
     ap.add_argument("--devices", default="0,1")
     ap.add_argument("--gen-tokens", type=int, default=128)
     args = ap.parse_args()
@@ -71,27 +63,10 @@ def main():
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model_dir)
 
-    lib = ctypes.CDLL(args.library)
-    lib.engine_create.argtypes = [ctypes.c_char_p, ctypes.POINTER(EngineConfig)]
-    lib.engine_create.restype = ctypes.c_void_p
-    lib.engine_destroy.argtypes = [ctypes.c_void_p]
-    lib.engine_reset.argtypes = [ctypes.c_void_p]
-    lib.engine_seq_len.argtypes = [ctypes.c_void_p]
-    lib.engine_seq_len.restype = ctypes.c_int
-    lib.engine_prefill.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-    lib.engine_decode.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p]
-    lib.engine_last_error.restype = ctypes.c_char_p
-
+    lib = bind(ctypes.CDLL(args.library))
     devices = [int(x) for x in args.devices.split(",")]
-    dev_arr = (ctypes.c_int * len(devices))(*devices)
-    assign = (ctypes.c_int * 64)(*(devices[min(i * len(devices) // 64, len(devices) - 1)]
-                                   for i in range(64)))
-    cfg = EngineConfig(64, len(devices), dev_arr, assign, 1024)
-
-    eng = lib.engine_create(args.model_dir.encode(), ctypes.byref(cfg))
-    assert eng, lib.engine_last_error().decode()
-
-    vocab = 248320
+    descriptor = load_descriptor(args.desc, max_seq_len=1024)
+    eng, vocab = create_engine(lib, args.model_dir, descriptor, devices)
     logits = np.empty(vocab, dtype=np.float32)
 
     def prefill(idarr):

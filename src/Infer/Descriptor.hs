@@ -15,6 +15,7 @@ module Infer.Descriptor
   , MixerKind(..)
   , FfnKind(..)
   , Role(..)
+  , ShardKind(..)
   , descVersion
   , encodeDescriptor
   , decodeDescriptor
@@ -23,6 +24,8 @@ module Infer.Descriptor
   , mixerName
   , ffnName
   , roleName
+  , shardName
+  , allReplicated
   , kvBytesPerToken
   , attentionLayers
   , gdnLayers
@@ -71,6 +74,37 @@ ffnName :: FfnKind -> String
 ffnName FDense = "dense"
 ffnName FMoe = "moe"
 
+-- | Tensor-parallel sharding rule for one weight role, i.e. which dimension of
+-- the tensor the engine splits across @tp_size@ ranks. The vocabulary is kept
+-- deliberately small: the engine loads shards without any family knowledge.
+--
+--   * 'ShardNone'     -- replicated: every rank loads the whole tensor.
+--   * 'ShardOutHeads' -- output dimension split by head: the tensor's rows are
+--                        @heads * head_dim@ and each rank takes a contiguous
+--                        block of heads (attention / per-head projections).
+--   * 'ShardOutDim'   -- output dimension (rows of an @[out, in]@ weight) split
+--                        into @tp_size@ contiguous blocks.
+--   * 'ShardInDim'    -- input dimension (columns) split into @tp_size@
+--                        contiguous blocks.
+--
+-- With @tp_size == 1@ every rule is a no-op; the default for a freshly built
+-- descriptor is 'ShardNone' for every role (see 'allReplicated').
+data ShardKind = ShardNone | ShardOutHeads | ShardOutDim | ShardInDim
+  deriving (Eq, Ord, Show, Read, Enum, Bounded)
+
+-- | Wire name of a 'ShardKind'. @csrc/model_desc.c@ carries the same names.
+shardName :: ShardKind -> String
+shardName ShardNone = "none"
+shardName ShardOutHeads = "out_heads"
+shardName ShardOutDim = "out_dim"
+shardName ShardInDim = "in_dim"
+
+-- | The default shard rules: one 'ShardNone' per role, parallel to the role
+-- table. Building a descriptor with these plus @dTpSize = 1@ keeps the model
+-- replicated, i.e. the historical single-rank behaviour.
+allReplicated :: [(Role, String)] -> [ShardKind]
+allReplicated = map (const ShardNone)
+
 -- | Wire name of a role: the constructor with its leading @R@ dropped and the
 -- first letter lowercased (@REmbed@ -> @embed@, @RAttnQNorm@ -> @attnQNorm@).
 -- @csrc/model_desc.c@ carries the same names in the same order.
@@ -112,6 +146,8 @@ data Descriptor = Descriptor
   , dGdnConvKernel :: !Int
   , dFlaChunkSize :: !Int         -- ^ must match the AOT-compiled FLA chunk cubin
   , dMaxChunk :: !Int             -- ^ prefill batch size (<= the kernels' limit)
+  , dTpSize :: !Int               -- ^ tensor-parallel ranks (1 = no sharding)
+  , dTpRank :: !Int               -- ^ this rank, in [0, dTpSize)
   -- Mixture-of-experts feed-forward (used when a layer's ffn kind is moe)
   , dMoeNumExperts :: !Int        -- ^ routed experts per layer
   , dMoeTopK :: !Int              -- ^ experts selected per token
@@ -126,6 +162,7 @@ data Descriptor = Descriptor
   , dLayerMixers :: [MixerKind]
   , dLayerFfns :: [FfnKind]
   , dRoleTemplates :: [(Role, String)]
+  , dRoleShards :: [ShardKind]    -- ^ parallel to 'dRoleTemplates'
   } deriving (Eq, Show)
 
 withMaxSeqLen :: Int -> Descriptor -> Descriptor
@@ -153,12 +190,13 @@ descriptorKeys =
   , "rotary_theta", "norm_style", "attn_qk_norm", "attn_output_gate"
   , "q_gate_interleave", "gdn_conv_dim"
   , "gdn_value_dim", "gdn_num_v_heads", "gdn_num_k_heads", "gdn_head_dim"
-  , "gdn_conv_kernel", "fla_chunk_size", "max_chunk", "moe_num_experts", "moe_top_k"
+  , "gdn_conv_kernel", "fla_chunk_size", "max_chunk", "tp_size", "tp_rank"
+  , "moe_num_experts", "moe_top_k"
   , "moe_intermediate_size", "moe_router_scoring", "moe_norm_topk_prob"
   , "moe_num_shared_experts", "moe_shared_intermediate_size", "moe_routed_scaling_factor"
   , "moe_shared_gate_scalar"
   , "eos_tokens", "layer_mixers"
-  , "layer_ffns", "role_names", "role_templates"
+  , "layer_ffns", "role_names", "role_templates", "role_shards"
   ]
 
 -- | Encode to the flat wire format consumed by @engine_create@.
@@ -191,6 +229,8 @@ encodeDescriptor d = BL.toStrict . encode $ object
   , "gdn_conv_kernel" .= dGdnConvKernel d
   , "fla_chunk_size" .= dFlaChunkSize d
   , "max_chunk" .= dMaxChunk d
+  , "tp_size" .= dTpSize d
+  , "tp_rank" .= dTpRank d
   , "moe_num_experts" .= dMoeNumExperts d
   , "moe_top_k" .= dMoeTopK d
   , "moe_intermediate_size" .= dMoeIntermediateSize d
@@ -205,6 +245,7 @@ encodeDescriptor d = BL.toStrict . encode $ object
   , "layer_ffns" .= map ffnName (dLayerFfns d)
   , "role_names" .= map (roleName . fst) (dRoleTemplates d)
   , "role_templates" .= map snd (dRoleTemplates d)
+  , "role_shards" .= map shardName (dRoleShards d)
   ]
 
 -- | Decode the flat wire format. Unknown or missing keys are errors.
@@ -247,6 +288,10 @@ decodeDescriptor bytes = do
   convKernel <- reqInt obj "gdn_conv_kernel"
   chunkSize <- reqInt obj "fla_chunk_size"
   maxChunk <- reqInt obj "max_chunk"
+  -- Tensor-parallel keys are optional: absent means "replicated single rank",
+  -- which is what every descriptor written before they existed means.
+  tpSize <- optInt obj "tp_size" 1
+  tpRank <- optInt obj "tp_rank" 0
   moeExperts <- reqInt obj "moe_num_experts"
   moeTopK <- reqInt obj "moe_top_k"
   moeIntermediate <- reqInt obj "moe_intermediate_size"
@@ -262,6 +307,14 @@ decodeDescriptor bytes = do
   roleNames <- reqTextList obj "role_names"
   templates <- reqTextList obj "role_templates"
   roles <- traverse parseRole roleNames
+  -- Absent role_shards means "everything replicated": the default mirrors the
+  -- role table so the array is always parallel to role_names/role_templates.
+  shardNames <- optTextList obj "role_shards" (replicate (length roles) "none")
+  shards <- traverse parseShard shardNames
+  if length shards /= length roles
+    then Left ("role_shards (" ++ show (length shards)
+               ++ ") must be parallel to role_names (" ++ show (length roles) ++ ")")
+    else Right ()
   pure Descriptor
     { dVersion = version, dFamily = families, dModelType = modelType
     , dNumLayers = numLayers, dHiddenSize = hidden, dIntermediateSize = intermediate
@@ -273,6 +326,7 @@ decodeDescriptor bytes = do
     , dQGateInterleave = qgInterleave, dGdnConvDim = convDim, dGdnValueDim = valueDim
     , dGdnNumVHeads = vHeads, dGdnNumKHeads = kHeads, dGdnHeadDim = gdnHeadDim
     , dGdnConvKernel = convKernel, dFlaChunkSize = chunkSize, dMaxChunk = maxChunk
+    , dTpSize = tpSize, dTpRank = tpRank
     , dMoeNumExperts = moeExperts, dMoeTopK = moeTopK
     , dMoeIntermediateSize = moeIntermediate, dMoeRouterScoring = moeScoring
     , dMoeNormTopkProb = moeNormTopk, dMoeNumSharedExperts = moeSharedExperts
@@ -281,6 +335,7 @@ decodeDescriptor bytes = do
     , dEosTokens = eos
     , dLayerMixers = mixers, dLayerFfns = ffns
     , dRoleTemplates = zip roles templates
+    , dRoleShards = shards
     }
 
 parseMixer :: String -> Either String MixerKind
@@ -301,11 +356,24 @@ parseRole s = case [r | r <- [minBound .. maxBound], roleName r == s] of
   [r] -> Right r
   _ -> Left ("unknown role name: " ++ show s)
 
+parseShard :: String -> Either String ShardKind
+parseShard s = case [k | k <- [minBound .. maxBound], shardName k == s] of
+  [k] -> Right k
+  _ -> Left ("unknown role_shards entry: " ++ show s)
+
 reqInt :: Object -> String -> Either String Int
 reqInt obj key = case KM.lookup (Key.fromString key) obj of
   Just (Number n) -> Right (round n)
   Just _ -> Left ("descriptor key " ++ show key ++ " must be a number")
   Nothing -> Left ("descriptor key " ++ show key ++ " is missing")
+
+-- | Like 'reqInt' but the key is optional (used for the tensor-parallel keys,
+-- whose absence must keep older descriptors valid).
+optInt :: Object -> String -> Int -> Either String Int
+optInt obj key fallback = case KM.lookup (Key.fromString key) obj of
+  Just (Number n) -> Right (round n)
+  Just _ -> Left ("descriptor key " ++ show key ++ " must be a number")
+  Nothing -> Right fallback
 
 reqDouble :: Object -> String -> Either String Double
 reqDouble obj key = case KM.lookup (Key.fromString key) obj of
@@ -333,6 +401,16 @@ reqIntList obj key = case KM.lookup (Key.fromString key) obj of
   where
     asInt (Number n) = Right (round n)
     asInt _ = Left ("descriptor key " ++ show key ++ " must contain only numbers")
+
+-- | Like 'reqTextList' below but the key is optional.
+optTextList :: Object -> String -> [String] -> Either String [String]
+optTextList obj key fallback = case KM.lookup (Key.fromString key) obj of
+  Just (Array values) -> traverse asText (V.toList values)
+  Just _ -> Left ("descriptor key " ++ show key ++ " must be an array")
+  Nothing -> Right fallback
+  where
+    asText (String t) = Right (T.unpack t)
+    asText _ = Left ("descriptor key " ++ show key ++ " must contain only strings")
 
 reqTextList :: Object -> String -> Either String [String]
 reqTextList obj key = case KM.lookup (Key.fromString key) obj of
@@ -377,6 +455,12 @@ checks d =
   , err (dRmsEps d <= 0) "rms_eps must be positive"
   , err (dMaxChunk d < 1 || dMaxChunk d > 128)
         "max_chunk must be in [1,128] (the kernels' batch limit)"
+  , err (dTpSize d < 1)
+        "tp_size must be at least 1"
+  , err (dTpRank d < 0 || dTpRank d >= dTpSize d)
+        "tp_rank must be in [0, tp_size)"
+  , err (length (dRoleShards d) /= length (dRoleTemplates d))
+        "role_shards must be parallel to role_names/role_templates"
   , err (null (dEosTokens d)) "eos_tokens must not be empty"
   , err (any (\t -> t < 0 || t >= dVocabSize d) (dEosTokens d))
         "eos_tokens must be within the vocabulary"

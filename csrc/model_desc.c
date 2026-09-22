@@ -39,54 +39,60 @@ enum {
     K_MOE_SHARED_GATE_SCALAR,
     K_EOS_TOKENS, K_LAYER_MIXERS,
     K_LAYER_FFNS, K_ROLE_NAMES, K_ROLE_TEMPLATES,
+    /* Optional keys: absent means the historical single-rank behaviour. */
+    K_TP_SIZE, K_TP_RANK, K_ROLE_SHARDS,
     K_COUNT
 };
 
 static const struct {
     const char *name;
     int type;
+    int optional;   /* optional keys may be absent and take their default */
 } kKeys[K_COUNT] = {
-    {"desc_version", KV_INT},
-    {"family", KV_TEXT},
-    {"model_type", KV_TEXT},
-    {"num_layers", KV_INT},
-    {"hidden_size", KV_INT},
-    {"intermediate_size", KV_INT},
-    {"vocab_size", KV_INT},
-    {"rms_eps", KV_DOUBLE},
-    {"max_position_embeddings", KV_INT},
-    {"max_seq_len", KV_INT},
-    {"num_heads", KV_INT},
-    {"num_kv_heads", KV_INT},
-    {"head_dim", KV_INT},
-    {"rotary_dim", KV_INT},
-    {"rotary_theta", KV_DOUBLE},
-    {"norm_style", KV_TEXT},
-    {"attn_qk_norm", KV_BOOL},
-    {"attn_output_gate", KV_BOOL},
-    {"q_gate_interleave", KV_BOOL},
-    {"gdn_conv_dim", KV_INT},
-    {"gdn_value_dim", KV_INT},
-    {"gdn_num_v_heads", KV_INT},
-    {"gdn_num_k_heads", KV_INT},
-    {"gdn_head_dim", KV_INT},
-    {"gdn_conv_kernel", KV_INT},
-    {"fla_chunk_size", KV_INT},
-    {"max_chunk", KV_INT},
-    {"moe_num_experts", KV_INT},
-    {"moe_top_k", KV_INT},
-    {"moe_intermediate_size", KV_INT},
-    {"moe_router_scoring", KV_TEXT},
-    {"moe_norm_topk_prob", KV_BOOL},
-    {"moe_num_shared_experts", KV_INT},
-    {"moe_shared_intermediate_size", KV_INT},
-    {"moe_routed_scaling_factor", KV_DOUBLE},
-    {"moe_shared_gate_scalar", KV_BOOL},
-    {"eos_tokens", KV_INT_ARRAY},
-    {"layer_mixers", KV_TEXT_ARRAY},
-    {"layer_ffns", KV_TEXT_ARRAY},
-    {"role_names", KV_TEXT_ARRAY},
-    {"role_templates", KV_TEXT_ARRAY},
+    {"desc_version", KV_INT, 0},
+    {"family", KV_TEXT, 0},
+    {"model_type", KV_TEXT, 0},
+    {"num_layers", KV_INT, 0},
+    {"hidden_size", KV_INT, 0},
+    {"intermediate_size", KV_INT, 0},
+    {"vocab_size", KV_INT, 0},
+    {"rms_eps", KV_DOUBLE, 0},
+    {"max_position_embeddings", KV_INT, 0},
+    {"max_seq_len", KV_INT, 0},
+    {"num_heads", KV_INT, 0},
+    {"num_kv_heads", KV_INT, 0},
+    {"head_dim", KV_INT, 0},
+    {"rotary_dim", KV_INT, 0},
+    {"rotary_theta", KV_DOUBLE, 0},
+    {"norm_style", KV_TEXT, 0},
+    {"attn_qk_norm", KV_BOOL, 0},
+    {"attn_output_gate", KV_BOOL, 0},
+    {"q_gate_interleave", KV_BOOL, 0},
+    {"gdn_conv_dim", KV_INT, 0},
+    {"gdn_value_dim", KV_INT, 0},
+    {"gdn_num_v_heads", KV_INT, 0},
+    {"gdn_num_k_heads", KV_INT, 0},
+    {"gdn_head_dim", KV_INT, 0},
+    {"gdn_conv_kernel", KV_INT, 0},
+    {"fla_chunk_size", KV_INT, 0},
+    {"max_chunk", KV_INT, 0},
+    {"moe_num_experts", KV_INT, 0},
+    {"moe_top_k", KV_INT, 0},
+    {"moe_intermediate_size", KV_INT, 0},
+    {"moe_router_scoring", KV_TEXT, 0},
+    {"moe_norm_topk_prob", KV_BOOL, 0},
+    {"moe_num_shared_experts", KV_INT, 0},
+    {"moe_shared_intermediate_size", KV_INT, 0},
+    {"moe_routed_scaling_factor", KV_DOUBLE, 0},
+    {"moe_shared_gate_scalar", KV_BOOL, 0},
+    {"eos_tokens", KV_INT_ARRAY, 0},
+    {"layer_mixers", KV_TEXT_ARRAY, 0},
+    {"layer_ffns", KV_TEXT_ARRAY, 0},
+    {"role_names", KV_TEXT_ARRAY, 0},
+    {"role_templates", KV_TEXT_ARRAY, 0},
+    {"tp_size", KV_INT, 1},
+    {"tp_rank", KV_INT, 1},
+    {"role_shards", KV_TEXT_ARRAY, 1},
 };
 
 static int key_id(const char *name) {
@@ -94,6 +100,10 @@ static int key_id(const char *name) {
         if (strcmp(kKeys[i].name, name) == 0) return i;
     return -1;
 }
+
+/* Shard rules, in the same order as the Haskell ShardKind enum. */
+static const char *kShardNames[] = {"none", "out_heads", "out_dim", "in_dim"};
+#define SHARD_KIND_COUNT ((int)(sizeof(kShardNames) / sizeof(kShardNames[0])))
 
 /* Role names, in the same order as the Haskell Role enum. */
 static const char *kRoleNames[ROLE_COUNT] = {
@@ -201,6 +211,12 @@ static int role_from_name(const char *name) {
     return -1;
 }
 
+static int shard_from_name(const char *name) {
+    for (int i = 0; i < SHARD_KIND_COUNT; ++i)
+        if (strcmp(kShardNames[i], name) == 0) return i;
+    return -1;
+}
+
 static int parse_int_array(struct Cursor *c, int *out, int max, int *count,
                            char *err, size_t err_len) {
     if (expect_char(c, '[') != 0) return -1;
@@ -277,8 +293,12 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         return -1;
     }
     memset(out, 0, sizeof(*out));
+    /* Defaults for the optional tensor-parallel keys: one rank, no sharding. */
+    out->tp_size = 1;
+    out->tp_rank = 0;
     unsigned char seen[K_COUNT] = {0};
     int eos_count = 0, mixer_count = 0, ffn_count = 0, role_count = 0, template_count = 0;
+    int shard_count = 0;
     char (*templates)[ENGINE_TEMPLATE_MAX] = out->role_templates;
 
     struct Cursor c = {json};
@@ -320,6 +340,7 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         case K_ROTARY_DIM: case K_GDN_CONV_DIM: case K_GDN_VALUE_DIM:
         case K_GDN_NUM_V_HEADS: case K_GDN_NUM_K_HEADS: case K_GDN_HEAD_DIM:
         case K_GDN_CONV_KERNEL: case K_FLA_CHUNK_SIZE: case K_MAX_CHUNK:
+        case K_TP_SIZE: case K_TP_RANK:
         case K_MOE_NUM_EXPERTS: case K_MOE_TOP_K: case K_MOE_INTERMEDIATE_SIZE:
         case K_MOE_NUM_SHARED_EXPERTS: case K_MOE_SHARED_INTERMEDIATE_SIZE:
             if (parse_number(&c, &number) != 0) {
@@ -386,6 +407,11 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
                                  NULL, NULL, templates) != 0)
                 return -1;
             break;
+        case K_ROLE_SHARDS:
+            if (parse_text_array(&c, ENGINE_MAX_ROLES, &shard_count, err, err_len,
+                                 shard_from_name, out->role_shards, NULL) != 0)
+                return -1;
+            break;
         default:
             fail(err, err_len, "unhandled descriptor key: %s", key);
             return -1;
@@ -416,6 +442,8 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         case K_GDN_CONV_KERNEL: out->gdn_conv_kernel = (int)number; break;
         case K_FLA_CHUNK_SIZE: out->fla_chunk_size = (int)number; break;
         case K_MAX_CHUNK: out->max_chunk = (int)number; break;
+        case K_TP_SIZE: out->tp_size = (int)number; break;
+        case K_TP_RANK: out->tp_rank = (int)number; break;
         case K_MOE_NUM_EXPERTS: out->moe_num_experts = (int)number; break;
         case K_MOE_TOP_K: out->moe_top_k = (int)number; break;
         case K_MOE_INTERMEDIATE_SIZE: out->moe_intermediate_size = (int)number; break;
@@ -443,9 +471,17 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
              role_count, template_count);
         return -1;
     }
+    /* role_shards is parallel to the role table; absent means all-replicated
+     * (the struct was zeroed, and ENGINE_SHARD_NONE is 0). */
+    out->role_shard_count = seen[K_ROLE_SHARDS] ? shard_count : role_count;
+    if (out->role_shard_count != role_count) {
+        fail(err, err_len, "role_shards (%d) and role_names (%d) differ in length",
+             out->role_shard_count, role_count);
+        return -1;
+    }
     out->role_count = role_count;
     for (int i = 0; i < K_COUNT; ++i) {
-        if (!seen[i]) {
+        if (!seen[i] && !kKeys[i].optional) {
             fail(err, err_len, "descriptor key is missing: %s", kKeys[i].name);
             return -1;
         }
@@ -508,6 +544,25 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
     if (d->max_chunk < 1 || d->max_chunk > 128) {
         fail(err, err_len, "max_chunk %d is outside the supported range [1,128]", d->max_chunk);
         return -1;
+    }
+    if (d->tp_size < 1) {
+        fail(err, err_len, "tp_size %d must be at least 1", d->tp_size);
+        return -1;
+    }
+    if (d->tp_rank < 0 || d->tp_rank >= d->tp_size) {
+        fail(err, err_len, "tp_rank %d is outside [0, tp_size=%d)", d->tp_rank, d->tp_size);
+        return -1;
+    }
+    if (d->role_shard_count != d->role_count) {
+        fail(err, err_len, "role_shards (%d) and role_names (%d) differ in length",
+             d->role_shard_count, d->role_count);
+        return -1;
+    }
+    for (int i = 0; i < d->role_shard_count; ++i) {
+        if (d->role_shards[i] < 0 || d->role_shards[i] >= SHARD_KIND_COUNT) {
+            fail(err, err_len, "role_shards entry %d is not a known shard rule", i);
+            return -1;
+        }
     }
     if (strcmp(d->norm_style, "gemma") != 0 && strcmp(d->norm_style, "plain") != 0) {
         fail(err, err_len, "norm_style must be gemma or plain");
@@ -728,6 +783,8 @@ int model_desc_format(const struct ModelDesc *d, char *buf, int buf_len) {
     if (append(buf, buf_len, &used, "\"gdn_conv_kernel\":%d,", d->gdn_conv_kernel) != 0) return -1;
     if (append(buf, buf_len, &used, "\"fla_chunk_size\":%d,", d->fla_chunk_size) != 0) return -1;
     if (append(buf, buf_len, &used, "\"max_chunk\":%d,", d->max_chunk) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"tp_size\":%d,", d->tp_size) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"tp_rank\":%d,", d->tp_rank) != 0) return -1;
     if (append(buf, buf_len, &used, "\"moe_num_experts\":%d,", d->moe_num_experts) != 0) return -1;
     if (append(buf, buf_len, &used, "\"moe_top_k\":%d,", d->moe_top_k) != 0) return -1;
     if (append(buf, buf_len, &used, "\"moe_intermediate_size\":%d,", d->moe_intermediate_size) != 0) return -1;
@@ -763,6 +820,12 @@ int model_desc_format(const struct ModelDesc *d, char *buf, int buf_len) {
     if (append(buf, buf_len, &used, "\"role_templates\":[") != 0) return -1;
     for (int i = 0; i < d->role_count; ++i) {
         if (append(buf, buf_len, &used, "%s\"%s\"", i ? "," : "", d->role_templates[i]) != 0) return -1;
+    }
+    if (append(buf, buf_len, &used, "],") != 0) return -1;
+    if (append(buf, buf_len, &used, "\"role_shards\":[") != 0) return -1;
+    for (int i = 0; i < d->role_shard_count; ++i) {
+        if (append(buf, buf_len, &used, "%s\"%s\"", i ? "," : "",
+                   kShardNames[d->role_shards[i]]) != 0) return -1;
     }
     if (append(buf, buf_len, &used, "]}") != 0) return -1;
     return used;

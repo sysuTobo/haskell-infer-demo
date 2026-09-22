@@ -87,6 +87,21 @@ static void set_literal(char *buf, const char *old, const char *replacement) {
     memcpy(pos, replacement, new_len);
 }
 
+static void test_rejects(char *json, const char *needle, const char *what) {
+    struct ModelDesc desc;
+    char err[256] = {0};
+    int rc = model_desc_parse(json, &desc, err, sizeof(err));
+    if (rc == 0) {
+        fprintf(stderr, "FAIL: %s (accepted)\n", what);
+        ++failures;
+        return;
+    }
+    if (needle != NULL && strstr(err, needle) == NULL) {
+        fprintf(stderr, "FAIL: %s (error was '%s', expected to mention '%s')\n", what, err, needle);
+        ++failures;
+    }
+}
+
 static void test_good(void) {
     struct ModelDesc desc;
     char err[256] = {0};
@@ -103,6 +118,12 @@ static void test_good(void) {
     check(desc.role_count == TEST_ROLE_COUNT, "role count");
     check(model_desc_role_index(&desc, ROLE_GDN_NORM) == TEST_ROLE_COUNT - 1, "role index lookup");
     check(model_desc_role_index(&desc, ROLE_MOE_ROUTER) == -1, "absent role lookup");
+    /* The tensor-parallel keys are optional: absent means one replicated rank. */
+    check(desc.tp_size == 1 && desc.tp_rank == 0, "tp_size/tp_rank default to one rank");
+    check(desc.role_shard_count == desc.role_count, "role_shards defaults to the role count");
+    check(desc.role_shards[0] == ENGINE_SHARD_NONE &&
+              desc.role_shards[TEST_ROLE_COUNT - 1] == ENGINE_SHARD_NONE,
+          "absent role_shards means every role is replicated");
 
     char expanded[ENGINE_TEMPLATE_MAX];
     model_desc_expand("model.layers.%d.attn.q_proj.weight", 7, 0, expanded, sizeof(expanded));
@@ -114,6 +135,10 @@ static void test_good(void) {
     char echo[8192];
     int written = model_desc_format(&desc, echo, sizeof(echo));
     check(written > 0, "canonical echo produced");
+    check(strstr(echo, "\"tp_size\":1") != NULL, "canonical echo carries tp_size");
+    check(strstr(echo, "\"tp_rank\":0") != NULL, "canonical echo carries tp_rank");
+    check(strstr(echo, "\"role_shards\":[\"none\"") != NULL,
+          "canonical echo carries role_shards");
     struct ModelDesc again;
     rc = model_desc_parse(echo, &again, err, sizeof(err));
     check(rc == 0, err[0] ? err : "canonical echo does not re-parse");
@@ -122,25 +147,85 @@ static void test_good(void) {
               strcmp(again.model_type, desc.model_type) == 0 &&
               again.layer_mixers[1] == desc.layer_mixers[1] &&
               again.max_seq_len == desc.max_seq_len &&
-              again.eos_tokens[0] == desc.eos_tokens[0],
+              again.eos_tokens[0] == desc.eos_tokens[0] &&
+              again.tp_size == desc.tp_size && again.tp_rank == desc.tp_rank &&
+              again.role_shard_count == desc.role_shard_count &&
+              again.role_shards[0] == desc.role_shards[0],
           "round-trip preserves the descriptor");
     /* The echo must fit the documented buffer size used by engine_describe. */
     check(written < (int)sizeof(echo), "canonical echo fits its buffer");
 }
 
-static void test_rejects(char *json, const char *needle, const char *what) {
+/* The good descriptor with tensor parallelism enabled (tp_size 2, rank 1) and a
+ * role_shards table exercising the whole vocabulary. The table is parallel to
+ * role_names (23 entries). */
+static void build_tp2(char *buf, size_t buf_len) {
+    copy_desc(buf, buf_len);
+    set_literal(buf, "\"num_layers\":2,",
+        "\"num_layers\":2,"
+        "\"tp_size\":2,\"tp_rank\":1,"
+        "\"role_shards\":[\"none\",\"out_dim\",\"none\",\"none\",\"none\","
+        "\"out_dim\",\"out_dim\",\"in_dim\",\"out_heads\",\"out_heads\","
+        "\"out_heads\",\"in_dim\",\"none\",\"none\",\"out_heads\",\"none\","
+        "\"none\",\"none\",\"none\",\"none\",\"none\",\"in_dim\",\"none\"],");
+}
+
+static void test_tp(void) {
+    char buf[8192];
     struct ModelDesc desc;
     char err[256] = {0};
-    int rc = model_desc_parse(json, &desc, err, sizeof(err));
-    if (rc == 0) {
-        fprintf(stderr, "FAIL: %s (accepted)\n", what);
-        ++failures;
-        return;
-    }
-    if (needle != NULL && strstr(err, needle) == NULL) {
-        fprintf(stderr, "FAIL: %s (error was '%s', expected to mention '%s')\n", what, err, needle);
-        ++failures;
-    }
+    build_tp2(buf, sizeof(buf));
+    int rc = model_desc_parse(buf, &desc, err, sizeof(err));
+    check(rc == 0, err[0] ? err : "well-formed TP2 descriptor is rejected");
+    check(desc.tp_size == 2 && desc.tp_rank == 1, "tp_size/tp_rank parsed");
+    check(desc.role_shard_count == desc.role_count, "role_shards length matches the roles");
+    check(desc.role_shards[model_desc_role_index(&desc, ROLE_EMBED)] == ENGINE_SHARD_NONE,
+          "replicated role parsed");
+    check(desc.role_shards[model_desc_role_index(&desc, ROLE_ATTN_Q)] == ENGINE_SHARD_OUT_HEADS,
+          "out_heads rule parsed");
+    check(desc.role_shards[model_desc_role_index(&desc, ROLE_MLP_UP)] == ENGINE_SHARD_OUT_DIM,
+          "out_dim rule parsed");
+    check(desc.role_shards[model_desc_role_index(&desc, ROLE_MLP_DOWN)] == ENGINE_SHARD_IN_DIM,
+          "in_dim rule parsed");
+
+    /* The echo must reproduce the rules, not just the scalar keys. */
+    char echo[8192];
+    int written = model_desc_format(&desc, echo, sizeof(echo));
+    check(written > 0 && strstr(echo, "\"tp_size\":2") != NULL &&
+              strstr(echo, "\"tp_rank\":1") != NULL &&
+              strstr(echo, "\"out_heads\"") != NULL &&
+              strstr(echo, "\"in_dim\"") != NULL,
+          "canonical echo carries the tensor-parallel keys");
+    struct ModelDesc again;
+    rc = model_desc_parse(echo, &again, err, sizeof(err));
+    check(rc == 0, err[0] ? err : "TP2 echo does not re-parse");
+    check(again.tp_size == 2 && again.tp_rank == 1 &&
+              again.role_shard_count == desc.role_shard_count,
+          "TP2 echo round-trips");
+
+    /* tp_rank must be inside [0, tp_size). */
+    snprintf(buf, sizeof(buf), "%s", kGoodDesc);
+    set_literal(buf, "\"num_layers\":2,", "\"num_layers\":2,\"tp_size\":2,\"tp_rank\":2,");
+    test_rejects(buf, "tp_rank", "tp_rank >= tp_size is rejected");
+    snprintf(buf, sizeof(buf), "%s", kGoodDesc);
+    set_literal(buf, "\"num_layers\":2,", "\"num_layers\":2,\"tp_size\":2,\"tp_rank\":-1,");
+    test_rejects(buf, "tp_rank", "negative tp_rank is rejected");
+    build_tp2(buf, sizeof(buf));
+    set_literal(buf, "\"tp_size\":2,", "\"tp_size\":0,");
+    test_rejects(buf, "tp_size", "tp_size below 1 is rejected");
+
+    /* role_shards must be parallel to the role tables. */
+    build_tp2(buf, sizeof(buf));
+    set_literal(buf, "\"role_shards\":[\"none\",", "\"role_shards\":[");
+    test_rejects(buf, "role_shards", "short role_shards table is rejected");
+    snprintf(buf, sizeof(buf), "%s", kGoodDesc);
+    set_literal(buf, "\"num_layers\":2,", "\"num_layers\":2,\"role_shards\":[],");
+    test_rejects(buf, "role_shards", "empty role_shards table is rejected");
+
+    /* Unknown shard name. */
+    build_tp2(buf, sizeof(buf));
+    set_literal(buf, "\"out_heads\"", "\"out_heds\"");
+    test_rejects(buf, "unknown name", "unknown shard rule name is rejected");
 }
 
 
@@ -320,6 +405,7 @@ static void test_errors(void) {
 
 int main(void) {
     test_good();
+    test_tp();
     test_moe();
     test_errors();
     if (failures == 0) {

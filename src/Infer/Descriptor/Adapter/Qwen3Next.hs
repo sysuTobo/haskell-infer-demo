@@ -93,6 +93,7 @@ qwen3NextDescriptorFromConfig cfg tokenizer = do
     , dGdnConvKernel = fromMaybe 4 (lookupInt cfg "linear_conv_kernel_dim")
     , dFlaChunkSize = 64
     , dMaxChunk = 128
+    , dTpSize = 1, dTpRank = 0
     , dMoeNumExperts = numExperts
     , dMoeTopK = fromMaybe 1 (lookupInt cfg "num_experts_per_tok")
     , dMoeIntermediateSize = fromMaybe 0 (lookupInt cfg "moe_intermediate_size")
@@ -109,6 +110,7 @@ qwen3NextDescriptorFromConfig cfg tokenizer = do
             then FMoe else FDense
         | i <- [0 .. numLayers - 1] ]
     , dRoleTemplates = weightRoles
+    , dRoleShards = allReplicated weightRoles
     }
   where
     mixerOf :: String -> Either String MixerKind

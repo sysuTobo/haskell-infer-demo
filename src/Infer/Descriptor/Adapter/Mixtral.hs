@@ -63,6 +63,7 @@ moeDenseDescriptorFromConfig cfg tokenizer = do
         | not hasMoe = FDense
         | i `elem` denseLayers || (i + 1) `mod` sparseStep /= 0 = FDense
         | otherwise = FMoe
+      roles = weightRoles family hasMoe tied
   pure Descriptor
     { dVersion = descVersion
     , dFamily = family
@@ -91,6 +92,7 @@ moeDenseDescriptorFromConfig cfg tokenizer = do
     , dGdnConvKernel = 0
     , dFlaChunkSize = 64
     , dMaxChunk = 128
+    , dTpSize = 1, dTpRank = 0
     , dMoeNumExperts = numExperts
     , dMoeTopK = topK
     , dMoeIntermediateSize = expertIntermediate
@@ -103,7 +105,8 @@ moeDenseDescriptorFromConfig cfg tokenizer = do
     , dEosTokens = eosTokens cfg tokenizer
     , dLayerMixers = replicate numLayers MFullAttention
     , dLayerFfns = map ffnFor [0 .. numLayers - 1]
-    , dRoleTemplates = weightRoles family hasMoe tied
+    , dRoleTemplates = roles
+    , dRoleShards = allReplicated roles
     }
   where
     orElse (Just x) _ = Just x

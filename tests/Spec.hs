@@ -4,8 +4,13 @@
 module Main (main) where
 
 import Control.Monad (unless)
+import Data.Aeson (Value(..), eitherDecodeStrict', encode)
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KM
 import Data.List (isInfixOf, nub)
+import Data.Maybe (fromMaybe)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BL
 import System.Environment (lookupEnv)
 import System.IO (hPutStrLn, stderr)
 import Test.Hspec
@@ -48,6 +53,8 @@ qwen38 = Descriptor
   , dGdnConvKernel = 4
   , dFlaChunkSize = 64
   , dMaxChunk = 128
+  , dTpSize = 1
+  , dTpRank = 0
   , dMoeNumExperts = 0
   , dMoeTopK = 0
   , dMoeIntermediateSize = 0
@@ -62,7 +69,14 @@ qwen38 = Descriptor
       [ if (i + 1) `mod` 4 == 0 then MFullAttention else MGatedDeltaNet
       | i <- [0 .. 63] ]
   , dLayerFfns = replicate 64 FDense
-  , dRoleTemplates =
+  , dRoleTemplates = qwen38Roles
+  , dRoleShards = allReplicated qwen38Roles
+  }
+
+-- | Qwen3.8-27B weight templates; 'allReplicated' turns them into the default
+-- (unsharded) role_shards table.
+qwen38Roles :: [(Role, String)]
+qwen38Roles =
       [ (REmbed, "model.language_model.embed_tokens.weight")
       , (RLmHead, "lm_head.weight")
       , (RFinalNorm, "model.language_model.norm.weight")
@@ -87,7 +101,6 @@ qwen38 = Descriptor
       , (RMlpUp, "model.language_model.layers.%d.mlp.up_proj.weight")
       , (RMlpDown, "model.language_model.layers.%d.mlp.down_proj.weight")
       ]
-  }
 
 -- | Helper: a validation/placement failure.
 isLeftResult :: Either String a -> Bool
@@ -98,6 +111,30 @@ isLeftResult (Right _) = False
 mentions :: String -> Either String a -> Bool
 mentions needle (Left err) = needle `isInfixOf` err
 mentions _ (Right _) = False
+
+-- | Remove top-level keys from an encoded descriptor (to exercise the defaults
+-- of the optional tensor-parallel keys).
+dropDescriptorKeys :: [String] -> BS.ByteString -> BS.ByteString
+dropDescriptorKeys keys bytes = case eitherDecodeStrict' bytes of
+  Right (Object o) ->
+    BL.toStrict (encode (Object (foldr (KM.delete . Key.fromString) o keys)))
+  _ -> bytes
+
+-- | Craft an invalid wire document by replacing a literal byte string
+-- (replaces every occurrence; the test strings are unique in the document).
+replaceBytes :: BS.ByteString -> BS.ByteString -> BS.ByteString -> BS.ByteString
+replaceBytes needle replacement = go
+  where
+    go haystack = case BS.breakSubstring needle haystack of
+      (before, rest)
+        | BS.null rest -> haystack
+        | otherwise ->
+            BS.concat [before, replacement, go (BS.drop (BS.length needle) rest)]
+
+-- | Shard rules for the descriptor's role table with a few roles overridden.
+shardsFor :: Descriptor -> [(Role, ShardKind)] -> [ShardKind]
+shardsFor d overrides =
+  [ fromMaybe ShardNone (lookup r overrides) | (r, _) <- dRoleTemplates d ]
 
 main :: IO ()
 main = hspec $ do
@@ -142,6 +179,53 @@ main = hspec $ do
       -- 65536 B per token across the 16 attention layers (the historical number).
       kvBytesPerToken qwen38 `shouldBe` 4096
       kvBytesPerToken qwen38 * length (attentionLayers qwen38) `shouldBe` 65536
+
+    it "defaults tp_size/tp_rank/role_shards when the keys are absent" $ do
+      -- A document without the tensor-parallel keys means the historical
+      -- single-rank, fully replicated layout.
+      let withoutTp = dropDescriptorKeys ["tp_size", "tp_rank", "role_shards"]
+                        (encodeDescriptor qwen38)
+      decodeDescriptor withoutTp `shouldBe` Right qwen38
+      dTpSize qwen38 `shouldBe` 1
+      dTpRank qwen38 `shouldBe` 0
+      dRoleShards qwen38
+        `shouldBe` replicate (length (dRoleTemplates qwen38)) ShardNone
+
+    it "accepts and round-trips a TP2 descriptor with shard rules" $ do
+      let tp2 = qwen38
+            { dTpSize = 2
+            , dTpRank = 1
+            , dRoleShards = shardsFor qwen38
+                [ (RAttnQ, ShardOutHeads), (RAttnK, ShardOutHeads)
+                , (RAttnV, ShardOutHeads), (RAttnO, ShardInDim)
+                , (RMlpGate, ShardOutDim), (RMlpUp, ShardOutDim)
+                , (RMlpDown, ShardInDim), (RGdnOut, ShardInDim) ]
+            }
+      validateDescriptor tp2 `shouldBe` Right ()
+      decodeDescriptor (encodeDescriptor tp2) `shouldBe` Right tp2
+      dTpRank tp2 `shouldBe` 1
+
+    it "rejects a tp_rank outside [0, tp_size) and a non-positive tp_size" $ do
+      validateDescriptor qwen38 { dTpSize = 2, dTpRank = 2 }
+        `shouldSatisfy` mentions "tp_rank"
+      validateDescriptor qwen38 { dTpRank = -1 }
+        `shouldSatisfy` mentions "tp_rank"
+      validateDescriptor qwen38 { dTpSize = 0 }
+        `shouldSatisfy` mentions "tp_size"
+
+    it "rejects a role_shards table that is not parallel to the roles" $ do
+      validateDescriptor qwen38 { dRoleShards = [] }
+        `shouldSatisfy` mentions "role_shards"
+      validateDescriptor qwen38 { dRoleShards = init (dRoleShards qwen38) }
+        `shouldSatisfy` mentions "role_shards"
+      let broken = replaceBytes "\"none\"" "\"none\",\"none\""
+                     (encodeDescriptor qwen38)
+      decodeDescriptor broken `shouldSatisfy` mentions "role_shards"
+
+    it "rejects an unknown role_shards name on the wire" $ do
+      let bogus = replaceBytes "\"none\"" "\"out_heds\"" (encodeDescriptor qwen38)
+      decodeDescriptor bogus
+        `shouldSatisfy` mentions "unknown role_shards entry"
 
   describe "Model + Placement" $ do
     it "builds a 64-layer plan for 2 devices with 32 layers each" $ do

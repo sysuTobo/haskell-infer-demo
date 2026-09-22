@@ -31,6 +31,23 @@ extern "C" {
 #define ENGINE_FFN_DENSE 0
 #define ENGINE_FFN_MOE 1
 
+/* Tensor-parallel sharding rules for one weight role (mirrors
+ * Infer.Descriptor.ShardKind). The vocabulary is deliberately small so the
+ * engine can load shards without any family knowledge:
+ *
+ *   NONE      - replicated: every rank loads the whole tensor;
+ *   OUT_HEADS - output dimension split by head (rows are heads*head_dim; each
+ *               rank takes a contiguous block of heads);
+ *   OUT_DIM   - output dimension (rows of an [out, in] weight) split into
+ *               tp_size contiguous blocks;
+ *   IN_DIM    - input dimension (columns) split into tp_size contiguous blocks.
+ *
+ * With tp_size == 1 every rule is a no-op. */
+#define ENGINE_SHARD_NONE 0
+#define ENGINE_SHARD_OUT_HEADS 1
+#define ENGINE_SHARD_OUT_DIM 2
+#define ENGINE_SHARD_IN_DIM 3
+
 /* Weight roles (mirrors Infer.Descriptor.Role, same order). */
 enum {
     ROLE_EMBED = 0,
@@ -112,6 +129,16 @@ struct ModelDesc {
     int moe_shared_intermediate_size;
     double moe_routed_scaling_factor;
     int moe_shared_gate_scalar;
+
+    /* Tensor parallelism (defaults: tp_size 1, tp_rank 0 = no sharding).
+     * tp_size is the number of ranks; tp_rank identifies this rank. role_shards
+     * is parallel to role_ids/role_templates and holds one ENGINE_SHARD_* rule
+     * per role, so the loader knows which dimension (if any) to split. When the
+     * wire document omits the key the table is all ENGINE_SHARD_NONE. */
+    int tp_size;
+    int tp_rank;
+    int role_shard_count;
+    int role_shards[ENGINE_MAX_ROLES];
 
     int eos_count;
     int eos_tokens[ENGINE_MAX_EOS];

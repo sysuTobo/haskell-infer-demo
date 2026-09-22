@@ -88,6 +88,7 @@ qwen35DescriptorFromConfig tc tokenizer = do
     , dGdnConvKernel = convKernel
     , dFlaChunkSize = 64
     , dMaxChunk = 128
+    , dTpSize = 1, dTpRank = 0
     , dMoeNumExperts = 0, dMoeTopK = 0, dMoeIntermediateSize = 0
     , dMoeRouterScoring = "softmax", dMoeNormTopkProb = False
     , dMoeNumSharedExperts = 0, dMoeSharedIntermediateSize = 0
@@ -97,6 +98,7 @@ qwen35DescriptorFromConfig tc tokenizer = do
     , dLayerMixers = mixers
     , dLayerFfns = replicate numLayers FDense
     , dRoleTemplates = weightRoles
+    , dRoleShards = allReplicated weightRoles
     }
   where
     orElse (Just x) _ = Just x

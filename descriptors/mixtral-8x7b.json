@@ -118,6 +118,21 @@
     "moeExpertUp",
     "moeExpertDown"
   ],
+  "role_shards": [
+    "none",
+    "none",
+    "none",
+    "none",
+    "none",
+    "none",
+    "none",
+    "none",
+    "none",
+    "none",
+    "none",
+    "none",
+    "none"
+  ],
   "role_templates": [
     "model.embed_tokens.weight",
     "lm_head.weight",
@@ -135,5 +150,7 @@
   ],
   "rotary_dim": 128,
   "rotary_theta": 1000000,
+  "tp_rank": 0,
+  "tp_size": 1,
   "vocab_size": 32000
 }

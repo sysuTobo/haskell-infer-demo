@@ -101,7 +101,7 @@ static const char *kRoleNames[ROLE_COUNT] = {
     "mlpGate", "mlpUp", "mlpDown",
     "attnQ", "attnK", "attnV", "attnO", "attnQNorm", "attnKNorm",
     "gdnQkv", "gdnZ", "gdnA", "gdnB", "gdnConv1d", "gdnDtBias", "gdnALog",
-    "gdnOut", "gdnNorm",
+    "gdnOut", "gdnNorm", "gdnQkvz", "gdnBa",
     "moeRouter", "moeRouterBias",
     "moeExpertGate", "moeExpertUp", "moeExpertDown",
     "moeSharedGate", "moeSharedUp", "moeSharedDown", "moeSharedGateScalar",
@@ -585,12 +585,23 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
         }
     }
     if (has_gdn) {
-        const int gdn_roles[] = {ROLE_GDN_QKV, ROLE_GDN_Z, ROLE_GDN_A, ROLE_GDN_B,
-                                 ROLE_GDN_CONV1D, ROLE_GDN_DT_BIAS, ROLE_GDN_A_LOG,
-                                 ROLE_GDN_OUT, ROLE_GDN_NORM};
-        for (size_t i = 0; i < sizeof(gdn_roles) / sizeof(gdn_roles[0]); ++i) {
-            if (require_role(d, gdn_roles[i], "needed by gdn layers", err, err_len) != 0)
+        const int gdn_common[] = {ROLE_GDN_CONV1D, ROLE_GDN_DT_BIAS, ROLE_GDN_A_LOG,
+                                  ROLE_GDN_OUT, ROLE_GDN_NORM};
+        for (size_t i = 0; i < sizeof(gdn_common) / sizeof(gdn_common[0]); ++i) {
+            if (require_role(d, gdn_common[i], "needed by gdn layers", err, err_len) != 0)
                 return -1;
+        }
+        /* Either the projections are separate (Qwen3.5) or fused into qkvz+ba
+         * (Qwen3-Next); both layouts are complete. */
+        const int separate = model_desc_role_index(d, ROLE_GDN_QKV) >= 0 &&
+                              model_desc_role_index(d, ROLE_GDN_Z) >= 0 &&
+                              model_desc_role_index(d, ROLE_GDN_A) >= 0 &&
+                              model_desc_role_index(d, ROLE_GDN_B) >= 0;
+        const int fused = model_desc_role_index(d, ROLE_GDN_QKVZ) >= 0 &&
+                           model_desc_role_index(d, ROLE_GDN_BA) >= 0;
+        if (!separate && !fused) {
+            fail(err, err_len, "gdn layers need either qkv/z/a/b or the fused qkvz/ba roles");
+            return -1;
         }
         if (d->gdn_head_dim <= 0 || d->gdn_num_v_heads <= 0 || d->gdn_num_k_heads <= 0 ||
             d->gdn_num_v_heads % d->gdn_num_k_heads != 0) {

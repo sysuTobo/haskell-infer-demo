@@ -18,6 +18,7 @@ import Infer.Descriptor
 import Infer.Descriptor.Adapter.Json
 import Infer.Descriptor.Adapter.Mixtral
 import Infer.Descriptor.Adapter.Qwen35
+import Infer.Descriptor.Adapter.Qwen3Next
 
 -- | Load a descriptor for a model directory by dispatching on @model_type@.
 descriptorFromModelDir :: FilePath -> IO (Either String Descriptor)
@@ -31,7 +32,9 @@ descriptorFromModelDir dir = do
         modelType <- modelTypeOf value
         cfg <- textConfig value
         let tok = tokenizer
-        if modelType `elem` ["mixtral", "qwen3_moe", "qwen3"]
+        if modelType == "qwen3_next"
+          then qwen3NextDescriptorFromConfig cfg tok
+          else if modelType `elem` ["mixtral", "qwen3_moe", "qwen3"]
           then moeDenseDescriptorFromConfig cfg tok
           else if "qwen3_5" `prefixOf` modelType || "qwen3_5_text" == modelType
             then qwen35DescriptorFromConfig cfg tok
@@ -47,7 +50,9 @@ descriptorFromConfigFile path = do
     Right value -> pure $ do
       modelType <- modelTypeOf value
       cfg <- textConfig value
-      if modelType `elem` ["mixtral", "qwen3_moe", "qwen3"]
+      if modelType == "qwen3_next"
+        then qwen3NextDescriptorFromConfig cfg Nothing
+        else if modelType `elem` ["mixtral", "qwen3_moe", "qwen3"]
         then moeDenseDescriptorFromConfig cfg Nothing
         else qwen35DescriptorFromConfig cfg Nothing
 

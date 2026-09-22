@@ -124,6 +124,10 @@ static ExpectedShape expected_shape(int role, const struct ModelDesc &d) {
         return {2, {hidden, d.gdn_value_dim, 0}};
     case ROLE_GDN_NORM:
         return {1, {d.gdn_head_dim, 0, 0}};
+    case ROLE_GDN_QKVZ:
+        return {2, {d.gdn_conv_dim + d.gdn_value_dim, hidden, 0}};
+    case ROLE_GDN_BA:
+        return {2, {2 * d.gdn_num_v_heads, hidden, 0}};
     case ROLE_MOE_ROUTER:
         return {2, {d.moe_num_experts, hidden, 0}};
     case ROLE_MOE_EXPERT_GATE: case ROLE_MOE_EXPERT_UP:
@@ -311,6 +315,8 @@ static __nv_bfloat16 **role_target(LayerWeights &lw, int role) {
     case ROLE_GDN_A_LOG: return &lw.A_log;
     case ROLE_GDN_OUT: return &lw.gdn_out_proj_w;
     case ROLE_GDN_NORM: return &lw.gdn_norm_w;
+    /* The fused layout has no single destination field; it is expanded below. */
+    case ROLE_GDN_QKVZ: case ROLE_GDN_BA: return nullptr;
     default: return nullptr;
     }
 }
@@ -450,6 +456,7 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             lw.plan.ffn = eng->desc.layer_ffns[i];
             for (int role = 0; role < ROLE_COUNT; ++role) {
                 if (!role_used_by_layer(role, lw.plan.mixer, lw.plan.ffn)) continue;
+                if (model_desc_role_index(&eng->desc, role) < 0) continue;
                 __nv_bfloat16 **target = role_target(lw, role);
                 if (target == nullptr) continue;
                 load_role(index, eng->desc, role, i, ctx.device_id, target);
@@ -527,6 +534,22 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                     check_cuda(cudaMalloc(&ctx.moe_scratch, bytes), "Allocate MoE scratch");
                     ctx.moe_ws_size = bytes;
                 }
+            }
+            /* A fused qkvz/ba checkpoint fills the same views: rows are
+             * contiguous, so qkv = base and z = base + conv_dim rows, and
+             * "ba" stores b first (matching the reference's chunk order). */
+            const int qkvz_slot = model_desc_role_index(&eng->desc, ROLE_GDN_QKVZ);
+            if (qkvz_slot >= 0 && lw.plan.mixer == ENGINE_MIXER_GDN) {
+                __nv_bfloat16 *fused = nullptr;
+                load_role(index, eng->desc, ROLE_GDN_QKVZ, i, ctx.device_id, &fused);
+                lw.in_proj_qkv_w = fused;
+                lw.in_proj_z_w = fused + (size_t)eng->dims.gdn_conv_dim * hidden;
+                lw.owned.push_back(fused);
+                __nv_bfloat16 *ba = nullptr;
+                load_role(index, eng->desc, ROLE_GDN_BA, i, ctx.device_id, &ba);
+                lw.in_proj_b_w = ba;
+                lw.in_proj_a_w = ba + (size_t)eng->dims.gdn_num_v_heads * hidden;
+                lw.owned.push_back(ba);
             }
             if (lw.plan.mixer == ENGINE_MIXER_FULL_ATTN) {
                 check_cuda(cudaMalloc(&lw.kv_cache, kv_cache_bytes(eng)), "Allocate KV cache");

@@ -20,8 +20,8 @@ struct Workspace {
 }
 
 size_t kernel_fla_workspace_size(int tokens, int value_heads) {
-    if (tokens < 1 || tokens > 128 || value_heads != 48)
-        throw std::invalid_argument("FLA supports 1..128 tokens and 48 value heads");
+    if (tokens < 1 || tokens > 128 || value_heads <= 0 || value_heads > 128)
+        throw std::invalid_argument("FLA supports 1..128 tokens and a positive value-head count");
     size_t rows = size_t(tokens) * value_heads;
     return 6 * aligned(rows * 128 * sizeof(__nv_bfloat16)) +
            3 * aligned(rows * sizeof(float)) +
@@ -66,8 +66,17 @@ void kernel_fla_gdn(__nv_bfloat16 *out, const __nv_bfloat16 *qkv,
     aot_prepare(stream, qkv, b, a, dt_bias, A_log, q, k, v, g, beta,
                 key_heads, value_heads, (2 * key_heads + value_heads) * 128, tokens);
     if (tokens == 1) {
-        aot_recurrent48(stream, q, k, v, g, nullptr, nullptr, beta, nullptr,
-                      nullptr, out, state, state, nullptr, scale, tokens);
+        /* The recurrent kernel is AOT-compiled per value-head count; 48 is
+         * Qwen3.5's GDN layout and 32 is Qwen3-Next's. */
+        if (value_heads == 48) {
+            aot_recurrent48(stream, q, k, v, g, nullptr, nullptr, beta, nullptr,
+                            nullptr, out, state, state, nullptr, scale, tokens);
+        } else if (value_heads == 32) {
+            aot_recurrent32(stream, q, k, v, g, nullptr, nullptr, beta, nullptr,
+                            nullptr, out, state, state, nullptr, scale, tokens);
+        } else {
+            throw std::invalid_argument("no AOT recurrent kernel for this value-head count");
+        }
         return;
     }
     aot_cumsum(stream, g, cumulative_g, tokens, value_heads);

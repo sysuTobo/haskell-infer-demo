@@ -56,6 +56,7 @@ data Role
   | RAttnQ | RAttnK | RAttnV | RAttnO | RAttnQNorm | RAttnKNorm
   | RGdnQkv | RGdnZ | RGdnA | RGdnB | RGdnConv1d | RGdnDtBias | RGdnALog
   | RGdnOut | RGdnNorm
+  | RGdnQkvz | RGdnBa           -- fused projections (Qwen3-Next style)
   | RMoeRouter | RMoeRouterBias
   | RMoeExpertGate | RMoeExpertUp | RMoeExpertDown
   | RMoeSharedGate | RMoeSharedUp | RMoeSharedDown | RMoeSharedGateScalar
@@ -441,7 +442,13 @@ rolesCheck d
       | not hasFull = []
       | dAttnQkNorm d = [RAttnQ, RAttnK, RAttnV, RAttnO, RAttnQNorm, RAttnKNorm]
       | otherwise = [RAttnQ, RAttnK, RAttnV, RAttnO]
-    gdn = if hasGdn
-      then [RGdnQkv, RGdnZ, RGdnA, RGdnB, RGdnConv1d, RGdnDtBias, RGdnALog, RGdnOut, RGdnNorm]
-      else []
+    -- GDN layers need either the separate projections (Qwen3.5) or the fused
+    -- qkvz/ba pair (Qwen3-Next).
+    gdnCommon = [RGdnConv1d, RGdnDtBias, RGdnALog, RGdnOut, RGdnNorm]
+    gdnSeparate = [RGdnQkv, RGdnZ, RGdnA, RGdnB]
+    gdnFused = [RGdnQkvz, RGdnBa]
+    gdn
+      | not hasGdn = []
+      | all (`elem` roles) gdnSeparate = gdnCommon ++ gdnSeparate
+      | otherwise = gdnCommon ++ gdnFused
     required = global ++ attn ++ gdn

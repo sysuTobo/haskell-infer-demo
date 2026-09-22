@@ -180,9 +180,13 @@ def main():
         "USE_GATE_IN_KERNEL": False, "HAS_DT_BIAS": False,
         "APPLY_BETA_SIGMOID": False, "ALLOW_NEG_EIGVAL": False,
     }
-    for heads in (16, 48):
+    # The recurrent kernel is compiled per (q/k heads, v heads): Qwen3.5 uses
+    # 16/48, Qwen3-Next 16/32.
+    for name, heads, value_heads in (("recurrent16", 16, 48), ("recurrent48", 48, 48),
+                                     ("recurrent32", 16, 32)):
         constants["H"] = heads
-        h, cc = emit(f"recurrent{heads}", fn, signature, constants, ("16", "48", "1"), 1, 3, arches)
+        constants["HV"] = value_heads
+        h, cc = emit(name, fn, signature, constants, ("16", str(value_heads), "1"), 1, 3, arches)
         declarations.append(h)
         sources.append(cc)
     output = Path(args.output)

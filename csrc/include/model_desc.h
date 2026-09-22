@@ -56,6 +56,8 @@ enum {
     ROLE_GDN_A_LOG,
     ROLE_GDN_OUT,
     ROLE_GDN_NORM,
+    ROLE_GDN_QKVZ,        /* fused q+k+v+z projection (Qwen3-Next style) */
+    ROLE_GDN_BA,          /* fused b+a projection */
     ROLE_MOE_ROUTER,
     ROLE_MOE_ROUTER_BIAS,
     ROLE_MOE_EXPERT_GATE,

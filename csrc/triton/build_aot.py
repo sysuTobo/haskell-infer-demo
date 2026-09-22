@@ -35,8 +35,27 @@ static void check_driver(CUresult status) {
     }
 }
 
-struct Kernel {
+/* One cubin per (kernel, architecture); the matching one is chosen at runtime
+ * from the device's compute capability. These cubins carry no PTX, so a device
+ * whose capability was not built is a hard error here instead of a driver error
+ * somewhere downstream. */
+struct ArchImage {
+    int arch;
     const unsigned char *image;
+};
+
+static int device_compute_capability() {
+    CUdevice device;
+    check_driver(cuCtxGetDevice(&device));
+    int major = 0, minor = 0;
+    check_driver(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+    check_driver(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+    return major * 10 + minor;
+}
+
+struct Kernel {
+    const ArchImage *images;
+    int image_count;
     const char *name;
     unsigned shared;
     std::mutex mutex;
@@ -49,6 +68,19 @@ struct Kernel {
         std::lock_guard<std::mutex> guard(mutex);
         auto found = contexts.find(context);
         if (found != contexts.end()) return found->second.second;
+        const int arch = device_compute_capability();
+        const unsigned char *image = nullptr;
+        for (int i = 0; i < image_count; ++i)
+            if (images[i].arch == arch) image = images[i].image;
+        if (image == nullptr) {
+            std::string available;
+            for (int i = 0; i < image_count; ++i) {
+                if (i) available += ", ";
+                available += std::to_string(images[i].arch);
+            }
+            throw std::runtime_error(std::string("no AOT cubin for compute capability ") +
+                                     std::to_string(arch) + " (built for: " + available + ")");
+        }
         CUmodule module;
         check_driver(cuModuleLoadData(&module, image));
         CUfunction function;
@@ -66,13 +98,7 @@ struct Kernel {
 '''
 
 
-def emit(name, fn, signature, constants, grid, warps, stages, target):
-    compiled = triton.compile(
-        ASTSource(fn=fn, signature=signature, constexprs=constants),
-        target=target, options={"num_warps": warps, "num_stages": stages},
-    )
-    if compiled.metadata.global_scratch_size:
-        raise RuntimeError(f"{name} unexpectedly requires global scratch")
+def emit(name, fn, signature, constants, grid, warps, stages, arches):
     params = []
     names = []
     for arg in fn.arg_names:
@@ -83,24 +109,46 @@ def emit(name, fn, signature, constants, grid, warps, stages, target):
         params.append(ctype + arg)
         names.append(arg)
     declaration = f"void aot_{name}(CUstream stream, " + ", ".join(params) + ")"
-    data = ",".join(str(x) for x in compiled.asm["cubin"])
-    source = f"static const unsigned char image_{name}[] = {{{data}}};\n"
-    source += f'static Kernel kernel_{name}{{image_{name}, "{compiled.name}", {compiled.metadata.shared}}};\n'
+    source = ""
+    table = []
+    symbol = None
+    shared = None
+    for arch in arches:
+        compiled = triton.compile(
+            ASTSource(fn=fn, signature=signature, constexprs=constants),
+            target=GPUTarget("cuda", arch, 32),
+            options={"num_warps": warps, "num_stages": stages},
+        )
+        if compiled.metadata.global_scratch_size:
+            raise RuntimeError(f"{name} unexpectedly requires global scratch")
+        symbol = compiled.name
+        shared = compiled.metadata.shared
+        array = f"image_{name}_{arch}"
+        data = ",".join(str(x) for x in compiled.asm["cubin"])
+        source += f"static const unsigned char {array}[] = {{{data}}};\n"
+        table.append(f"{{{arch}, {array}}}")
+        print(f"{name}[{arch}]: {len(compiled.asm['cubin'])} bytes, shared={shared}", flush=True)
+    source += "static const ArchImage images_" + name + "[] = {" + ", ".join(table) + "};\n"
+    source += f'static Kernel kernel_{name}{{images_{name}, {len(arches)}, "{symbol}", {shared}}};\n'
     source += declaration + " {\n    void *scratch = nullptr;\n"
     source += "    void *args[] = {" + ", ".join("&" + x for x in names) + ", &scratch};\n"
-    source += f"    check_driver(cuLaunchKernel(kernel_{name}.get(), {', '.join(grid)}, {warps * 32}, 1, 1, {compiled.metadata.shared}, stream, args, nullptr));\n}}\n"
-    print(f"{name}: {len(compiled.asm['cubin'])} bytes, shared={compiled.metadata.shared}", flush=True)
+    source += f"    check_driver(cuLaunchKernel(kernel_{name}.get(), {', '.join(grid)}, {warps * 32}, 1, 1, {shared}, stream, args, nullptr));\n}}\n"
     return declaration + ";\n", source
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
-    parser.add_argument("--arch", type=int, default=86)
+    parser.add_argument("--arch", default="86",
+                        help="comma-separated compute capabilities, e.g. 86,89,90")
     args = parser.parse_args()
     if triton.__version__ != "3.4.0" or importlib.metadata.version("fla-core") != "0.5.2":
         raise RuntimeError("AOT requires triton==3.4.0 and fla-core==0.5.2")
-    target = GPUTarget("cuda", args.arch, 32)
+    requested = args.arch.replace(";", ",")
+    arches = sorted({int(a.strip().rstrip("a")) for a in requested.split(",") if a.strip()})
+    if not arches:
+        raise RuntimeError("no architectures requested")
+    print(f"AOT targets: {arches}", flush=True)
     declarations = ["#pragma once\n#include <cuda.h>\n#include <cstdint>\n"]
     sources = [PREAMBLE]
     for name, symbol, spec, grid, warps, stages in SPECS:
@@ -111,7 +159,7 @@ def main():
                 constants[arg] = int(dtype)
             else:
                 signature[arg] = dtype
-        h, cc = emit(name, fn, signature, constants, grid, warps, stages, target)
+        h, cc = emit(name, fn, signature, constants, grid, warps, stages, arches)
         declarations.append(h)
         sources.append(cc)
     fn = fused_recurrent_gated_delta_rule_fwd_kernel
@@ -134,7 +182,7 @@ def main():
     }
     for heads in (16, 48):
         constants["H"] = heads
-        h, cc = emit(f"recurrent{heads}", fn, signature, constants, ("16", "48", "1"), 1, 3, target)
+        h, cc = emit(f"recurrent{heads}", fn, signature, constants, ("16", "48", "1"), 1, 3, arches)
         declarations.append(h)
         sources.append(cc)
     output = Path(args.output)

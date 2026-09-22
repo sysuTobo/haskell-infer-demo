@@ -57,7 +57,7 @@ Rust (tokenizer-ffi)
 |-----------|---------|-------|
 | GHC | 9.6+ | via [ghcup](https://www.haskell.org/ghcup/) |
 | Cabal | 3.10+ | installed with ghcup |
-| CUDA Toolkit | 12.9.1 | nvcc targeting sm_86 (A40) |
+| CUDA Toolkit | 12.9.1 | nvcc targeting sm_86; sm_89/sm_90a SASS + compute_90 PTX built alongside |
 | FlashInfer | 0.5.3 | C++ headers only; no TVM/Python runtime |
 | Triton / fla-core | 3.4.0 / 0.5.2 | Build-time AOT; cubins embedded in libengine.so |
 | Python / PyTorch | 3.10+ / 2.8 | Build and independent numerical tests only |
@@ -79,8 +79,17 @@ source /path/on/local-ssd/kernel-deps/env.sh
 
 The native engine is `csrc/build-libs/libengine.so`; Haskell links to this shared
 library so rebuilding CUDA does not leave a stale statically linked engine.
-Runtime requires neither Python nor PyTorch. `CUDA_ARCH` defaults to `86`;
-other architectures need separate compilation and numerical validation.
+Runtime requires neither Python nor PyTorch.
+
+Architectures: one `libengine.so` carries SASS for `86;89;90a` plus `compute_90`
+PTX, so the same build runs on A40 (sm_86), L20 (sm_89) and H200 (sm_90a); the
+PTX is the forward-compatibility path for newer devices. The Triton AOT cubins of
+the FLA kernels have no PTX equivalent, so they are compiled per architecture
+(`ENGINE_TRITON_ARCHS`, default `86;89;90`) and picked at runtime from the
+device's compute capability -- a device with no matching cubin fails with an
+explicit error instead of a driver error. Both lists are CMake cache variables
+(`CMAKE_CUDA_ARCHITECTURES`, `ENGINE_TRITON_ARCHS`), and `CUDA_ARCH` still
+overrides the nvcc list in `scripts/build.sh`.
 
 ### Model descriptor
 
@@ -114,7 +123,9 @@ equal highest BF16 reference logits are treated as ties.
 ## Tests
 
 - `ctest --test-dir csrc/build-libs` — `test_model_desc` (CPU: descriptor parsing,
-  validation, canonical echo) plus the operator-level GPU regressions:
+  validation, canonical echo), `test_collective` (event-ordered copies and the
+  cross-device all-reduce on 2 GPUs, skipped with fewer devices) plus the
+  operator-level GPU regressions:
   `test_attention` (causal GQA, KV write, output gate), `test_gdn` (FLA recurrent
   decode, causal-conv1d, gated norm), `test_library_ops` (FLA chunk pipeline
   T=1..128 vs PyTorch recurrent on both GPUs, GemmaRMSNorm, partial RoPE).

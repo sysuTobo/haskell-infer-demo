@@ -38,6 +38,33 @@ Qwen3.8-27B (hybrid Full-Attention + GatedDeltaNet, 64 layers, ~50 GiB BF16).
 - The tokenizer ecosystem is in Rust/Python; Rust gives us a C ABI with zero
   runtime dependency beyond libstdc++.
 
+### Hardware targets and cross-device communication
+
+One shared library serves every target. `CMAKE_CUDA_ARCHITECTURES` is
+`86;89;90a` (SASS) plus `90-virtual` (PTX): the PTX lets a device newer than the
+built list JIT the nvcc-compiled kernels, which is the only forward-compatibility
+mechanism available. The FLA chunk kernels are Triton AOT cubins with no PTX
+equivalent, so `triton/build_aot.py` compiles them per architecture and the
+launcher picks the image matching the current device's compute capability,
+raising an explicit error when none was built.
+
+Cross-device work runs through `csrc/collective.cu`. There is no NCCL: at 2-8
+devices inside one process, the transfers and the reduction are cheaper than a
+communicator and the demo stays dependency-free. Two rules:
+
+- A copy never synchronizes the producer's stream. The producer records an event
+  and the consumer's stream waits on it, so the GPUs stay busy while the
+  activation crosses devices.
+- Peer access is probed once at startup and reported; when it is unavailable
+  (A40 pairs on PCIe have no P2P) the copies still work, staged through the host
+  by the driver.
+
+The all-reduce used by tensor/expert parallel placement is leader-based: every
+follower copies its partial into the leader's staging buffer, the leader adds it
+(elementwise bf16) and broadcasts the result. It is exercised by
+`test_collective`, which also checks that a copy issued without host
+synchronization still observes data produced asynchronously on the source stream.
+
 ### Model descriptor
 
 Everything the engine needs to know about an architecture travels in one *flat*
@@ -135,6 +162,14 @@ State S is [48, 128, 128] F32 = 3 MiB per layer, 147 MiB total.
 (same recurrent kernel as decode). This is O(n) kernel launches for n prompt
 tokens but guarantees correctness and code reuse. Chunked prefill is a
 future optimization.
+
+### Prefill batching
+
+The descriptor's `max_chunk` (default 128, validated against the kernels' hard
+limit) sets the prefill batch size: activation buffers, position buffers and the
+chunking loop all follow it, so a model that wants smaller batches only changes
+data. Kernel-side limits stay where they belong -- FLA's chunk pipeline rejects
+more than 128 tokens per call regardless of the descriptor.
 
 ### Layer kinds
 

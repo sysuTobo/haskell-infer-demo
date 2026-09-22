@@ -32,7 +32,7 @@ enum {
     K_MAX_SEQ_LEN, K_NUM_HEADS, K_NUM_KV_HEADS, K_HEAD_DIM, K_ROTARY_DIM,
     K_ROTARY_THETA, K_ATTN_OUTPUT_GATE, K_Q_GATE_INTERLEAVE, K_GDN_CONV_DIM,
     K_GDN_VALUE_DIM, K_GDN_NUM_V_HEADS, K_GDN_NUM_K_HEADS, K_GDN_HEAD_DIM,
-    K_GDN_CONV_KERNEL, K_FLA_CHUNK_SIZE, K_EOS_TOKENS, K_LAYER_MIXERS,
+    K_GDN_CONV_KERNEL, K_FLA_CHUNK_SIZE, K_MAX_CHUNK, K_EOS_TOKENS, K_LAYER_MIXERS,
     K_LAYER_FFNS, K_ROLE_NAMES, K_ROLE_TEMPLATES,
     K_COUNT
 };
@@ -65,6 +65,7 @@ static const struct {
     {"gdn_head_dim", KV_INT},
     {"gdn_conv_kernel", KV_INT},
     {"fla_chunk_size", KV_INT},
+    {"max_chunk", KV_INT},
     {"eos_tokens", KV_INT_ARRAY},
     {"layer_mixers", KV_TEXT_ARRAY},
     {"layer_ffns", KV_TEXT_ARRAY},
@@ -302,7 +303,7 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         case K_MAX_SEQ_LEN: case K_NUM_HEADS: case K_NUM_KV_HEADS: case K_HEAD_DIM:
         case K_ROTARY_DIM: case K_GDN_CONV_DIM: case K_GDN_VALUE_DIM:
         case K_GDN_NUM_V_HEADS: case K_GDN_NUM_K_HEADS: case K_GDN_HEAD_DIM:
-        case K_GDN_CONV_KERNEL: case K_FLA_CHUNK_SIZE:
+        case K_GDN_CONV_KERNEL: case K_FLA_CHUNK_SIZE: case K_MAX_CHUNK:
             if (parse_number(&c, &number) != 0) {
                 fail(err, err_len, "key %s must be a number", key);
                 return -1;
@@ -382,6 +383,7 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         case K_GDN_HEAD_DIM: out->gdn_head_dim = (int)number; break;
         case K_GDN_CONV_KERNEL: out->gdn_conv_kernel = (int)number; break;
         case K_FLA_CHUNK_SIZE: out->fla_chunk_size = (int)number; break;
+        case K_MAX_CHUNK: out->max_chunk = (int)number; break;
         case K_EOS_TOKENS: out->eos_count = eos_count; break;
         default: break;
         }
@@ -461,6 +463,10 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
     }
     if (d->rms_eps <= 0 || d->rotary_theta <= 0) {
         fail(err, err_len, "rms_eps and rotary_theta must be positive");
+        return -1;
+    }
+    if (d->max_chunk < 1 || d->max_chunk > 128) {
+        fail(err, err_len, "max_chunk %d is outside the supported range [1,128]", d->max_chunk);
         return -1;
     }
     if (d->eos_count <= 0) {
@@ -603,6 +609,7 @@ int model_desc_format(const struct ModelDesc *d, char *buf, int buf_len) {
     if (append(buf, buf_len, &used, "\"gdn_head_dim\":%d,", d->gdn_head_dim) != 0) return -1;
     if (append(buf, buf_len, &used, "\"gdn_conv_kernel\":%d,", d->gdn_conv_kernel) != 0) return -1;
     if (append(buf, buf_len, &used, "\"fla_chunk_size\":%d,", d->fla_chunk_size) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"max_chunk\":%d,", d->max_chunk) != 0) return -1;
     if (append(buf, buf_len, &used, "\"eos_tokens\":[") != 0) return -1;
     for (int i = 0; i < d->eos_count; ++i) {
         if (append(buf, buf_len, &used, "%s%d", i ? "," : "", d->eos_tokens[i]) != 0) return -1;

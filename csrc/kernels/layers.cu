@@ -9,9 +9,10 @@
 #include <stdexcept>
 #include <string>
 
-static void check_tokens(int tokens) {
-    if (tokens < 1 || tokens > ENGINE_BATCH_TOKENS)
-        throw std::invalid_argument("Layer token count must be in [1, 128]");
+static void check_tokens(int tokens, const ModelDims *dims) {
+    const int limit = dims != nullptr && dims->max_chunk > 0 ? dims->max_chunk : ENGINE_MAX_CHUNK;
+    if (tokens < 1 || tokens > limit)
+        throw std::invalid_argument("Layer token count exceeds the model's max_chunk");
 }
 
 static void check_launch() {
@@ -38,7 +39,7 @@ static void checked_gemm(cublasHandle_t cublas, __nv_bfloat16 *out,
 }
 
 size_t layer_workspace_size(int tokens, const ModelDims *dims) {
-    check_tokens(tokens);
+    check_tokens(tokens, dims);
     const size_t H = dims->hidden_size;
     const size_t Q = (size_t)dims->num_heads * dims->head_dim;
     const size_t KV = (size_t)dims->num_kv_heads * dims->head_dim;
@@ -74,7 +75,7 @@ int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
                 const __nv_bfloat16 *residual, __nv_bfloat16 *ws,
                 __nv_bfloat16 *layer_out, const MlpWeights *w,
                 int tokens, const ModelDims *dims) {
-    check_tokens(tokens);
+    check_tokens(tokens, dims);
     bind_stream(cublas, stream);
     const int H = dims->hidden_size;
     const int I = dims->intermediate_size;
@@ -98,7 +99,7 @@ int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
     const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
     const AttentionWeights *w, __nv_bfloat16 *kv_cache,
     const int64_t *positions, int tokens, int seq_len, const ModelDims *dims) {
-    check_tokens(tokens);
+    check_tokens(tokens, dims);
     if (!positions || seq_len < tokens || seq_len > dims->max_seq_len)
         throw std::invalid_argument("Invalid attention positions or sequence length");
     bind_stream(cublas, stream);
@@ -154,7 +155,7 @@ int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
     const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
     const GdnWeights *w, __nv_bfloat16 *conv_state,
     float *ssm_state, void *fla_scratch, int tokens, const ModelDims *dims) {
-    check_tokens(tokens);
+    check_tokens(tokens, dims);
     bind_stream(cublas, stream);
     const int H = dims->hidden_size;
     const int C = dims->gdn_conv_dim;

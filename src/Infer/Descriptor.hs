@@ -108,6 +108,7 @@ data Descriptor = Descriptor
   , dGdnHeadDim :: !Int
   , dGdnConvKernel :: !Int
   , dFlaChunkSize :: !Int         -- ^ must match the AOT-compiled FLA chunk cubin
+  , dMaxChunk :: !Int             -- ^ prefill batch size (<= the kernels' limit)
   , dEosTokens :: [Int]
   , dLayerMixers :: [MixerKind]
   , dLayerFfns :: [FfnKind]
@@ -138,7 +139,7 @@ descriptorKeys =
   , "max_seq_len", "num_heads", "num_kv_heads", "head_dim", "rotary_dim"
   , "rotary_theta", "attn_output_gate", "q_gate_interleave", "gdn_conv_dim"
   , "gdn_value_dim", "gdn_num_v_heads", "gdn_num_k_heads", "gdn_head_dim"
-  , "gdn_conv_kernel", "fla_chunk_size", "eos_tokens", "layer_mixers"
+  , "gdn_conv_kernel", "fla_chunk_size", "max_chunk", "eos_tokens", "layer_mixers"
   , "layer_ffns", "role_names", "role_templates"
   ]
 
@@ -169,6 +170,7 @@ encodeDescriptor d = BL.toStrict . encode $ object
   , "gdn_head_dim" .= dGdnHeadDim d
   , "gdn_conv_kernel" .= dGdnConvKernel d
   , "fla_chunk_size" .= dFlaChunkSize d
+  , "max_chunk" .= dMaxChunk d
   , "eos_tokens" .= dEosTokens d
   , "layer_mixers" .= map mixerName (dLayerMixers d)
   , "layer_ffns" .= map ffnName (dLayerFfns d)
@@ -213,6 +215,7 @@ decodeDescriptor bytes = do
   gdnHeadDim <- reqInt obj "gdn_head_dim"
   convKernel <- reqInt obj "gdn_conv_kernel"
   chunkSize <- reqInt obj "fla_chunk_size"
+  maxChunk <- reqInt obj "max_chunk"
   eos <- reqIntList obj "eos_tokens"
   mixers <- traverse parseMixer =<< reqTextList obj "layer_mixers"
   ffns <- traverse parseFfn =<< reqTextList obj "layer_ffns"
@@ -227,7 +230,8 @@ decodeDescriptor bytes = do
     , dRotaryDim = rotaryDim, dRotaryTheta = theta, dAttnOutputGate = outGate
     , dQGateInterleave = qgInterleave, dGdnConvDim = convDim, dGdnValueDim = valueDim
     , dGdnNumVHeads = vHeads, dGdnNumKHeads = kHeads, dGdnHeadDim = gdnHeadDim
-    , dGdnConvKernel = convKernel, dFlaChunkSize = chunkSize, dEosTokens = eos
+    , dGdnConvKernel = convKernel, dFlaChunkSize = chunkSize, dMaxChunk = maxChunk
+    , dEosTokens = eos
     , dLayerMixers = mixers, dLayerFfns = ffns
     , dRoleTemplates = zip roles templates
     }
@@ -322,6 +326,8 @@ checks d =
         "rotary_dim must be even and <= head_dim"
   , err (dRotaryTheta d <= 0) "rotary_theta must be positive"
   , err (dRmsEps d <= 0) "rms_eps must be positive"
+  , err (dMaxChunk d < 1 || dMaxChunk d > 128)
+        "max_chunk must be in [1,128] (the kernels' batch limit)"
   , err (null (dEosTokens d)) "eos_tokens must not be empty"
   , err (any (\t -> t < 0 || t >= dVocabSize d) (dEosTokens d))
         "eos_tokens must be within the vocabulary"

@@ -44,6 +44,7 @@ static const char *kGoodDesc =
     "\"gdn_head_dim\":4,"
     "\"gdn_conv_kernel\":4,"
     "\"fla_chunk_size\":64,"
+    "\"max_chunk\":128,"
     "\"eos_tokens\":[7,9],"
     "\"layer_mixers\":[\"full_attn\",\"gdn\"],"
     "\"layer_ffns\":[\"dense\",\"dense\"],"
@@ -84,6 +85,7 @@ static void test_good(void) {
     check(desc.hidden_size == 8, "hidden_size parsed");
     check(desc.attn_output_gate == 1, "attn_output_gate parsed");
     check(desc.max_seq_len == 64, "max_seq_len parsed");
+    check(desc.max_chunk == 128, "max_chunk parsed");
     check(desc.layer_mixers[0] == ENGINE_MIXER_FULL_ATTN, "layer 0 mixer");
     check(desc.layer_mixers[1] == ENGINE_MIXER_GDN, "layer 1 mixer");
     check(desc.eos_count == 2 && desc.eos_tokens[1] == 9, "eos tokens parsed");
@@ -159,6 +161,11 @@ static void test_errors(void) {
     copy_desc(buf, sizeof(buf));
     set_literal(buf, "\"eos_tokens\":[7,9]", "\"eos_tokens\":[7,999]");
     test_rejects(buf, "outside the vocabulary", "out-of-vocab EOS is rejected");
+
+    /* max_chunk beyond the kernels' limit. */
+    copy_desc(buf, sizeof(buf));
+    set_literal(buf, "\"max_chunk\":128", "\"max_chunk\":256");
+    test_rejects(buf, "max_chunk", "max_chunk beyond the kernel limit is rejected");
 
     /* Wrong type for a scalar. */
     copy_desc(buf, sizeof(buf));

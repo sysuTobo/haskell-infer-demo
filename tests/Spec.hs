@@ -45,6 +45,7 @@ qwen38 = Descriptor
   , dGdnHeadDim = 128
   , dGdnConvKernel = 4
   , dFlaChunkSize = 64
+  , dMaxChunk = 128
   , dEosTokens = [248046, 248044]
   , dLayerMixers =
       [ if (i + 1) `mod` 4 == 0 then MFullAttention else MGatedDeltaNet

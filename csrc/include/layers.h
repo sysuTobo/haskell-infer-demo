@@ -33,9 +33,12 @@ typedef struct {
     int gdn_num_k_heads;
     int gdn_head_dim;
     int gdn_conv_kernel;
+    int max_chunk;            /* prefill batch size (<= ENGINE_MAX_CHUNK) */
 } ModelDims;
 
-static constexpr int ENGINE_BATCH_TOKENS = 128;
+/* Hard limit of the kernels (FLA chunk pipeline and layer scratch). Descriptors
+ * ask for a max_chunk <= this; the engine chunks prefill accordingly. */
+static constexpr int ENGINE_MAX_CHUNK = 128;
 
 /* Per-layer MLP weights (shared between attention and GDN layers) */
 typedef struct {
@@ -139,8 +142,29 @@ typedef struct {
 int forward_layer(const LayerContext *ctx, const struct LayerWeights *w,
                   const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out);
 
+/* ------------------------------------------------------------------ */
+/* Cross-device primitives (collective.cu)                            */
+/* ------------------------------------------------------------------ */
+
+/* Probe (and optionally enable) peer access for every ordered device pair;
+ * returns the number of reachable pairs and logs the outcome. */
+int peer_probe_all(const int *devices, int count, int enable);
+
+/* Copy [src] on from_device to [dst] on to_device, ordered by an event recorded
+ * on the producer stream (no host synchronization). */
+int copy_across_devices(int from_device, cudaStream_t from_stream, cudaEvent_t *from_event,
+                        int to_device, cudaStream_t to_stream,
+                        void *dst, const void *src, size_t bytes);
+
+/* In-place sum of one bf16 buffer per device (elementwise, bf16 arithmetic), via
+ * leader staging on devices[0]. events/streams are index-aligned with devices;
+ * the caller synchronizes afterwards. */
+int allreduce_sum_bf16(const int *devices, cudaStream_t *streams, cudaEvent_t *events,
+                       int count, __nv_bfloat16 **buffers, __nv_bfloat16 *leader_staging,
+                       size_t elements);
+
 /* Bytes for reusable attention/GDN/MLP workspace; excludes FLA scratch and
- * the independent residual/layer_out buffers. tokens must be in [1, 128]. */
+ * the independent residual/layer_out buffers. tokens must be in [1, max_chunk]. */
 size_t layer_workspace_size(int tokens, const ModelDims *dims);
 
 /* residual and layer_out are separate [tokens, hidden_size] BF16 buffers,

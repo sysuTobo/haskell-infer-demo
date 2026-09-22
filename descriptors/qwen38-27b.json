@@ -23,6 +23,7 @@
   "gdn_head_dim": 128,
   "gdn_conv_kernel": 4,
   "fla_chunk_size": 64,
+  "max_chunk": 128,
   "eos_tokens": [
     248046,
     248044

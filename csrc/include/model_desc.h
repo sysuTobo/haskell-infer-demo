@@ -96,6 +96,7 @@ struct ModelDesc {
     int gdn_head_dim;
     int gdn_conv_kernel;
     int fla_chunk_size;
+    int max_chunk;              /* prefill batch size the engine chunks to */
 
     int eos_count;
     int eos_tokens[ENGINE_MAX_EOS];

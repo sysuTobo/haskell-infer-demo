@@ -1,5 +1,10 @@
-cmake_minimum_required(VERSION 3.18)
-set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architecture")
+cmake_minimum_required(VERSION 3.24)
+# SASS for every deployment target plus PTX for compute_90 (the only forward
+# compatibility we have: it lets a newer device JIT the nvcc-compiled kernels).
+set(CMAKE_CUDA_ARCHITECTURES "86;89;90a;90-virtual" CACHE STRING "CUDA SASS/PTX targets")
+# Triton AOT cubins have no PTX fallback, so they are built per architecture and
+# selected at runtime by compute capability (see triton/build_aot.py).
+set(ENGINE_TRITON_ARCHS "86;89;90" CACHE STRING "Triton AOT targets")
 project(infer-engine LANGUAGES C CXX CUDA)
 
 set(CMAKE_CUDA_STANDARD 17)
@@ -16,7 +21,7 @@ add_custom_command(
     OUTPUT "${GENERATED}/aot_kernels.cpp" "${GENERATED}/aot_kernels.h"
     COMMAND ${CMAKE_COMMAND} -E env "TRITON_PTXAS_PATH=${CUDAToolkit_BIN_DIR}/ptxas"
             ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/triton/build_aot.py"
-            --output "${GENERATED}" --arch ${CMAKE_CUDA_ARCHITECTURES}
+            --output "${GENERATED}" --arch "${ENGINE_TRITON_ARCHS}"
     DEPENDS triton/build_aot.py triton/gated_delta_rule_chunkwise.py
     VERBATIM
 )
@@ -31,7 +36,7 @@ add_custom_command(
 )
 
 add_library(engine SHARED
-    engine.cu memory.cu safetensors_loader.cu model_desc.c layer_dispatch.cu
+    engine.cu memory.cu safetensors_loader.cu model_desc.c layer_dispatch.cu collective.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu
@@ -61,6 +66,9 @@ if(BUILD_TESTS)
     add_executable(test_gdn ../tests/kernels/test_gdn.cu)
     target_link_libraries(test_gdn PRIVATE engine)
     add_test(NAME test_gdn COMMAND test_gdn)
+    add_executable(test_collective ../tests/kernels/test_collective.cu)
+    target_link_libraries(test_collective PRIVATE engine)
+    add_test(NAME test_collective COMMAND test_collective)
     add_library(kernel_test_bridge SHARED ../tests/kernels/kernel_bridge.cu)
     target_link_libraries(kernel_test_bridge PRIVATE engine)
     add_test(NAME test_library_ops COMMAND ${Python3_EXECUTABLE}

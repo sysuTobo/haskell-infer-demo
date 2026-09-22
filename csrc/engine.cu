@@ -155,6 +155,7 @@ struct DeviceCtx {
     int device_id = -1;
     cublasHandle_t cublas = nullptr;
     cudaStream_t stream = nullptr;
+    cudaEvent_t copy_event = nullptr;   // orders cross-device copies
     __nv_bfloat16 *residual = nullptr;   // [128, hidden]
     __nv_bfloat16 *layer_out = nullptr;  // Never aliases layer/MLP scratch.
     __nv_bfloat16 *workspace = nullptr;
@@ -281,6 +282,7 @@ static void fill_dims(ModelDims &dims, const struct ModelDesc &desc) {
     dims.rms_eps = (float)desc.rms_eps;
     dims.rope_theta = (float)desc.rotary_theta;
     dims.max_seq_len = desc.max_seq_len;
+    dims.max_chunk = desc.max_chunk;
     dims.gdn_conv_dim = desc.gdn_conv_dim;
     dims.gdn_value_dim = desc.gdn_value_dim;
     dims.gdn_num_v_heads = desc.gdn_num_v_heads;
@@ -328,6 +330,8 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             eng->layer_device[i] = (int)(it - eng->devices.begin());
         }
 
+        peer_probe_all(eng->devices.data(), eng->num_devices, 1);
+
         std::map<std::string, TensorInfo> index;
         int nt = safetensors_scan_dir(model_dir, index);
         if (nt <= 0)
@@ -337,21 +341,24 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
         const int hidden = eng->dims.hidden_size;
         eng->ctx = new DeviceCtx[eng->num_devices]();
         eng->layers = new LayerWeights[num_layers]();
-        const size_t activation_bytes = (size_t)ENGINE_BATCH_TOKENS * hidden * sizeof(__nv_bfloat16);
+        const int max_chunk = eng->dims.max_chunk;
+        const size_t activation_bytes = (size_t)max_chunk * hidden * sizeof(__nv_bfloat16);
         for (int d = 0; d < eng->num_devices; ++d) {
             DeviceCtx &ctx = eng->ctx[d];
             ctx.device_id = eng->devices[d];
             check_cuda(cudaSetDevice(ctx.device_id), "Initialize device");
             check_cuda(cudaStreamCreateWithFlags(&ctx.stream, cudaStreamNonBlocking), "Create stream");
+            check_cuda(cudaEventCreateWithFlags(&ctx.copy_event, cudaEventDisableTiming),
+                       "Create copy event");
             check_cublas(cublasCreate(&ctx.cublas), "Create cuBLAS");
             check_cublas(cublasSetStream(ctx.cublas, ctx.stream), "Set cuBLAS stream");
             check_cuda(cudaMalloc(&ctx.residual, activation_bytes), "Allocate residual");
             check_cuda(cudaMalloc(&ctx.layer_out, activation_bytes), "Allocate layer output");
-            ctx.ws_size = layer_workspace_size(ENGINE_BATCH_TOKENS, &eng->dims);
+            ctx.ws_size = layer_workspace_size(max_chunk, &eng->dims);
             check_cuda(cudaMalloc(&ctx.workspace, ctx.ws_size), "Allocate layer workspace");
-            ctx.fla_size = kernel_fla_workspace_size(ENGINE_BATCH_TOKENS, eng->dims.gdn_num_v_heads);
+            ctx.fla_size = kernel_fla_workspace_size(max_chunk, eng->dims.gdn_num_v_heads);
             check_cuda(cudaMalloc(&ctx.fla_scratch, ctx.fla_size), "Allocate FLA scratch");
-            check_cuda(cudaMalloc(&ctx.positions, ENGINE_BATCH_TOKENS * sizeof(int64_t)), "Allocate positions");
+            check_cuda(cudaMalloc(&ctx.positions, max_chunk * sizeof(int64_t)), "Allocate positions");
             check_cuda(cudaMalloc(&ctx.conv_bias_zero, eng->dims.gdn_conv_dim * sizeof(__nv_bfloat16)),
                        "Allocate conv bias");
             check_cuda(cudaMemsetAsync(ctx.conv_bias_zero, 0,
@@ -360,7 +367,7 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
         }
 
         load_role(index, eng->desc, ROLE_EMBED, 0, eng->devices.front(), &eng->embed_w);
-        check_cuda(cudaMalloc(&eng->token_ids, ENGINE_BATCH_TOKENS * sizeof(int64_t)), "Allocate token IDs");
+        check_cuda(cudaMalloc(&eng->token_ids, max_chunk * sizeof(int64_t)), "Allocate token IDs");
         load_role(index, eng->desc, ROLE_LM_HEAD, 0, eng->devices.back(), &eng->lm_head_w);
         load_role(index, eng->desc, ROLE_FINAL_NORM, 0, eng->devices.back(), &eng->final_norm_w);
         check_cuda(cudaMalloc(&eng->d_logits, eng->dims.vocab_size * sizeof(float)), "Allocate logits");
@@ -434,13 +441,13 @@ static __nv_bfloat16 *move_activation(EngineHandle *eng, int from, int to, int t
     if (from != to) {
         DeviceCtx &src = eng->ctx[from];
         DeviceCtx &dst = eng->ctx[to];
-        // The destination stream alone does not order reads after source kernels.
-        check_cuda(cudaSetDevice(src.device_id), "Select activation source");
-        check_cuda(cudaStreamSynchronize(src.stream), "Finish activation source");
-        check_cuda(cudaSetDevice(dst.device_id), "Select activation destination");
-        check_cuda(cudaMemcpyPeerAsync(dst.residual, dst.device_id, src.residual, src.device_id,
-                                      (size_t)tokens * eng->dims.hidden_size * sizeof(__nv_bfloat16), dst.stream),
+        check_cuda((cudaError_t)copy_across_devices(
+                       src.device_id, src.stream, &src.copy_event,
+                       dst.device_id, dst.stream,
+                       dst.residual, src.residual,
+                       (size_t)tokens * eng->dims.hidden_size * sizeof(__nv_bfloat16)),
                    "Copy activation between devices");
+        check_cuda(cudaSetDevice(dst.device_id), "Select activation destination");
     } else {
         check_cuda(cudaSetDevice(eng->devices[to]), "Select layer device");
     }
@@ -449,12 +456,12 @@ static __nv_bfloat16 *move_activation(EngineHandle *eng, int from, int to, int t
 
 static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
                            int tokens, float *h_logits) {
-    int64_t positions[ENGINE_BATCH_TOKENS];
+    std::vector<int64_t> positions(eng->dims.max_chunk);
     for (int t = 0; t < tokens; ++t) positions[t] = (int64_t)eng->seq_len + t;
     for (int d = 0; d < eng->num_devices; ++d) {
         DeviceCtx &ctx = eng->ctx[d];
         check_cuda(cudaSetDevice(ctx.device_id), "Select position device");
-        check_cuda(cudaMemcpyAsync(ctx.positions, positions, tokens * sizeof(int64_t),
+        check_cuda(cudaMemcpyAsync(ctx.positions, positions.data(), tokens * sizeof(int64_t),
                                    cudaMemcpyHostToDevice, ctx.stream), "Upload positions");
         // Finish staging host arrays before any subsequent operation can throw.
         check_cuda(cudaStreamSynchronize(ctx.stream), "Finish position upload");
@@ -547,7 +554,7 @@ int engine_prefill(EngineHandle *eng, const int64_t *token_ids,
         int status = validate_inputs(eng, token_ids, num_tokens, out_logits);
         if (status != ENGINE_OK) return status;
         for (int offset = 0; offset < num_tokens;) {
-            int tokens = std::min(ENGINE_BATCH_TOKENS, num_tokens - offset);
+            int tokens = std::min(eng->dims.max_chunk, num_tokens - offset);
             forward_tokens(eng, token_ids + offset, tokens,
                            offset + tokens == num_tokens ? out_logits : nullptr);
             offset += tokens;
@@ -651,6 +658,7 @@ void engine_destroy(EngineHandle *eng) {
                 if (status != CUBLAS_STATUS_SUCCESS && !g_error_buf[0])
                     set_error("engine_destroy: cuBLAS status %d", (int)status);
             }
+            if (ctx.copy_event) cleanup_cuda(cudaEventDestroy(ctx.copy_event));
             if (ctx.stream) cleanup_cuda(cudaStreamDestroy(ctx.stream));
         }
     }

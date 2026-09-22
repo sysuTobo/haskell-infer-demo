@@ -84,6 +84,7 @@ qwen35DescriptorFromConfig tc tokenizer = do
     , dGdnHeadDim = headDimGdn
     , dGdnConvKernel = convKernel
     , dFlaChunkSize = 64
+    , dMaxChunk = 128
     , dEosTokens = eosTokens tc tokenizer
     , dLayerMixers = mixers
     , dLayerFfns = replicate numLayers FDense

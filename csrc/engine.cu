@@ -207,7 +207,42 @@ struct EngineHandle {
     float *d_logits = nullptr;
     int seq_len = 0;
     bool state_valid = true;
+    /* Debug taps: layer indices whose residual stream is dumped to disk, and
+     * where. Enabled by INFER_TAP_LAYERS=0,1,2 and INFER_TAP_DIR=<dir>. */
+    std::vector<int> tap_layers;
+    std::string tap_dir;
 };
+
+/* Dump one layer's residual stream as raw float32 [tokens, hidden]. Slow on
+ * purpose (a sync per tap) -- this exists to localize numerical differences. */
+static void tap_layer(const EngineHandle *eng, int layer, int device,
+                      const __nv_bfloat16 *residual, int tokens) {
+    if (eng->tap_dir.empty()) return;
+    if (std::find(eng->tap_layers.begin(), eng->tap_layers.end(), layer) ==
+        eng->tap_layers.end())
+        return;
+    const size_t elements = (size_t)tokens * eng->dims.hidden_size;
+    std::vector<__nv_bfloat16> staged(elements);
+    cudaSetDevice(device);
+    cudaError_t status = cudaMemcpy(staged.data(), residual, elements * sizeof(__nv_bfloat16),
+                                    cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+        fprintf(stderr, "[tap] layer %d copy failed: %s\n", layer, cudaGetErrorString(status));
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/layer_%02d_seq%d_tok%d.f32", eng->tap_dir.c_str(),
+             layer, eng->seq_len, tokens);
+    FILE *file = fopen(path, "wb");
+    if (file == nullptr) {
+        fprintf(stderr, "[tap] cannot open %s\n", path);
+        return;
+    }
+    std::vector<float> expanded(elements);
+    for (size_t i = 0; i < elements; ++i) expanded[i] = __bfloat162float(staged[i]);
+    fwrite(expanded.data(), sizeof(float), elements, file);
+    fclose(file);
+}
 
 static size_t kv_cache_bytes(const EngineHandle *eng) {
     return (size_t)2 * eng->dims.max_seq_len * eng->dims.num_kv_heads *
@@ -364,6 +399,24 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             throw EngineError(ENGINE_ERR_CONFIG, "Invalid engine configuration");
 
         eng = new EngineHandle();
+        if (const char *layers = getenv("INFER_TAP_LAYERS")) {
+            const char *dir = getenv("INFER_TAP_DIR");
+            if (dir == nullptr || !*dir) {
+                fprintf(stderr, "[tap] INFER_TAP_LAYERS set without INFER_TAP_DIR\n");
+            } else {
+                eng->tap_dir = dir;
+                const char *cursor = layers;
+                while (*cursor) {
+                    char *end = nullptr;
+                    const long value = strtol(cursor, &end, 10);
+                    if (end == cursor) break;
+                    eng->tap_layers.push_back((int)value);
+                    cursor = (*end == ',') ? end + 1 : end;
+                }
+                fprintf(stderr, "[tap] dumping %zu layer(s) to %s\n",
+                        eng->tap_layers.size(), eng->tap_dir.c_str());
+            }
+        }
         if (model_desc_parse(descriptor_json, &eng->desc, desc_error, sizeof(desc_error)) != 0)
             throw EngineError(ENGINE_ERR_CONFIG, std::string("Bad descriptor: ") + desc_error);
         fill_dims(eng->dims, eng->desc);
@@ -660,6 +713,7 @@ static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
         lctx.layer_index = i;
         lctx.dims = &eng->dims;
         check_forward(forward_layer(&lctx, &eng->layers[i], act, ctx.layer_out), "Layer forward");
+        tap_layer(eng, i, ctx.device_id, act, tokens);
     }
 
     if (h_logits) {

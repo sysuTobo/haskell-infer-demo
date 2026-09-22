@@ -1,21 +1,23 @@
-/**
- * attention.cu - Naive scaled-dot-product attention with KV cache and GQA.
- *
- * Not optimized (no flash attention). Correctness-first for the demo.
- * Supports Grouped Query Attention: 24 q-heads share 4 kv-heads (6:1 ratio).
- *
- * KV cache layout: [2, max_seq_len, num_kv_heads, head_dim] BF16
- *   - cache[0] = K, cache[1] = V
- */
-
 #include "kernels.h"
-#include <cuda_bf16.h>
-#include <math.h>
 
-/**
- * Write new K/V into the cache at positions [seq_start, seq_start+tokens).
- * Grid: (tokens), Block: (num_kv_heads * head_dim / 4)
- */
+#include <flashinfer/attention/default_prefill_params.cuh>
+#include <flashinfer/attention/prefill.cuh>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+void check_cuda(cudaError_t status, const char *op) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(op) + ": " + cudaGetErrorString(status));
+    }
+}
+
+// KV cache: [2, max_seq_len, num_kv_heads, head_dim].
 __global__ void kv_cache_write_kernel(__nv_bfloat16 *__restrict__ kv_cache,
                                       const __nv_bfloat16 *__restrict__ k_new,
                                       const __nv_bfloat16 *__restrict__ v_new,
@@ -27,22 +29,38 @@ __global__ void kv_cache_write_kernel(__nv_bfloat16 *__restrict__ kv_cache,
 
     int kv_dim = num_kv_heads * head_dim;
     int pos = seq_start + t;
-
-    // Each thread copies 4 elements (2 BF16 = 4 bytes)
+    long long dst = static_cast<long long>(pos) * kv_dim;
+    long long src = static_cast<long long>(t) * kv_dim;
+    long long v_base = static_cast<long long>(max_seq_len) * kv_dim;
     for (int i = threadIdx.x * 4; i < kv_dim; i += blockDim.x * 4) {
-        // K
-        kv_cache[(long long)0 * max_seq_len * kv_dim + pos * kv_dim + i]     = k_new[(long long)t * kv_dim + i];
-        kv_cache[(long long)0 * max_seq_len * kv_dim + pos * kv_dim + i + 1] = k_new[(long long)t * kv_dim + i + 1];
-        kv_cache[(long long)0 * max_seq_len * kv_dim + pos * kv_dim + i + 2] = k_new[(long long)t * kv_dim + i + 2];
-        kv_cache[(long long)0 * max_seq_len * kv_dim + pos * kv_dim + i + 3] = k_new[(long long)t * kv_dim + i + 3];
-        // V
-        long long v_base = (long long)1 * max_seq_len * kv_dim;
-        kv_cache[v_base + pos * kv_dim + i]     = v_new[(long long)t * kv_dim + i];
-        kv_cache[v_base + pos * kv_dim + i + 1] = v_new[(long long)t * kv_dim + i + 1];
-        kv_cache[v_base + pos * kv_dim + i + 2] = v_new[(long long)t * kv_dim + i + 2];
-        kv_cache[v_base + pos * kv_dim + i + 3] = v_new[(long long)t * kv_dim + i + 3];
+        for (int j = 0; j < 4 && i + j < kv_dim; ++j) {
+            kv_cache[dst + i + j] = k_new[src + i + j];
+            kv_cache[v_base + dst + i + j] = v_new[src + i + j];
+        }
     }
 }
+
+__global__ void sigmoid_mul_kernel(__nv_bfloat16 *out,
+                                   const __nv_bfloat16 *attn,
+                                   const __nv_bfloat16 *gate,
+                                   int dim, int tokens,
+                                   int gate_stride, int gate_offset) {
+    int t = blockIdx.x;
+    if (t >= tokens) return;
+
+    const __nv_bfloat16 *attn_row = attn + static_cast<long long>(t) * dim;
+    const __nv_bfloat16 *gate_row = gate + static_cast<long long>(t) * gate_stride + gate_offset;
+    __nv_bfloat16 *out_row = out + static_cast<long long>(t) * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float a = __bfloat162float(attn_row[i]);
+        float g = __bfloat162float(gate_row[i]);
+        // Match torch.sigmoid(BF16) followed by BF16 multiplication.
+        __nv_bfloat16 sig = __float2bfloat16_rn(1.0f / (1.0f + expf(-g)));
+        out_row[i] = __float2bfloat16_rn(a * __bfloat162float(sig));
+    }
+}
+
+}  // namespace
 
 void kernel_kv_cache_write(__nv_bfloat16 *kv_cache,
                            const __nv_bfloat16 *k_new,
@@ -50,90 +68,21 @@ void kernel_kv_cache_write(__nv_bfloat16 *kv_cache,
                            int seq_start, int tokens,
                            int num_kv_heads, int head_dim,
                            int max_seq_len, cudaStream_t stream) {
+    if (tokens < 0 || seq_start < 0 || max_seq_len < seq_start ||
+        tokens > max_seq_len - seq_start || num_kv_heads <= 0 || head_dim <= 0 ||
+        num_kv_heads > std::numeric_limits<int>::max() / head_dim) {
+        throw std::runtime_error("kernel_kv_cache_write: invalid shape or cache range");
+    }
+    if (tokens == 0) return;
+    if (!kv_cache || !k_new || !v_new) {
+        throw std::runtime_error("kernel_kv_cache_write: null buffer");
+    }
     int kv_dim = num_kv_heads * head_dim;
-    int block = min(256, (kv_dim + 3) / 4);
+    int block = static_cast<int>(std::min(256LL, (static_cast<long long>(kv_dim) + 3) / 4));
     kv_cache_write_kernel<<<tokens, block, 0, stream>>>(
         kv_cache, k_new, v_new, seq_start, tokens,
         num_kv_heads, head_dim, max_seq_len);
-}
-
-/**
- * Naive attention: for each query token and head, compute softmax(Q*K^T/sqrt(d))*V.
- * Grid: (tokens, num_heads), Block: (head_dim)
- *
- * GQA: q_head h maps to kv_head (h / (num_heads / num_kv_heads)).
- * Causal mask: query at position p can only attend to positions <= p.
- */
-__global__ void attention_kernel(__nv_bfloat16 *__restrict__ out,
-                                 const __nv_bfloat16 *__restrict__ q,
-                                 const __nv_bfloat16 *__restrict__ kv_cache,
-                                 int seq_start, int tokens, int seq_len,
-                                 int num_heads, int num_kv_heads, int head_dim,
-                                 float scale, int max_seq_len) {
-    int t = blockIdx.x;    // query token index (0..tokens-1)
-    int h = blockIdx.y;    // query head index (0..num_heads-1)
-    if (t >= tokens) return;
-
-    int kv_h = h / (num_heads / num_kv_heads);  // GQA mapping
-    int query_pos = seq_start + t;
-
-    // Load query vector for this head
-    extern __shared__ float s_data[];
-    float *q_vec = s_data;  // [head_dim]
-    float *scores = s_data + head_dim;  // [max_seq_len] - but we limit to seq_len
-
-    const __nv_bfloat16 *q_ptr = q + ((long long)t * num_heads + h) * head_dim;
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        q_vec[d] = __bfloat162float(q_ptr[d]);
-    }
-    __syncthreads();
-
-    // Compute attention scores against all cached K
-    // K cache: kv_cache[0, pos, kv_h, d]
-    long long k_base = (long long)kv_h * head_dim;
-    long long kv_stride = (long long)num_kv_heads * head_dim;
-
-    // Each thread computes scores for a subset of positions
-    for (int p = threadIdx.x; p <= query_pos; p += blockDim.x) {
-        const __nv_bfloat16 *k_ptr = kv_cache + (long long)p * kv_stride + k_base;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++) {
-            dot += q_vec[d] * __bfloat162float(k_ptr[d]);
-        }
-        scores[p] = dot * scale;
-    }
-    __syncthreads();
-
-    // Softmax (thread 0 does it serially for simplicity in this demo)
-    if (threadIdx.x == 0) {
-        float max_score = -1e30f;
-        for (int p = 0; p <= query_pos; p++) {
-            if (scores[p] > max_score) max_score = scores[p];
-        }
-        float sum = 0.0f;
-        for (int p = 0; p <= query_pos; p++) {
-            scores[p] = expf(scores[p] - max_score);
-            sum += scores[p];
-        }
-        float inv_sum = 1.0f / (sum + 1e-9f);
-        for (int p = 0; p <= query_pos; p++) {
-            scores[p] *= inv_sum;
-        }
-    }
-    __syncthreads();
-
-    // Weighted sum of V
-    long long v_base = (long long)max_seq_len * kv_stride + (long long)kv_h * head_dim;
-    __nv_bfloat16 *out_ptr = out + ((long long)t * num_heads + h) * head_dim;
-
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (int p = 0; p <= query_pos; p++) {
-            const __nv_bfloat16 *v_ptr = kv_cache + v_base + (long long)p * kv_stride + d;
-            acc += scores[p] * __bfloat162float(*v_ptr);
-        }
-        out_ptr[d] = __float2bfloat16(acc);
-    }
+    check_cuda(cudaGetLastError(), "kernel_kv_cache_write");
 }
 
 void kernel_attention(__nv_bfloat16 *out, const __nv_bfloat16 *q,
@@ -141,41 +90,56 @@ void kernel_attention(__nv_bfloat16 *out, const __nv_bfloat16 *q,
                       int seq_start, int tokens, int seq_len,
                       int num_heads, int num_kv_heads, int head_dim,
                       float scale, int max_seq_len, cudaStream_t stream) {
-    dim3 grid(tokens, num_heads);
-    dim3 block(min(head_dim, 256));
-    size_t smem = (head_dim + seq_len) * sizeof(float);
-    attention_kernel<<<grid, block, smem, stream>>>(
-        out, q, kv_cache, seq_start, tokens, seq_len,
-        num_heads, num_kv_heads, head_dim, scale, max_seq_len);
-}
-
-/**
- * Sigmoid gate multiplication: out = attn * sigmoid(gate)
- * Grid: (tokens), Block: (256)
- */
-__global__ void sigmoid_mul_kernel(__nv_bfloat16 *__restrict__ out,
-                                   const __nv_bfloat16 *__restrict__ attn,
-                                   const __nv_bfloat16 *__restrict__ gate,
-                                   int dim, int tokens,
-                                   int gate_stride, int gate_offset) {
-    int t = blockIdx.x;
-    if (t >= tokens) return;
-
-    const __nv_bfloat16 *attn_row = attn + (long long)t * dim;
-    const __nv_bfloat16 *gate_row = gate + (long long)t * gate_stride + gate_offset;
-    __nv_bfloat16 *out_row = out + (long long)t * dim;
-
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float a = __bfloat162float(attn_row[i]);
-        float g = __bfloat162float(gate_row[i]);
-        float sig = 1.0f / (1.0f + expf(-g));
-        out_row[i] = __float2bfloat16(a * sig);
+    if (tokens < 0 || seq_start < 0 || max_seq_len < seq_start ||
+        tokens > max_seq_len - seq_start || seq_len != seq_start + tokens ||
+        head_dim != 256 || num_heads <= 0 || num_kv_heads <= 0 ||
+        num_heads % num_kv_heads != 0 ||
+        num_heads > std::numeric_limits<int>::max() / head_dim || !std::isfinite(scale)) {
+        throw std::runtime_error("kernel_attention: expected head_dim=256, valid GQA and seq_len=seq_start+tokens within cache");
     }
+    if (tokens == 0) return;
+    if (!out || !q || !kv_cache) {
+        throw std::runtime_error("kernel_attention: null buffer");
+    }
+
+    using Params = flashinfer::SinglePrefillParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>;
+    using Attention = flashinfer::DefaultAttention<false, false, false, false>;
+    const int kv_stride = num_kv_heads * head_dim;
+    Params params(
+        const_cast<__nv_bfloat16 *>(q),
+        const_cast<__nv_bfloat16 *>(kv_cache),
+        const_cast<__nv_bfloat16 *>(kv_cache + static_cast<long long>(max_seq_len) * kv_stride),
+        /*maybe_custom_mask=*/nullptr, out, /*lse=*/nullptr, /*maybe_alibi_slopes=*/nullptr,
+        num_heads, num_kv_heads, tokens, seq_len,
+        num_heads * head_dim, head_dim, kv_stride, head_dim, head_dim,
+        /*window_left=*/-1, /*logits_soft_cap=*/0.0f, scale,
+        /*rope_scale=*/1.0f, /*rope_theta=*/1.0f);
+
+    cudaError_t status;
+    try {
+        // Prefill also handles single-token GQA6; nullptr disables split-KV workspace.
+        status = flashinfer::SinglePrefillWithKVCacheDispatched<
+            256, 256, flashinfer::PosEncodingMode::kNone, false,
+            flashinfer::MaskMode::kCausal, Attention>(params, /*tmp=*/nullptr, stream);
+    } catch (const std::exception &error) {
+        throw std::runtime_error(std::string("kernel_attention: ") + error.what());
+    }
+    check_cuda(status, "kernel_attention");
+    check_cuda(cudaGetLastError(), "kernel_attention launch");
 }
 
 void kernel_sigmoid_mul(__nv_bfloat16 *out, const __nv_bfloat16 *attn,
                         const __nv_bfloat16 *gate, int dim, int tokens,
                         int gate_stride, int gate_offset, cudaStream_t stream) {
+    if (tokens < 0 || dim <= 0 || gate_offset < 0 || gate_stride < dim ||
+        gate_offset > gate_stride - dim) {
+        throw std::runtime_error("kernel_sigmoid_mul: invalid shape or gate stride");
+    }
+    if (tokens == 0) return;
+    if (!out || !attn || !gate) {
+        throw std::runtime_error("kernel_sigmoid_mul: null buffer");
+    }
     sigmoid_mul_kernel<<<tokens, 256, 0, stream>>>(
         out, attn, gate, dim, tokens, gate_stride, gate_offset);
+    check_cuda(cudaGetLastError(), "kernel_sigmoid_mul");
 }

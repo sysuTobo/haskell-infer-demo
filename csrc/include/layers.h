@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* Model dimensions (shared across all layers) */
@@ -31,65 +32,66 @@ typedef struct {
     int gdn_conv_kernel;      // 4
 } ModelDims;
 
+static constexpr int ENGINE_BATCH_TOKENS = 128;
+
 /* Per-layer MLP weights (shared between attention and GDN layers) */
 typedef struct {
     const __nv_bfloat16 *gate_proj_w;   // [intermediate, hidden]
     const __nv_bfloat16 *up_proj_w;     // [intermediate, hidden]
     const __nv_bfloat16 *down_proj_w;   // [hidden, intermediate]
-    const float *post_norm_w_p1;        // [hidden] f32 (weight+1)
+    const __nv_bfloat16 *post_norm_w;   // [hidden], raw Gemma weight
 } MlpWeights;
 
 /* Attention layer weights */
 typedef struct {
-    const __nv_bfloat16 *q_proj_w;      // [num_heads*head_dim*2, hidden] = [12288, 5120]
-    const __nv_bfloat16 *k_proj_w;      // [num_kv_heads*head_dim, hidden] = [1024, 5120]
-    const __nv_bfloat16 *v_proj_w;      // [num_kv_heads*head_dim, hidden] = [1024, 5120]
-    const __nv_bfloat16 *o_proj_w;      // [hidden, num_heads*head_dim] = [5120, 6144]
-    const __nv_bfloat16 *q_norm_w;      // [head_dim] = [256]
-    const __nv_bfloat16 *k_norm_w;      // [head_dim] = [256]
-    const float *q_norm_w_p1;           // [head_dim] f32 (weight+1)
-    const float *k_norm_w_p1;           // [head_dim] f32 (weight+1)
-    const float *input_norm_w_p1;       // [hidden] f32
-    MlpWeights mlp;
+    const __nv_bfloat16 *q_proj_w;      // [num_heads*head_dim*2, hidden]
+    const __nv_bfloat16 *k_proj_w;      // [num_kv_heads*head_dim, hidden]
+    const __nv_bfloat16 *v_proj_w;      // [num_kv_heads*head_dim, hidden]
+    const __nv_bfloat16 *o_proj_w;      // [hidden, num_heads*head_dim]
+    const __nv_bfloat16 *q_norm_w;      // [head_dim], raw Gemma weight
+    const __nv_bfloat16 *k_norm_w;      // [head_dim], raw Gemma weight
+    const __nv_bfloat16 *input_norm_w;  // [hidden], raw Gemma weight
 } AttentionWeights;
 
 /* GDN layer weights */
 typedef struct {
-    const __nv_bfloat16 *in_proj_qkv_w; // [conv_dim, hidden] = [10240, 5120]
-    const __nv_bfloat16 *in_proj_z_w;   // [v_dim, hidden] = [6144, 5120]
-    const __nv_bfloat16 *in_proj_a_w;   // [num_v_heads, hidden] = [48, 5120]
-    const __nv_bfloat16 *in_proj_b_w;   // [num_v_heads, hidden] = [48, 5120]
-    const __nv_bfloat16 *conv1d_w;      // [conv_dim, 1, kernel_size] = [10240, 1, 4]
-    const __nv_bfloat16 *conv1d_bias;   // [conv_dim] or NULL (model has no conv bias)
-    const __nv_bfloat16 *dt_bias;       // [num_v_heads] = [48]
-    const __nv_bfloat16 *A_log;         // [num_v_heads] = [48]
-    const __nv_bfloat16 *out_proj_w;    // [hidden, v_dim] = [5120, 6144]
-    const float *gdn_norm_w_p1;         // [head_dim] f32 = [128]
-    const float *input_norm_w_p1;       // [hidden] f32
-    MlpWeights mlp;
+    const __nv_bfloat16 *in_proj_qkv_w; // [conv_dim, hidden]
+    const __nv_bfloat16 *in_proj_z_w;   // [v_dim, hidden]
+    const __nv_bfloat16 *in_proj_a_w;   // [num_v_heads, hidden]
+    const __nv_bfloat16 *in_proj_b_w;   // [num_v_heads, hidden]
+    const __nv_bfloat16 *conv1d_w;      // [conv_dim, 1, kernel_size]
+    const __nv_bfloat16 *conv1d_bias;   // [conv_dim], device-local zero for this model
+    const __nv_bfloat16 *dt_bias;       // [num_v_heads]
+    const __nv_bfloat16 *A_log;         // [num_v_heads]
+    const __nv_bfloat16 *out_proj_w;    // [hidden, v_dim]
+    const float *gdn_norm_w;           // [head_dim], effective FP32 weight (no +1)
+    const __nv_bfloat16 *input_norm_w;  // [hidden], raw Gemma weight
 } GdnWeights;
 
-/* Forward function declarations.
- * layer_out: caller-provided buffer [1, hidden_size] for the layer's output
- * (before residual add). The caller does: residual += layer_out. */
+/* Bytes for reusable attention/GDN/MLP workspace; excludes FLA scratch and
+ * the independent residual/layer_out buffers. tokens must be in [1, 128]. */
+size_t layer_workspace_size(int tokens, const ModelDims *dims);
+
+/* residual and layer_out are separate [tokens, hidden_size] BF16 buffers,
+ * disjoint from ws. Caller adds layer_out to residual after each call.
+ * All pointers and the cuBLAS handle belong to the stream's current device.
+ * Attention positions is int64[tokens]; seq_len includes these tokens.
+ * GDN scratch needs kernel_fla_workspace_size(tokens, gdn_num_v_heads) bytes;
+ * ssm_state stays FP32 [gdn_num_v_heads, gdn_head_dim, gdn_head_dim].
+ * Internal C++ entry points may throw std::exception on backend errors. */
 int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
-    __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
+    const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
     const AttentionWeights *w, __nv_bfloat16 *kv_cache,
-    __nv_bfloat16 *cos_cache, __nv_bfloat16 *sin_cache,
-    int64_t *d_position, int seq_len, const ModelDims *dims);
+    const int64_t *positions, int tokens, int seq_len, const ModelDims *dims);
 
 int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
-    __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
+    const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
     const GdnWeights *w, __nv_bfloat16 *conv_state,
-    float *ssm_state, const ModelDims *dims);
+    float *ssm_state, void *fla_scratch, int tokens, const ModelDims *dims);
 
 int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
-    __nv_bfloat16 *residual, __nv_bfloat16 *normed,
-    __nv_bfloat16 *gate_up_out, __nv_bfloat16 *mlp_act,
-    __nv_bfloat16 *mlp_down_out, const __nv_bfloat16 *post_norm_w_p1,
-    const __nv_bfloat16 *gate_proj_w, const __nv_bfloat16 *up_proj_w,
-    const __nv_bfloat16 *down_proj_w, const float *post_norm_w_p1_f32,
-    int hidden, int intermediate, float eps);
+    const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
+    const MlpWeights *w, int tokens, const ModelDims *dims);
 
 /* GEMM declarations (gemm.cu) */
 int gemm_bf16(cublasHandle_t handle, __nv_bfloat16 *out,

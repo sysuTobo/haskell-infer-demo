@@ -10,6 +10,8 @@ cabal.project.local
 # C/CUDA
 build/
 csrc/build/
+csrc/build-libs/
+__pycache__/
 *.so
 *.a
 *.o

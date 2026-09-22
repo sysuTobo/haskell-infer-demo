@@ -1,25 +1,42 @@
-/**
- * silu.cu - Fused SiLU(gate) * up for MLP.
- * out[i] = gate[i] * sigmoid(gate[i]) * up[i]
- */
 #include "kernels.h"
-#include <cuda_bf16.h>
 
-__global__ void silu_mul_kernel(__nv_bfloat16 *__restrict__ out,
-                                const __nv_bfloat16 *__restrict__ gate,
-                                const __nv_bfloat16 *__restrict__ up,
-                                int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g = __bfloat162float(gate[i]);
-    float u = __bfloat162float(up[i]);
-    float s = g / (1.0f + expf(-g));  // SiLU
-    out[i] = __float2bfloat16(s * u);
+#include <flashinfer/activation.cuh>
+
+#include <algorithm>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+// Scalar callback required by FlashInfer's native activation template (as in its JIT).
+__device__ __forceinline__ float SiLU(const float &value) {
+    return value / (1.0f + __expf(-value));
 }
+
+}  // namespace
 
 void kernel_silu_mul(__nv_bfloat16 *out, const __nv_bfloat16 *gate,
                      const __nv_bfloat16 *up, int n, cudaStream_t stream) {
-    int block = 256;
-    int grid = (n + block - 1) / block;
-    silu_mul_kernel<<<grid, block, 0, stream>>>(out, gate, up, n);
+    if (n < 0) {
+        throw std::runtime_error("kernel_silu_mul: negative element count");
+    }
+    if (n == 0) return;
+    if (!out || !gate || !up || up != gate + n) {
+        throw std::runtime_error("kernel_silu_mul: expected contiguous [gate[n], up[n]] input");
+    }
+    constexpr int vec_size = 16 / sizeof(__nv_bfloat16);
+    if (n >= vec_size && (n % vec_size != 0 ||
+        reinterpret_cast<uintptr_t>(gate) % 16 != 0 ||
+        reinterpret_cast<uintptr_t>(out) % 16 != 0)) {
+        throw std::runtime_error("kernel_silu_mul: vectorized input/output must be 16-byte aligned and n divisible by 8");
+    }
+
+    const int block = std::max(1, std::min(n / vec_size, 1024));
+    flashinfer::activation::act_and_mul_kernel<__nv_bfloat16, SiLU>
+        <<<1, block, 0, stream>>>(out, gate, n);
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("kernel_silu_mul: ") + cudaGetErrorString(status));
+    }
 }

@@ -9,7 +9,7 @@
 # Prerequisites:
 #   - GHC 9.6+ and Cabal (via ghcup)
 #   - Rust/Cargo (for tokenizer-ffi)
-#   - CUDA Toolkit 12.x with nvcc (for csrc/)
+#   - CUDA 12.9+, FlashInfer headers, Triton 3.4.0 and fla-core 0.5.2
 #   - CMake 3.18+
 set -euo pipefail
 
@@ -27,7 +27,7 @@ done
 
 if [ "$CLEAN" -eq 1 ]; then
   echo "=== Cleaning ==="
-  rm -rf "$ROOT/csrc/build"
+  rm -rf "$ROOT/csrc/build-libs"
   rm -rf "$ROOT/tokenizer-ffi/target"
   rm -rf "$ROOT/dist-newstyle"
   echo "Clean done."
@@ -46,11 +46,13 @@ echo "  -> tokenizer-ffi/target/release/libtokenizer_ffi.so"
 # 2. C/CUDA engine
 # ---------------------------------------------------------------------------
 echo "=== Building CUDA engine ==="
-mkdir -p "$ROOT/csrc/build"
-cd "$ROOT/csrc/build"
-cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS="$BUILD_TESTS"
-cmake --build . -j"$(nproc)"
-echo "  -> csrc/build/libengine.a"
+mkdir -p "$ROOT/csrc/build-libs"
+cd "$ROOT/csrc/build-libs"
+cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS="$BUILD_TESTS" \
+  -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH:-86}" \
+  -DPython3_EXECUTABLE="$(command -v python)"
+cmake --build . -j"${BUILD_JOBS:-2}"
+echo "  -> csrc/build-libs/libengine.so"
 
 if [ "$BUILD_TESTS" = "ON" ]; then
   echo "=== Running CUDA kernel tests ==="
@@ -69,7 +71,8 @@ if [ -f "$HOME/.ghcup/env" ]; then
   source "$HOME/.ghcup/env"
 fi
 
-cabal build all
+cabal build exe:haskell-infer-demo --extra-lib-dirs="$CUDA_HOME/lib64" \
+  --ghc-options="-optl-Wl,-rpath,$ROOT/csrc/build-libs -optl-Wl,-rpath,$ROOT/tokenizer-ffi/target/release"
 echo "  -> dist-newstyle/.../haskell-infer-demo"
 
 echo ""

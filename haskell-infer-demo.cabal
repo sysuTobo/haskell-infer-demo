@@ -41,9 +41,9 @@ executable haskell-infer-demo
                     , text >=2.0
                     , vector >=0.12
                     , mmap >=0.5
-  -- C/CUDA library built by CMake into csrc/build/
-  extra-lib-dirs:     csrc/build
-  extra-include-dirs: csrc/include
+  -- C/CUDA library built by CMake into csrc/build-libs/
+  extra-lib-dirs:     csrc/build-libs
+  include-dirs: csrc/include
   extra-libraries:    engine, cudart, cublas, stdc++
   -- Rust tokenizer FFI
   extra-lib-dirs:     tokenizer-ffi/target/release
@@ -73,6 +73,6 @@ test-suite infer-tests
                     , hspec >=2.10
                     , text
                     , vector
-  extra-lib-dirs:     csrc/build
-  extra-include-dirs: csrc/include
+  extra-lib-dirs:     csrc/build-libs
+  include-dirs: csrc/include
   extra-libraries:    engine, cudart, cublas, stdc++

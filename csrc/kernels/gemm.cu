@@ -61,7 +61,7 @@ int gemm_bf16(cublasHandle_t handle,
         CUBLAS_GEMM_DEFAULT);
 
     if (status != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "cuBLAS GEMM failed: %d (M=%d N=%d K=%d) W=%p x=%p out=%d dev=%d\n",
+        fprintf(stderr, "cuBLAS GEMM failed: %d (M=%d N=%d K=%d) W=%p x=%p dev=%d\n",
                 status, M, N, K, W, x, attr_out.device);
         return -1;
     }

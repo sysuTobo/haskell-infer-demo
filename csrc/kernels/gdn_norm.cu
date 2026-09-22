@@ -63,8 +63,10 @@ __global__ void gdn_gated_norm_kernel(__nv_bfloat16 *__restrict__ out,
     for (int i = threadIdx.x; i < dim; i += BLOCK) {
         float val = __bfloat162float(x_row[i]);
         float gate = __bfloat162float(z_row[i]);
-        float swish = gate / (1.0f + expf(-gate));  // z * sigmoid(z)
-        out_row[i] = __float2bfloat16(val * scale * weight_p1[i] * swish);
+        float swish = gate / (1.0f + expf(-gate));
+        float normalized = __bfloat162float(__float2bfloat16(val * scale));
+        float weighted = __bfloat162float(__float2bfloat16(normalized * weight_p1[i]));
+        out_row[i] = __float2bfloat16(weighted * swish);
     }
 }
 
@@ -77,31 +79,10 @@ void kernel_gdn_gated_norm(__nv_bfloat16 *out, const __nv_bfloat16 *x,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Weight preparation kernels                                        */
+/*  Small helpers                                                     */
 /* ------------------------------------------------------------------ */
 
-/**
- * weight_p1[i] = float(weight[i]) + 1.0
- * Grid: ceil(n/256), Block: 256
- */
-__global__ void weight_p1_kernel(float *__restrict__ out,
-                                 const __nv_bfloat16 *__restrict__ weight,
-                                 int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = __bfloat162float(weight[i]) + 1.0f;
-}
-
-void kernel_weight_p1(float *out, const __nv_bfloat16 *weight, int n,
-                      cudaStream_t stream) {
-    int block = 256;
-    int grid = (n + block - 1) / block;
-    weight_p1_kernel<<<grid, block, 0, stream>>>(out, weight, n);
-}
-
-/**
- * Cast BF16 to F32.
- */
+/** Cast BF16 to F32. */
 __global__ void cast_bf16_f32_kernel(float *__restrict__ out,
                                      const __nv_bfloat16 *__restrict__ in,
                                      int n) {
@@ -115,21 +96,6 @@ void kernel_cast_bf16_f32(float *out, const __nv_bfloat16 *in, int n,
     int block = 256;
     int grid = (n + block - 1) / block;
     cast_bf16_f32_kernel<<<grid, block, 0, stream>>>(out, in, n);
-}
-
-/**
- * Fill float buffer with constant.
- */
-__global__ void fill_f32_kernel(float *__restrict__ out, int n, float value) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = value;
-}
-
-void kernel_fill_f32(float *out, int n, float value, cudaStream_t stream) {
-    int block = 256;
-    int grid = (n + block - 1) / block;
-    fill_f32_kernel<<<grid, block, 0, stream>>>(out, n, value);
 }
 
 /* ------------------------------------------------------------------ */

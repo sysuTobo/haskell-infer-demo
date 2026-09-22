@@ -159,10 +159,14 @@ int main() {
     for (size_t i = 0; i < down.size(); ++i) down[i] = test::bf16(test::sample(i, 9) * 0.5f);
     std::vector<Bf16> input(kTokens * kHidden);
     for (size_t i = 0; i < input.size(); ++i) input[i] = test::bf16(test::sample(i, 13));
+    std::vector<Bf16> post_norm(kHidden);
+    for (size_t i = 0; i < post_norm.size(); ++i) post_norm[i] = test::bf16(1.0f + test::sample(i, 17) * 0.25f);
 
     ModelDims dims{};
     dims.hidden_size = kHidden;
     dims.max_chunk = kTokens;
+    dims.norm_style = 1;   /* plain RMSNorm, as the MoE families use */
+    dims.rms_eps = 1e-6f;
     MoeConfig moe{kExperts, kTopK, kInner, /*norm_topk_prob=*/1, /*sigmoid=*/0, 1.0f};
 
     DeviceBuffer<Bf16> d_input(input.size()), d_out(kTokens * kHidden);
@@ -177,7 +181,10 @@ int main() {
     const size_t scratch_bytes = moe_workspace_size(kTokens, &dims, &moe);
     void *scratch = nullptr;
     CUDA_CHECK(cudaMalloc(&scratch, scratch_bytes));
-    MoeWeights weights{d_router.get(), d_gate.get(), d_up.get(), d_down.get()};
+    DeviceBuffer<Bf16> d_post_norm(post_norm.size());
+    d_post_norm.upload(post_norm, stream.get());
+    MoeWeights weights{d_post_norm.get(), d_router.get(), d_gate.get(), d_up.get(),
+                       d_down.get()};
     MoeScratch workspace{scratch, scratch_bytes};
     cublasHandle_t cublas;
     if (cublasCreate(&cublas) != CUBLAS_STATUS_SUCCESS ||
@@ -193,11 +200,27 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    const auto ref_logits = cpu_router_logits(input, router);
+    /* The FFN applies the post-attention norm itself; mirror it here (BF16 out). */
+    std::vector<Bf16> normed_input((size_t)kTokens * kHidden);
+    for (int t = 0; t < kTokens; ++t) {
+        double mean_square = 0.0;
+        for (int j = 0; j < kHidden; ++j) {
+            const double x = (double)test::value(input[t * kHidden + j]);
+            mean_square += x * x;
+        }
+        mean_square /= kHidden;
+        for (int j = 0; j < kHidden; ++j) {
+            const double x = (double)test::value(input[t * kHidden + j]);
+            const double scaled = x / std::sqrt(mean_square + 1e-6) *
+                                  (double)test::value(post_norm[j]);
+            normed_input[t * kHidden + j] = test::bf16((float)scaled);
+        }
+    }
+    const auto ref_logits = cpu_router_logits(normed_input, router);
     std::vector<int> ids(kTokens * kTopK);
     std::vector<double> route_weights(kTokens * kTopK);
     cpu_router(ref_logits, /*norm_topk=*/true, 1.0f, ids, route_weights);
-    const auto want = cpu_moe(input, ids, route_weights, gate, up, down);
+    const auto want = cpu_moe(normed_input, ids, route_weights, gate, up, down);
     ok &= test::compare("moe forward", d_out.download(stream.get()), want, 5e-2, 5e-2);
 
     /* --- 3) Concentrated routing: one expert takes every token, the rest get
@@ -213,7 +236,7 @@ int main() {
         std::fprintf(stderr, "skewed forward_moe_ffn failed: %d\n", skewed_status);
         return EXIT_FAILURE;
     }
-    const auto skewed_logits = cpu_router_logits(input, skewed);
+    const auto skewed_logits = cpu_router_logits(normed_input, skewed);
     cpu_router(skewed_logits, /*norm_topk=*/true, 1.0f, ids, route_weights);
     /* Expert 2 carries the only non-zero router row and the other five rows are
      * zero, so tokens collapse onto a handful of experts; the point of this case
@@ -223,7 +246,7 @@ int main() {
     distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
     std::printf("skewed routing uses %zu of %d experts\n", distinct.size(), kExperts);
     ok &= distinct.size() < (size_t)kExperts;  // at least one expert is skipped
-    const auto skewed_want = cpu_moe(input, ids, route_weights, gate, up, down);
+    const auto skewed_want = cpu_moe(normed_input, ids, route_weights, gate, up, down);
     ok &= test::compare("moe forward (single expert)", d_out.download(stream.get()),
                         skewed_want, 5e-2, 5e-2);
 

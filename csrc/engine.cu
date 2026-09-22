@@ -472,6 +472,7 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                                      ctx.device_id, down + (size_t)e * hidden * inner);
                 }
                 check_cuda(cudaStreamSynchronize(nullptr), "Finish expert weight upload");
+                lw.moe.post_norm_w = lw.post_norm_w;
                 lw.moe.router_w = router;
                 lw.moe.experts_gate = gate;
                 lw.moe.experts_up = up;
@@ -603,9 +604,14 @@ static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
         current = last_idx;
         DeviceCtx &last = eng->ctx[last_idx];
         // Public API returns only the final row; avoid [128,vocab] logits.
-        kernel_gemma_rms_norm(last.workspace, act + (size_t)(tokens - 1) * eng->dims.hidden_size,
-                              eng->final_norm_w, eng->dims.hidden_size, 1, eng->dims.rms_eps,
-                              last.stream);
+        __nv_bfloat16 *final_row = act + (size_t)(tokens - 1) * eng->dims.hidden_size;
+        if (eng->dims.norm_style == 1) {
+            kernel_rms_norm_plain(last.workspace, final_row, eng->final_norm_w,
+                                  eng->dims.hidden_size, 1, eng->dims.rms_eps, last.stream);
+        } else {
+            kernel_gemma_rms_norm(last.workspace, final_row, eng->final_norm_w,
+                                  eng->dims.hidden_size, 1, eng->dims.rms_eps, last.stream);
+        }
         check_cuda(cudaGetLastError(), "Final norm");
         check_forward(gemm_bf16_f32out(last.cublas, eng->d_logits, last.workspace,
                       eng->lm_head_w, 1, eng->dims.vocab_size, eng->dims.hidden_size), "LM head");

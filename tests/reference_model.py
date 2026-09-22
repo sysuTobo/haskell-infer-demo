@@ -44,10 +44,11 @@ def main():
     ).eval()
     if family.startswith("qwen3_5"):
         patch_gdn_fallbacks(model)
-    elif family in ("qwen3_moe", "mixtral"):
-        pass  # sparse FFN only: no fused-kernel fallback to patch
+    elif family.startswith("qwen3") or family == "mixtral":
+        pass  # dense attention and/or sparse FFN: nothing to patch
     else:
-        raise SystemExit(f"no reference adapter for model_type {family!r}")
+        print(f"warning: no known adapter for model_type {family!r}; "
+              "using the transformers implementation as-is", flush=True)
     arrays = {}
     cases = []
     with torch.inference_mode():

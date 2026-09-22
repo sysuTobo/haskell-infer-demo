@@ -134,7 +134,10 @@ int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
     __nv_bfloat16 *gated = attn_out + T * Q;
 
     layer_norm(normed, residual, w->input_norm_w, H, tokens, dims, stream);
-    checked_gemm(cublas, q_raw, normed, w->q_proj_w, tokens,
+    /* With a fused gate the projection lands in q_raw and is split below;
+     * without one it is written straight into the query buffer. */
+    __nv_bfloat16 *q_dst = dims->attn_output_gate ? q_raw : q;
+    checked_gemm(cublas, q_dst, normed, w->q_proj_w, tokens,
                  dims->attn_output_gate ? 2 * Q : Q, H);
     checked_gemm(cublas, k_out, normed, w->k_proj_w, tokens, KV, H);
     checked_gemm(cublas, v_out, normed, w->v_proj_w, tokens, KV, H);
@@ -143,9 +146,6 @@ int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
         const int total = tokens * Q;
         deinterleave_qg_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
             q, gate, q_raw, total, hd);
-        check_launch();
-    } else {
-        /* No fused gate: q_proj already produced [tokens, Q] directly. */
         check_launch();
     }
     layer_norm(q, q, w->q_norm_w, hd, tokens * nH, dims, stream);

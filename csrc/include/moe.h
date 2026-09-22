@@ -35,6 +35,8 @@ typedef struct {
 
 /* Per-layer routed-expert weights, fused per expert (owned by the layer). */
 typedef struct {
+    /* The FFN owns its input norm, exactly like the dense MLP does. */
+    const __nv_bfloat16 *post_norm_w; // [H]
     const __nv_bfloat16 *router_w;    // [E, H]
     const __nv_bfloat16 *experts_gate; // [E, I, H]
     const __nv_bfloat16 *experts_up;   // [E, I, H]
@@ -50,8 +52,8 @@ typedef struct {
 /* Bytes needed for `tokens` tokens at the model's MoE configuration. */
 size_t moe_workspace_size(int tokens, const struct ModelDims *dims, const MoeConfig *moe);
 
-/* MoE feed-forward: out[T, H] = combine(top_k experts of normed[T, H]).
- * `normed` must already be the post-attention RMSNorm output. */
+/* MoE feed-forward: out[T, H] = combine(top_k experts of post_norm(residual)).
+ * The post-attention RMSNorm is applied here, using the model's norm style. */
 int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
                     const __nv_bfloat16 *normed, __nv_bfloat16 *out,
                     const MoeWeights *w, const MoeConfig *moe,

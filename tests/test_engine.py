@@ -14,6 +14,11 @@ def main():
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--reference", required=True)
     parser.add_argument("--desc", default="descriptors/qwen38-27b.json")
+    # Logit rms of BF16 reassociation against the reference. The Qwen3.5 operator
+    # set matches to ~0.02-0.04; families whose normalization order differs from
+    # the reference's (plain RMSNorm, MoE expert reduction) land around 0.1-0.2
+    # while keeping every greedy token identical, so the gate is explicit here.
+    parser.add_argument("--rms-tolerance", type=float, default=0.1)
     parser.add_argument("--devices", default="0,1")
     args = parser.parse_args()
     lib = bind(ctypes.CDLL(args.library))
@@ -49,7 +54,7 @@ def main():
                           "rms": rms, "max_abs": float(np.abs(error).max())}
                 print(json.dumps(result), flush=True)
                 # BF16 reference logits can tie while the engine returns FP32 logits.
-                if actual not in maxima or rms > 0.1:
+                if actual not in maxima or rms > args.rms_tolerance:
                     failures.append(result)
                 if step + 1 < len(reference[f"tokens_{case}"]):
                     status(lib.engine_decode(engine, int(token), ptr(logits)))

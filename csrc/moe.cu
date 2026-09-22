@@ -11,6 +11,7 @@
  */
 #include "moe.h"
 
+#include "flashinfer_ops.h"
 #include "kernels.h"
 #include "layers.h"
 
@@ -222,6 +223,7 @@ size_t moe_workspace_size(int tokens, const ModelDims *dims, const MoeConfig *mo
     const size_t hidden = (size_t)dims->hidden_size;
     const size_t inner = (size_t)moe->intermediate_size;
     size_t bytes = 0;
+    bytes += align_up(t * hidden * sizeof(__nv_bfloat16));    // post-normed input
     bytes += align_up(t * experts * sizeof(__nv_bfloat16));   // router logits
     bytes += align_up(t * k * sizeof(int));                   // expert ids
     bytes += align_up(t * k * sizeof(float));                 // routing weights
@@ -265,6 +267,7 @@ int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
             offset += align_up(bytes);
             return result;
         };
+        __nv_bfloat16 *normed_input = (__nv_bfloat16 *)take((size_t)tokens * hidden * 2);
         __nv_bfloat16 *router_logits = (__nv_bfloat16 *)take((size_t)tokens * experts * 2);
         int *ids = (int *)take((size_t)entries * sizeof(int));
         float *weights = (float *)take((size_t)entries * sizeof(float));
@@ -278,8 +281,22 @@ int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
         __nv_bfloat16 *activated = (__nv_bfloat16 *)take((size_t)entries * inner * 2);
         __nv_bfloat16 *expert_out = (__nv_bfloat16 *)take((size_t)entries * hidden * 2);
 
+        if (w->post_norm_w != nullptr) {
+            if (dims->norm_style == 1) {
+                kernel_rms_norm_plain(normed_input, normed, w->post_norm_w, hidden, tokens,
+                                      dims->rms_eps, stream);
+            } else {
+                kernel_gemma_rms_norm(normed_input, normed, w->post_norm_w, hidden, tokens,
+                                      dims->rms_eps, stream);
+            }
+        } else {
+            check_cuda(cudaMemcpyAsync(normed_input, normed, (size_t)tokens * hidden * 2,
+                                       cudaMemcpyDeviceToDevice, stream),
+                       "MoE input copy");
+        }
+
         /* Routing: BF16 logits as the reference linear produces, scored in FP32. */
-        const int gemm_status = gemm_bf16(cublas, router_logits, normed, w->router_w,
+        const int gemm_status = gemm_bf16(cublas, router_logits, normed_input, w->router_w,
                                           tokens, experts, hidden);
         if (gemm_status != 0) return gemm_status;
         kernel_moe_router_topk(router_logits, tokens, experts, top_k,
@@ -290,7 +307,7 @@ int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
         kernel_moe_offsets(counts, experts, offsets, stream);
         kernel_moe_permute(ids, tokens, top_k, experts, offsets, cursor, slot_of,
                            token_of_slot, stream);
-        kernel_moe_gather(normed, token_of_slot, packed, entries, hidden, stream);
+        kernel_moe_gather(normed_input, token_of_slot, packed, entries, hidden, stream);
 
         /* Expert loop: one plain GEMM per non-empty expert over its packed slice.
          * The per-expert token counts are device data, so this pulls the offsets

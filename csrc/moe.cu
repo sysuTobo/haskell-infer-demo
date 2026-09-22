@@ -98,6 +98,10 @@ __global__ void moe_router_topk_kernel(const __nv_bfloat16 *logits, int experts,
             for (int k = 0; k < top_k; ++k) selected[k] /= total;
     }
     for (int k = 0; k < top_k; ++k) selected[k] *= scaling;
+    /* The reference casts the routing weights to the model dtype before scaling
+     * the expert outputs; matching that keeps the comparison tight. */
+    for (int k = 0; k < top_k; ++k)
+        selected[k] = __bfloat162float(__float2bfloat16_rn(selected[k]));
 }
 
 void kernel_moe_router_topk(const __nv_bfloat16 *logits, int tokens, int experts,

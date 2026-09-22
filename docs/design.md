@@ -169,6 +169,50 @@ State S is [48, 128, 128] F32 = 3 MiB per layer, 147 MiB total.
 tokens but guarantees correctness and code reuse. Chunked prefill is a
 future optimization.
 
+### Mixture-of-experts feed-forward
+
+A layer whose `layer_ffns` entry is `moe` routes through a sparse FFN instead of
+the dense MLP. The arithmetic follows the reference implementation's order:
+router logits in BF16 (as the reference linear layer emits them), scoring in
+FP32, top-k selection with the lowest index winning ties, optional
+renormalization, then the per-expert MLP. Routed expert tensors are fused into
+one contiguous block per expert so the expert loop is a plain GEMM per slice.
+
+Two implementation choices worth knowing:
+
+- Experts run one at a time over their packed token slices and empty slices are
+  skipped. For single-request decode at most `top_k` experts are non-empty, so
+  this is both simple and cheap; a capacity-padded batched GEMM is the
+  optimization for throughput, not for correctness.
+- The per-expert token counts live on the device, so the loop pulls the offsets
+  back once per MoE layer (one small sync). Padding every expert to a common
+  capacity would remove it.
+
+The expert's per-slice layout is `[gate; up]` because the activation kernel
+consumes that adjacency, which in turn requires the expert width to be a multiple
+of 8; unsupported widths are rejected with an explicit error.
+
+### What differs between families
+
+The layer kinds share one path, so a new family is descriptor data plus, at most,
+one kernel:
+
+| | Qwen3.8-27B | Qwen3 / Mixtral | Qwen3-MoE |
+|---|---|---|---|
+| mixer | GDN + full attention | full attention | full attention |
+| q/k norm | yes | yes (Mixtral: no) | yes |
+| attention output gate | yes | no | no |
+| RMSNorm | Gemma (weight + 1) | plain | plain |
+| RoPE | partial (64 of 256) | full (128 of 128) | full (128 of 128) |
+| FFN | dense | dense | routed experts + `mlp.gate` router |
+| token embeddings | untied | tied (Qwen3-4B) | untied |
+
+Two families are verified end to end against independent PyTorch references
+(Qwen3.8-27B bitwise against its own baseline plus a 0.02-0.04 logit rms;
+Qwen3-4B and Qwen3-30B-A3B with every greedy token matching and a logit rms of
+0.1-0.4, the spread coming from BF16 reassociation: the reference accumulates
+expert outputs in BF16, this engine accumulates in FP32 and rounds once).
+
 ### Prefill batching
 
 The descriptor's `max_chunk` (default 128, validated against the kernels' hard
@@ -249,6 +293,17 @@ near-tie argmax; the reference's tied maxima are therefore accepted as a set.
 
 1. More model families (MoE, MLA) through new layer kinds in the descriptor
 2. More GPU targets (sm_89/sm_90a) via multi-arch SASS plus runtime cubin choice
-3. Tensor / expert parallel placement policies alongside the layer-wise split
+3. Tensor / expert parallel placement policies alongside the layer-wise split.
+   Note these are *not* numerically inert: layer-wise (pipeline-style) placement
+   does not split intra-layer reductions, but tensor parallel splits the
+   contraction dimension across ranks and expert parallel changes how expert
+   outputs are combined. Once either lands, logits become a function of device
+   count unless a fixed reduction tree is pinned in the execution contract.
 4. CUDA graph capture for decode, vocab-parallel argmax
 5. Sampling (temperature, top-p), HTTP API, streaming SSE
+6. A training framework (SFT, PPO, GRPO, DAPO, on-policy distillation) on small
+   models, orchestrated in Haskell over the same region library as inference, and
+   the numerical execution contract that makes train/inference bitwise agreement
+   structural rather than disciplinary — see `plan-numeric-contract.md` for the
+   staged plan, the audit of what the descriptor already pins versus what is
+   still implicit, and what does not exist yet

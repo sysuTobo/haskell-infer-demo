@@ -12,6 +12,11 @@ targeting **Qwen3.8-27B** (hybrid Full-Attention + GatedDeltaNet architecture).
 - **Hybrid architecture support**: 16 full-attention layers (GQA, partial RoPE,
   output gate) + 48 GatedDeltaNet layers (causal conv1d, gated delta rule,
   gated RMSNorm).
+- **Model families**: the descriptor + layer-kind design covers dense hybrid
+  models (Qwen3.8-27B, verified), dense attention with or without sparse MoE
+  (Qwen3-4B and Qwen3-30B-A3B, both verified against independent PyTorch
+  references; Mixtral shares their adapter and snapshot layout), and leaves room
+  for MLA mixers. `descriptors/` carries a snapshot per family.
 - **Single-request greedy decoding**: CLI with streaming token output.
 - **Three-language build**: Haskell (Cabal) + C/CUDA (CMake) + Rust (Cargo).
 
@@ -141,6 +146,11 @@ equal highest BF16 reference logits are treated as ties.
 - `cabal test infer-tests` — descriptor round-trip, layer plan and placement
   (no GPU); with `INFER_MODEL_DIR` set it also checks the adapter still
   reproduces `descriptors/*.json`.
+- `ctest` also runs `test_norm` (both RMSNorm variants) and `test_rope` (partial
+  and full rotation), each against a CPU reference.
+- `tests/test_engine.py --rms-tolerance` defaults to 0.1 and is raised per family
+  where the reference's arithmetic differs (plain-norm families and MoE expert
+  reduction land around 0.1-0.4); every greedy token still has to match.
 
 ## Usage
 

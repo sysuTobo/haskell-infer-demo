@@ -56,6 +56,10 @@ void cpu_router(const std::vector<Bf16> &logits, bool norm_topk, float scaling,
             for (int k = 0; k < kTopK; ++k) weights[t * kTopK + k] /= total;
         }
         for (int k = 0; k < kTopK; ++k) weights[t * kTopK + k] *= scaling;
+        // The kernel rounds the weights to bf16 before the combine, as the
+        // reference implementation does.
+        for (int k = 0; k < kTopK; ++k)
+            weights[t * kTopK + k] = (double)test::value(test::bf16((float)weights[t * kTopK + k]));
     }
 }
 

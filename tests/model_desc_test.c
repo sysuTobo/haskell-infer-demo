@@ -35,6 +35,7 @@ static const char *kGoodDesc =
     "\"head_dim\":4,"
     "\"rotary_dim\":2,"
     "\"rotary_theta\":10000000,"
+    "\"attn_qk_norm\":true,"
     "\"attn_output_gate\":true,"
     "\"q_gate_interleave\":true,"
     "\"gdn_conv_dim\":12,"
@@ -45,6 +46,14 @@ static const char *kGoodDesc =
     "\"gdn_conv_kernel\":4,"
     "\"fla_chunk_size\":64,"
     "\"max_chunk\":128,"
+    "\"moe_num_experts\":0,"
+    "\"moe_top_k\":0,"
+    "\"moe_intermediate_size\":0,"
+    "\"moe_router_scoring\":\"softmax\","
+    "\"moe_norm_topk_prob\":false,"
+    "\"moe_num_shared_experts\":0,"
+    "\"moe_shared_intermediate_size\":0,"
+    "\"moe_routed_scaling_factor\":1.0,"
     "\"eos_tokens\":[7,9],"
     "\"layer_mixers\":[\"full_attn\",\"gdn\"],"
     "\"layer_ffns\":[\"dense\",\"dense\"],"
@@ -132,6 +141,96 @@ static void test_rejects(char *json, const char *needle, const char *what) {
     }
 }
 
+
+/* A dense-attention + MoE descriptor (Mixtral/Qwen3-MoE shape): every layer is
+ * full attention with an MoE feed-forward and one shared expert. */
+static const char *kMoeDesc =
+    "{"
+    "\"desc_version\":1,"
+    "\"family\":\"mixtral\","
+    "\"model_type\":\"mixtral\","
+    "\"num_layers\":2,"
+    "\"hidden_size\":8,"
+    "\"intermediate_size\":16,"
+    "\"vocab_size\":32,"
+    "\"rms_eps\":1e-05,"
+    "\"max_position_embeddings\":128,"
+    "\"max_seq_len\":64,"
+    "\"num_heads\":2,"
+    "\"num_kv_heads\":1,"
+    "\"head_dim\":4,"
+    "\"rotary_dim\":4,"
+    "\"rotary_theta\":1000000,"
+    "\"attn_qk_norm\":false,"
+    "\"attn_output_gate\":false,"
+    "\"q_gate_interleave\":false,"
+    "\"gdn_conv_dim\":0,"
+    "\"gdn_value_dim\":0,"
+    "\"gdn_num_v_heads\":0,"
+    "\"gdn_num_k_heads\":0,"
+    "\"gdn_head_dim\":0,"
+    "\"gdn_conv_kernel\":0,"
+    "\"fla_chunk_size\":64,"
+    "\"max_chunk\":128,"
+    "\"moe_num_experts\":4,"
+    "\"moe_top_k\":2,"
+    "\"moe_intermediate_size\":6,"
+    "\"moe_router_scoring\":\"softmax\","
+    "\"moe_norm_topk_prob\":true,"
+    "\"moe_num_shared_experts\":1,"
+    "\"moe_shared_intermediate_size\":6,"
+    "\"moe_routed_scaling_factor\":1.0,"
+    "\"eos_tokens\":[2],"
+    "\"layer_mixers\":[\"full_attn\",\"full_attn\"],"
+    "\"layer_ffns\":[\"moe\",\"moe\"],"
+    "\"role_names\":[\"embed\",\"lmHead\",\"finalNorm\",\"inputNorm\",\"postNorm\","
+    "\"attnQ\",\"attnK\",\"attnV\",\"attnO\",\"attnQNorm\",\"attnKNorm\","
+    "\"moeRouter\",\"moeExpertGate\",\"moeExpertUp\",\"moeExpertDown\","
+    "\"moeSharedGate\",\"moeSharedUp\",\"moeSharedDown\"],"
+    "\"role_templates\":[\"e.w\",\"h.w\",\"fn.w\",\"in.w\",\"pn.w\",\"q.w\",\"k.w\","
+    "\"v.w\",\"o.w\",\"qn.w\",\"kn.w\",\"r.w\",\"eg.%e.w\",\"eu.%e.w\",\"ed.%e.w\","
+    "\"sg.w\",\"su.w\",\"sd.w\"]"
+    "}";
+
+static void test_moe(void) {
+    char err[256] = {0};
+    struct ModelDesc desc;
+    int rc = model_desc_parse(kMoeDesc, &desc, err, sizeof(err));
+    check(rc == 0, err[0] ? err : "well-formed MoE descriptor is rejected");
+    check(desc.moe_num_experts == 4 && desc.moe_top_k == 2, "MoE routing parsed");
+    check(desc.moe_num_shared_experts == 1 && desc.moe_shared_intermediate_size == 6,
+          "shared expert parsed");
+    check(strcmp(desc.moe_router_scoring, "softmax") == 0, "router scoring parsed");
+    check(desc.moe_norm_topk_prob == 1, "norm_topk_prob parsed");
+    check(model_desc_role_index(&desc, ROLE_MOE_ROUTER) == 11, "MoE router role lookup");
+    /* Templates expand per expert. */
+    char expanded[ENGINE_TEMPLATE_MAX];
+    model_desc_expand(desc.role_templates[model_desc_role_index(&desc, ROLE_MOE_EXPERT_UP)],
+                      3, 7, expanded, sizeof(expanded));
+    check(strcmp(expanded, "eu.7.w") == 0, "expert template expansion");
+
+    char buf[8192];
+    /* top_k beyond the expert count. */
+    copy_desc(buf, sizeof(buf));
+    snprintf(buf, sizeof(buf), "%s", kMoeDesc);
+    set_literal(buf, "\"moe_top_k\":2", "\"moe_top_k\":9");
+    test_rejects(buf, "moe_top_k", "top_k beyond num_experts is rejected");
+    /* Unknown scoring function. */
+    snprintf(buf, sizeof(buf), "%s", kMoeDesc);
+    set_literal(buf, "\"moe_router_scoring\":\"softmax\"", "\"moe_router_scoring\":\"topk\"");
+    test_rejects(buf, "moe_router_scoring", "unknown router scoring is rejected");
+    /* Missing expert role while MoE layers exist. */
+    snprintf(buf, sizeof(buf), "%s", kMoeDesc);
+    set_literal(buf, "\"moeSharedGate\",\"moeSharedUp\",\"moeSharedDown\"]", "\"moeSharedGate\"]");
+    set_literal(buf, "\"sg.w\",\"su.w\",\"sd.w\"]", "\"sg.w\"]");
+    test_rejects(buf, "moeSharedUp", "missing shared-expert roles are rejected");
+    /* Dense MLP roles are not required for an all-MoE model (the fixture above
+     * proves it) but must be present when a dense layer exists. */
+    snprintf(buf, sizeof(buf), "%s", kMoeDesc);
+    set_literal(buf, "\"layer_ffns\":[\"moe\",\"moe\"]", "\"layer_ffns\":[\"moe\",\"dense\"]");
+    test_rejects(buf, "mlpGate", "dense layer without MLP roles is rejected");
+}
+
 static void test_errors(void) {
     char buf[8192];
     test_rejects("{\"desc_version\":1}", "missing", "descriptor with missing keys is rejected");
@@ -187,6 +286,7 @@ static void test_errors(void) {
 
 int main(void) {
     test_good();
+    test_moe();
     test_errors();
     if (failures == 0) {
         printf("model_desc tests passed\n");

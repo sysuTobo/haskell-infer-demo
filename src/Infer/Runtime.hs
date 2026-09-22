@@ -15,7 +15,7 @@ import System.Exit (exitFailure)
 
 import Infer.Config
 import Infer.Descriptor
-import Infer.Descriptor.Adapter.Qwen35
+import Infer.Descriptor.Adapter
 import Infer.FFI.Engine
 import Infer.Model
 import Infer.Placement
@@ -47,7 +47,7 @@ loadDescriptor cfg = case rcDescriptor cfg of
     result <- decodeDescriptor <$> BS.readFile path
     finish result
   Nothing -> do
-    adapted <- qwen35DescriptorFromDir (rcModelDir cfg)
+    adapted <- descriptorFromModelDir (rcModelDir cfg)
     finish (adapted >>= validated)
   where
     validated desc = validateDescriptor desc >> pure desc

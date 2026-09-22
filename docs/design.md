@@ -65,6 +65,12 @@ follower copies its partial into the leader's staging buffer, the leader adds it
 `test_collective`, which also checks that a copy issued without host
 synchronization still observes data produced asynchronously on the source stream.
 
+Verification status per target: sm_86 and sm_89 are verified at runtime (sm_89
+through the operator suite on an L20, which exercises the sm_89 Triton cubins);
+sm_90a is compile- and artifact-verified (`cuobjdump` shows the cubins, and the
+loader's arch table lists 90) until H200 hardware is available. Building without
+a cubin for the device is an explicit error, not a driver failure.
+
 ### Model descriptor
 
 Everything the engine needs to know about an architecture travels in one *flat*

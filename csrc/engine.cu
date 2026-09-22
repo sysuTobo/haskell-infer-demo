@@ -322,6 +322,14 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                 throw EngineError(ENGINE_ERR_CONFIG, "Invalid or duplicate CUDA device ordinal");
         }
         const int num_layers = eng->desc.num_layers;
+        for (int i = 0; i < num_layers; ++i) {
+            if (eng->desc.layer_ffns[i] == ENGINE_FFN_MOE)
+                throw EngineError(ENGINE_ERR_CONFIG,
+                                  "moe feed-forward layers are not implemented in this build");
+            if (eng->desc.layer_mixers[i] == ENGINE_MIXER_MLA)
+                throw EngineError(ENGINE_ERR_CONFIG,
+                                  "mla mixer layers are not implemented in this build");
+        }
         eng->layer_device.resize(num_layers);
         for (int i = 0; i < num_layers; ++i) {
             auto it = std::find(eng->devices.begin(), eng->devices.end(), layer_devices[i]);

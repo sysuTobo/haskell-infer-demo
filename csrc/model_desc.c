@@ -30,9 +30,12 @@ enum {
     K_DESC_VERSION = 0, K_FAMILY, K_MODEL_TYPE, K_NUM_LAYERS, K_HIDDEN_SIZE,
     K_INTERMEDIATE_SIZE, K_VOCAB_SIZE, K_RMS_EPS, K_MAX_POSITION_EMBEDDINGS,
     K_MAX_SEQ_LEN, K_NUM_HEADS, K_NUM_KV_HEADS, K_HEAD_DIM, K_ROTARY_DIM,
-    K_ROTARY_THETA, K_ATTN_OUTPUT_GATE, K_Q_GATE_INTERLEAVE, K_GDN_CONV_DIM,
+    K_ROTARY_THETA, K_ATTN_QK_NORM, K_ATTN_OUTPUT_GATE, K_Q_GATE_INTERLEAVE, K_GDN_CONV_DIM,
     K_GDN_VALUE_DIM, K_GDN_NUM_V_HEADS, K_GDN_NUM_K_HEADS, K_GDN_HEAD_DIM,
-    K_GDN_CONV_KERNEL, K_FLA_CHUNK_SIZE, K_MAX_CHUNK, K_EOS_TOKENS, K_LAYER_MIXERS,
+    K_GDN_CONV_KERNEL, K_FLA_CHUNK_SIZE, K_MAX_CHUNK, K_MOE_NUM_EXPERTS, K_MOE_TOP_K,
+    K_MOE_INTERMEDIATE_SIZE, K_MOE_ROUTER_SCORING, K_MOE_NORM_TOPK_PROB,
+    K_MOE_NUM_SHARED_EXPERTS, K_MOE_SHARED_INTERMEDIATE_SIZE, K_MOE_ROUTED_SCALING_FACTOR,
+    K_EOS_TOKENS, K_LAYER_MIXERS,
     K_LAYER_FFNS, K_ROLE_NAMES, K_ROLE_TEMPLATES,
     K_COUNT
 };
@@ -56,6 +59,7 @@ static const struct {
     {"head_dim", KV_INT},
     {"rotary_dim", KV_INT},
     {"rotary_theta", KV_DOUBLE},
+    {"attn_qk_norm", KV_BOOL},
     {"attn_output_gate", KV_BOOL},
     {"q_gate_interleave", KV_BOOL},
     {"gdn_conv_dim", KV_INT},
@@ -66,6 +70,14 @@ static const struct {
     {"gdn_conv_kernel", KV_INT},
     {"fla_chunk_size", KV_INT},
     {"max_chunk", KV_INT},
+    {"moe_num_experts", KV_INT},
+    {"moe_top_k", KV_INT},
+    {"moe_intermediate_size", KV_INT},
+    {"moe_router_scoring", KV_TEXT},
+    {"moe_norm_topk_prob", KV_BOOL},
+    {"moe_num_shared_experts", KV_INT},
+    {"moe_shared_intermediate_size", KV_INT},
+    {"moe_routed_scaling_factor", KV_DOUBLE},
     {"eos_tokens", KV_INT_ARRAY},
     {"layer_mixers", KV_TEXT_ARRAY},
     {"layer_ffns", KV_TEXT_ARRAY},
@@ -304,20 +316,29 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         case K_ROTARY_DIM: case K_GDN_CONV_DIM: case K_GDN_VALUE_DIM:
         case K_GDN_NUM_V_HEADS: case K_GDN_NUM_K_HEADS: case K_GDN_HEAD_DIM:
         case K_GDN_CONV_KERNEL: case K_FLA_CHUNK_SIZE: case K_MAX_CHUNK:
+        case K_MOE_NUM_EXPERTS: case K_MOE_TOP_K: case K_MOE_INTERMEDIATE_SIZE:
+        case K_MOE_NUM_SHARED_EXPERTS: case K_MOE_SHARED_INTERMEDIATE_SIZE:
             if (parse_number(&c, &number) != 0) {
                 fail(err, err_len, "key %s must be a number", key);
                 return -1;
             }
             break;
-        case K_RMS_EPS: case K_ROTARY_THETA:
+        case K_RMS_EPS: case K_ROTARY_THETA: case K_MOE_ROUTED_SCALING_FACTOR:
             if (parse_number(&c, &number) != 0) {
                 fail(err, err_len, "key %s must be a number", key);
                 return -1;
             }
             break;
-        case K_ATTN_OUTPUT_GATE: case K_Q_GATE_INTERLEAVE:
+        case K_ATTN_QK_NORM: case K_ATTN_OUTPUT_GATE: case K_Q_GATE_INTERLEAVE:
+        case K_MOE_NORM_TOPK_PROB:
             if (parse_bool(&c, &boolean) != 0) {
                 fail(err, err_len, "key %s must be a boolean", key);
+                return -1;
+            }
+            break;
+        case K_MOE_ROUTER_SCORING:
+            if (parse_string(&c, out->moe_router_scoring, sizeof(out->moe_router_scoring)) != 0) {
+                fail(err, err_len, "key %s must be a string", key);
                 return -1;
             }
             break;
@@ -374,6 +395,7 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         case K_ROTARY_DIM: out->rotary_dim = (int)number; break;
         case K_RMS_EPS: out->rms_eps = number; break;
         case K_ROTARY_THETA: out->rotary_theta = number; break;
+        case K_ATTN_QK_NORM: out->attn_qk_norm = boolean; break;
         case K_ATTN_OUTPUT_GATE: out->attn_output_gate = boolean; break;
         case K_Q_GATE_INTERLEAVE: out->q_gate_interleave = boolean; break;
         case K_GDN_CONV_DIM: out->gdn_conv_dim = (int)number; break;
@@ -384,6 +406,13 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         case K_GDN_CONV_KERNEL: out->gdn_conv_kernel = (int)number; break;
         case K_FLA_CHUNK_SIZE: out->fla_chunk_size = (int)number; break;
         case K_MAX_CHUNK: out->max_chunk = (int)number; break;
+        case K_MOE_NUM_EXPERTS: out->moe_num_experts = (int)number; break;
+        case K_MOE_TOP_K: out->moe_top_k = (int)number; break;
+        case K_MOE_INTERMEDIATE_SIZE: out->moe_intermediate_size = (int)number; break;
+        case K_MOE_ROUTED_SCALING_FACTOR: out->moe_routed_scaling_factor = number; break;
+        case K_MOE_NUM_SHARED_EXPERTS: out->moe_num_shared_experts = (int)number; break;
+        case K_MOE_SHARED_INTERMEDIATE_SIZE: out->moe_shared_intermediate_size = (int)number; break;
+        case K_MOE_NORM_TOPK_PROB: out->moe_norm_topk_prob = boolean; break;
         case K_EOS_TOKENS: out->eos_count = eos_count; break;
         default: break;
         }
@@ -492,15 +521,14 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
             return -1;
         }
     }
-    /* Global roles are always required. */
+    /* Roles every layer needs, regardless of kind. */
     const int global_roles[] = {ROLE_EMBED, ROLE_LM_HEAD, ROLE_FINAL_NORM,
-                               ROLE_INPUT_NORM, ROLE_POST_NORM, ROLE_MLP_GATE,
-                               ROLE_MLP_UP, ROLE_MLP_DOWN};
+                               ROLE_INPUT_NORM, ROLE_POST_NORM};
     for (size_t i = 0; i < sizeof(global_roles) / sizeof(global_roles[0]); ++i) {
         if (require_role(d, global_roles[i], "required by every layer", err, err_len) != 0)
             return -1;
     }
-    int has_full = 0, has_gdn = 0, has_moe = 0;
+    int has_full = 0, has_gdn = 0, has_moe = 0, has_dense = 0;
     for (int i = 0; i < d->num_layers; ++i) {
         int mixer = d->layer_mixers[i];
         if (mixer == ENGINE_MIXER_FULL_ATTN) has_full = 1;
@@ -510,17 +538,31 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
             return -1;
         }
         if (d->layer_ffns[i] == ENGINE_FFN_MOE) has_moe = 1;
-        else if (d->layer_ffns[i] != ENGINE_FFN_DENSE) {
+        else if (d->layer_ffns[i] == ENGINE_FFN_DENSE) has_dense = 1;
+        else {
             fail(err, err_len, "layer %d has an unsupported ffn kind %d", i, d->layer_ffns[i]);
             return -1;
         }
     }
+    if (has_dense) {
+        const int dense_roles[] = {ROLE_MLP_GATE, ROLE_MLP_UP, ROLE_MLP_DOWN};
+        for (size_t i = 0; i < sizeof(dense_roles) / sizeof(dense_roles[0]); ++i) {
+            if (require_role(d, dense_roles[i], "needed by dense layers", err, err_len) != 0)
+                return -1;
+        }
+    }
     if (has_full) {
-        const int attn_roles[] = {ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_O,
-                                  ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM};
+        const int attn_roles[] = {ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_O};
         for (size_t i = 0; i < sizeof(attn_roles) / sizeof(attn_roles[0]); ++i) {
             if (require_role(d, attn_roles[i], "needed by full_attn layers", err, err_len) != 0)
                 return -1;
+        }
+        if (d->attn_qk_norm) {
+            const int norm_roles[] = {ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM};
+            for (size_t i = 0; i < sizeof(norm_roles) / sizeof(norm_roles[0]); ++i) {
+                if (require_role(d, norm_roles[i], "attn_qk_norm is enabled", err, err_len) != 0)
+                    return -1;
+            }
         }
         if (d->num_heads % d->num_kv_heads != 0) {
             fail(err, err_len, "num_heads must be a multiple of num_kv_heads");
@@ -561,8 +603,46 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
         }
     }
     if (has_moe) {
-        fail(err, err_len, "moe layers are not implemented yet");
-        return -1;
+        const int moe_roles[] = {ROLE_MOE_ROUTER, ROLE_MOE_EXPERT_GATE,
+                                 ROLE_MOE_EXPERT_UP, ROLE_MOE_EXPERT_DOWN};
+        for (size_t i = 0; i < sizeof(moe_roles) / sizeof(moe_roles[0]); ++i) {
+            if (require_role(d, moe_roles[i], "needed by moe layers", err, err_len) != 0)
+                return -1;
+        }
+        if (d->moe_num_experts <= 0) {
+            fail(err, err_len, "moe_num_experts must be positive");
+            return -1;
+        }
+        if (d->moe_top_k < 1 || d->moe_top_k > d->moe_num_experts) {
+            fail(err, err_len, "moe_top_k %d is outside [1, %d]", d->moe_top_k, d->moe_num_experts);
+            return -1;
+        }
+        if (d->moe_intermediate_size <= 0) {
+            fail(err, err_len, "moe_intermediate_size must be positive");
+            return -1;
+        }
+        if (strcmp(d->moe_router_scoring, "softmax") != 0 &&
+            strcmp(d->moe_router_scoring, "sigmoid") != 0) {
+            fail(err, err_len, "moe_router_scoring must be softmax or sigmoid");
+            return -1;
+        }
+        if (d->moe_num_shared_experts < 0 || d->moe_shared_intermediate_size < 0 ||
+            (d->moe_num_shared_experts > 0 && d->moe_shared_intermediate_size <= 0)) {
+            fail(err, err_len, "inconsistent shared-expert configuration");
+            return -1;
+        }
+        if (d->moe_routed_scaling_factor <= 0) {
+            fail(err, err_len, "moe_routed_scaling_factor must be positive");
+            return -1;
+        }
+        if (d->moe_num_shared_experts > 0) {
+            const int shared_roles[] = {ROLE_MOE_SHARED_GATE, ROLE_MOE_SHARED_UP,
+                                        ROLE_MOE_SHARED_DOWN};
+            for (size_t i = 0; i < sizeof(shared_roles) / sizeof(shared_roles[0]); ++i) {
+                if (require_role(d, shared_roles[i], "needed by shared experts", err, err_len) != 0)
+                    return -1;
+            }
+        }
     }
     return 0;
 }
@@ -600,6 +680,7 @@ int model_desc_format(const struct ModelDesc *d, char *buf, int buf_len) {
     if (append(buf, buf_len, &used, "\"head_dim\":%d,", d->head_dim) != 0) return -1;
     if (append(buf, buf_len, &used, "\"rotary_dim\":%d,", d->rotary_dim) != 0) return -1;
     if (append(buf, buf_len, &used, "\"rotary_theta\":%.17g,", d->rotary_theta) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"attn_qk_norm\":%s,", d->attn_qk_norm ? "true" : "false") != 0) return -1;
     if (append(buf, buf_len, &used, "\"attn_output_gate\":%s,", d->attn_output_gate ? "true" : "false") != 0) return -1;
     if (append(buf, buf_len, &used, "\"q_gate_interleave\":%s,", d->q_gate_interleave ? "true" : "false") != 0) return -1;
     if (append(buf, buf_len, &used, "\"gdn_conv_dim\":%d,", d->gdn_conv_dim) != 0) return -1;
@@ -610,6 +691,14 @@ int model_desc_format(const struct ModelDesc *d, char *buf, int buf_len) {
     if (append(buf, buf_len, &used, "\"gdn_conv_kernel\":%d,", d->gdn_conv_kernel) != 0) return -1;
     if (append(buf, buf_len, &used, "\"fla_chunk_size\":%d,", d->fla_chunk_size) != 0) return -1;
     if (append(buf, buf_len, &used, "\"max_chunk\":%d,", d->max_chunk) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"moe_num_experts\":%d,", d->moe_num_experts) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"moe_top_k\":%d,", d->moe_top_k) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"moe_intermediate_size\":%d,", d->moe_intermediate_size) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"moe_router_scoring\":\"%s\",", d->moe_router_scoring) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"moe_norm_topk_prob\":%s,", d->moe_norm_topk_prob ? "true" : "false") != 0) return -1;
+    if (append(buf, buf_len, &used, "\"moe_num_shared_experts\":%d,", d->moe_num_shared_experts) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"moe_shared_intermediate_size\":%d,", d->moe_shared_intermediate_size) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"moe_routed_scaling_factor\":%.17g,", d->moe_routed_scaling_factor) != 0) return -1;
     if (append(buf, buf_len, &used, "\"eos_tokens\":[") != 0) return -1;
     for (int i = 0; i < d->eos_count; ++i) {
         if (append(buf, buf_len, &used, "%s%d", i ? "," : "", d->eos_tokens[i]) != 0) return -1;

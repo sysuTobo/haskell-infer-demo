@@ -13,12 +13,13 @@ import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
 import Data.List (nub)
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
-import Data.Scientific (toBoundedInteger, toRealFloat)
+import Data.Scientific (toRealFloat)
 import qualified Data.Text as T
 import qualified Data.Vector as V
 import Text.Read (readMaybe)
 
 import Infer.Descriptor
+import Infer.Descriptor.Adapter.Json
 
 -- | Build a descriptor from a model directory (@config.json@ +
 -- @tokenizer_config.json@). The tokenizer config is optional: EOS ids then fall
@@ -29,10 +30,10 @@ qwen35DescriptorFromDir dir = do
   case config of
     Left err -> pure (Left ("cannot parse " ++ dir ++ "/config.json: " ++ err))
     Right configValue -> do
-      tokenizer <- eitherDecodeFileStrict (dir ++ "/tokenizer_config.json")
+      tokenizer <- readJsonValue (dir ++ "/tokenizer_config.json")
       pure $ do
         textConfig <- textConfigOf configValue
-        qwen35DescriptorFromConfig textConfig (either (const Nothing) Just tokenizer)
+        qwen35DescriptorFromConfig textConfig tokenizer
 
 -- | Build a descriptor from the text-tower config object.
 qwen35DescriptorFromConfig :: Object -> Maybe Value -> Either String Descriptor
@@ -75,6 +76,7 @@ qwen35DescriptorFromConfig tc tokenizer = do
     , dHeadDim = headDim
     , dRotaryDim = rotaryDim
     , dRotaryTheta = theta
+    , dAttnQkNorm = True
     , dAttnOutputGate = outGate
     , dQGateInterleave = outGate
     , dGdnConvDim = convDim
@@ -85,6 +87,10 @@ qwen35DescriptorFromConfig tc tokenizer = do
     , dGdnConvKernel = convKernel
     , dFlaChunkSize = 64
     , dMaxChunk = 128
+    , dMoeNumExperts = 0, dMoeTopK = 0, dMoeIntermediateSize = 0
+    , dMoeRouterScoring = "softmax", dMoeNormTopkProb = False
+    , dMoeNumSharedExperts = 0, dMoeSharedIntermediateSize = 0
+    , dMoeRoutedScalingFactor = 1.0
     , dEosTokens = eosTokens tc tokenizer
     , dLayerMixers = mixers
     , dLayerFfns = replicate numLayers FDense
@@ -171,55 +177,25 @@ textConfigOf value = do
   top <- maybe (Left "config.json must be an object") Right (valueObject value)
   pure $ fromMaybe top (lookupValue top "text_config" >>= valueObject)
 
-valueObject :: Value -> Maybe Object
-valueObject (Object o) = Just o
-valueObject _ = Nothing
-
-lookupValue :: Object -> String -> Maybe Value
-lookupValue obj key = KM.lookup (Key.fromString key) obj
-
-lookupInt :: Object -> String -> Maybe Int
-lookupInt obj key = lookupValue obj key >>= asInt
-
-lookupDouble :: Object -> String -> Maybe Double
-lookupDouble obj key = lookupValue obj key >>= asDouble
-
-lookupText :: Object -> String -> Maybe String
-lookupText obj key = lookupValue obj key >>= asText
-
-lookupBool :: Object -> String -> Maybe Bool
-lookupBool obj key = lookupValue obj key >>= asBool
-
--- | Look up a key inside a nested object value.
+-- | Look up a double inside a nested object value (@rope_parameters@).
 lookupDouble' :: String -> Value -> Maybe Double
 lookupDouble' key value = case valueObject value of
   Just obj -> lookupDouble obj key
   Nothing -> Nothing
 
-lookupText' :: Value -> String -> Maybe String
-lookupText' value key = case valueObject value of
-  Just obj -> lookupText obj key
-  Nothing -> Nothing
-
-asInt :: Value -> Maybe Int
-asInt (Number n) = toBoundedInteger n
-asInt _ = Nothing
-
 asDouble :: Value -> Maybe Double
 asDouble (Number n) = Just (toRealFloat n)
 asDouble _ = Nothing
-
-asText :: Value -> Maybe String
-asText (String t) = Just (T.unpack t)
-asText _ = Nothing
-
-asBool :: Value -> Maybe Bool
-asBool (Bool b) = Just b
-asBool _ = Nothing
 
 asTextArray :: Value -> Maybe [String]
 asTextArray (Array values) = traverse asText (V.toList values)
 asTextArray _ = Nothing
 
-needInt :: Object -> String -> Either String Int
-needInt obj key = maybe (Left ("config.json missing " ++ key)) Right (lookupInt obj key)
+asText :: Value -> Maybe String
+asText (String t) = Just (T.unpack t)
+asText _ = Nothing
+
+lookupText'' :: Object -> String -> Maybe String
+lookupText'' obj key = case lookupValue obj key of
+  Just (String t) -> Just (T.unpack t)
+  _ -> Nothing

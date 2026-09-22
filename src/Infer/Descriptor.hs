@@ -99,6 +99,7 @@ data Descriptor = Descriptor
   , dHeadDim :: !Int
   , dRotaryDim :: !Int
   , dRotaryTheta :: !Double
+  , dAttnQkNorm :: !Bool          -- ^ attention applies per-head q/k RMSNorm
   , dAttnOutputGate :: !Bool      -- ^ q_proj carries a fused output gate
   , dQGateInterleave :: !Bool     -- ^ fused Q+gate rows are interleaved per head
   , dGdnConvDim :: !Int
@@ -109,6 +110,15 @@ data Descriptor = Descriptor
   , dGdnConvKernel :: !Int
   , dFlaChunkSize :: !Int         -- ^ must match the AOT-compiled FLA chunk cubin
   , dMaxChunk :: !Int             -- ^ prefill batch size (<= the kernels' limit)
+  -- Mixture-of-experts feed-forward (used when a layer's ffn kind is moe)
+  , dMoeNumExperts :: !Int        -- ^ routed experts per layer
+  , dMoeTopK :: !Int              -- ^ experts selected per token
+  , dMoeIntermediateSize :: !Int  -- ^ per-expert FFN hidden size
+  , dMoeRouterScoring :: !String  -- ^ "softmax" or "sigmoid"
+  , dMoeNormTopkProb :: !Bool     -- ^ renormalize the selected weights to sum 1
+  , dMoeNumSharedExperts :: !Int  -- ^ always-on experts (0 for Mixtral/Qwen3-MoE)
+  , dMoeSharedIntermediateSize :: !Int
+  , dMoeRoutedScalingFactor :: !Double
   , dEosTokens :: [Int]
   , dLayerMixers :: [MixerKind]
   , dLayerFfns :: [FfnKind]
@@ -137,9 +147,12 @@ descriptorKeys =
   [ "desc_version", "family", "model_type", "num_layers", "hidden_size"
   , "intermediate_size", "vocab_size", "rms_eps", "max_position_embeddings"
   , "max_seq_len", "num_heads", "num_kv_heads", "head_dim", "rotary_dim"
-  , "rotary_theta", "attn_output_gate", "q_gate_interleave", "gdn_conv_dim"
+  , "rotary_theta", "attn_qk_norm", "attn_output_gate", "q_gate_interleave", "gdn_conv_dim"
   , "gdn_value_dim", "gdn_num_v_heads", "gdn_num_k_heads", "gdn_head_dim"
-  , "gdn_conv_kernel", "fla_chunk_size", "max_chunk", "eos_tokens", "layer_mixers"
+  , "gdn_conv_kernel", "fla_chunk_size", "max_chunk", "moe_num_experts", "moe_top_k"
+  , "moe_intermediate_size", "moe_router_scoring", "moe_norm_topk_prob"
+  , "moe_num_shared_experts", "moe_shared_intermediate_size", "moe_routed_scaling_factor"
+  , "eos_tokens", "layer_mixers"
   , "layer_ffns", "role_names", "role_templates"
   ]
 
@@ -161,6 +174,7 @@ encodeDescriptor d = BL.toStrict . encode $ object
   , "head_dim" .= dHeadDim d
   , "rotary_dim" .= dRotaryDim d
   , "rotary_theta" .= dRotaryTheta d
+  , "attn_qk_norm" .= dAttnQkNorm d
   , "attn_output_gate" .= dAttnOutputGate d
   , "q_gate_interleave" .= dQGateInterleave d
   , "gdn_conv_dim" .= dGdnConvDim d
@@ -171,6 +185,14 @@ encodeDescriptor d = BL.toStrict . encode $ object
   , "gdn_conv_kernel" .= dGdnConvKernel d
   , "fla_chunk_size" .= dFlaChunkSize d
   , "max_chunk" .= dMaxChunk d
+  , "moe_num_experts" .= dMoeNumExperts d
+  , "moe_top_k" .= dMoeTopK d
+  , "moe_intermediate_size" .= dMoeIntermediateSize d
+  , "moe_router_scoring" .= dMoeRouterScoring d
+  , "moe_norm_topk_prob" .= dMoeNormTopkProb d
+  , "moe_num_shared_experts" .= dMoeNumSharedExperts d
+  , "moe_shared_intermediate_size" .= dMoeSharedIntermediateSize d
+  , "moe_routed_scaling_factor" .= dMoeRoutedScalingFactor d
   , "eos_tokens" .= dEosTokens d
   , "layer_mixers" .= map mixerName (dLayerMixers d)
   , "layer_ffns" .= map ffnName (dLayerFfns d)
@@ -206,6 +228,7 @@ decodeDescriptor bytes = do
   headDim <- reqInt obj "head_dim"
   rotaryDim <- reqInt obj "rotary_dim"
   theta <- reqDouble obj "rotary_theta"
+  qkNorm <- reqBool obj "attn_qk_norm"
   outGate <- reqBool obj "attn_output_gate"
   qgInterleave <- reqBool obj "q_gate_interleave"
   convDim <- reqInt obj "gdn_conv_dim"
@@ -216,6 +239,14 @@ decodeDescriptor bytes = do
   convKernel <- reqInt obj "gdn_conv_kernel"
   chunkSize <- reqInt obj "fla_chunk_size"
   maxChunk <- reqInt obj "max_chunk"
+  moeExperts <- reqInt obj "moe_num_experts"
+  moeTopK <- reqInt obj "moe_top_k"
+  moeIntermediate <- reqInt obj "moe_intermediate_size"
+  moeScoring <- reqText obj "moe_router_scoring"
+  moeNormTopk <- reqBool obj "moe_norm_topk_prob"
+  moeSharedExperts <- reqInt obj "moe_num_shared_experts"
+  moeSharedIntermediate <- reqInt obj "moe_shared_intermediate_size"
+  moeScaling <- reqDouble obj "moe_routed_scaling_factor"
   eos <- reqIntList obj "eos_tokens"
   mixers <- traverse parseMixer =<< reqTextList obj "layer_mixers"
   ffns <- traverse parseFfn =<< reqTextList obj "layer_ffns"
@@ -227,10 +258,15 @@ decodeDescriptor bytes = do
     , dNumLayers = numLayers, dHiddenSize = hidden, dIntermediateSize = intermediate
     , dVocabSize = vocab, dRmsEps = eps, dMaxPositionEmbeddings = maxPos
     , dMaxSeqLen = maxSeq, dNumHeads = heads, dNumKvHeads = kvHeads, dHeadDim = headDim
-    , dRotaryDim = rotaryDim, dRotaryTheta = theta, dAttnOutputGate = outGate
+    , dRotaryDim = rotaryDim, dRotaryTheta = theta, dAttnQkNorm = qkNorm
+    , dAttnOutputGate = outGate
     , dQGateInterleave = qgInterleave, dGdnConvDim = convDim, dGdnValueDim = valueDim
     , dGdnNumVHeads = vHeads, dGdnNumKHeads = kHeads, dGdnHeadDim = gdnHeadDim
     , dGdnConvKernel = convKernel, dFlaChunkSize = chunkSize, dMaxChunk = maxChunk
+    , dMoeNumExperts = moeExperts, dMoeTopK = moeTopK
+    , dMoeIntermediateSize = moeIntermediate, dMoeRouterScoring = moeScoring
+    , dMoeNormTopkProb = moeNormTopk, dMoeNumSharedExperts = moeSharedExperts
+    , dMoeSharedIntermediateSize = moeSharedIntermediate, dMoeRoutedScalingFactor = moeScaling
     , dEosTokens = eos
     , dLayerMixers = mixers, dLayerFfns = ffns
     , dRoleTemplates = zip roles templates
@@ -332,6 +368,7 @@ checks d =
   , err (any (\t -> t < 0 || t >= dVocabSize d) (dEosTokens d))
         "eos_tokens must be within the vocabulary"
   , gdnCheck d
+  , moeCheck d
   , rolesCheck d
   ]
 
@@ -354,6 +391,22 @@ gdnCheck d
   | dFlaChunkSize d `notElem` [1 .. 128] = Just "fla_chunk_size must be in [1,128]"
   | otherwise = Nothing
 
+moeCheck :: Descriptor -> Maybe String
+moeCheck d
+  | not (FMoe `elem` dLayerFfns d) = Nothing
+  | dMoeNumExperts d <= 0 = Just "moe_num_experts must be positive"
+  | dMoeTopK d < 1 || dMoeTopK d > dMoeNumExperts d =
+      Just "moe_top_k must be in [1, moe_num_experts]"
+  | dMoeIntermediateSize d <= 0 = Just "moe_intermediate_size must be positive"
+  | dMoeRouterScoring d `notElem` ["softmax", "sigmoid"] =
+      Just "moe_router_scoring must be softmax or sigmoid"
+  | dMoeNumSharedExperts d < 0 || dMoeSharedIntermediateSize d < 0 =
+      Just "shared-expert sizes must not be negative"
+  | dMoeNumSharedExperts d > 0 && dMoeSharedIntermediateSize d <= 0 =
+      Just "moe_shared_intermediate_size is required when shared experts are used"
+  | dMoeRoutedScalingFactor d <= 0 = Just "moe_routed_scaling_factor must be positive"
+  | otherwise = Nothing
+
 rolesCheck :: Descriptor -> Maybe String
 rolesCheck d
   | length roles /= length (nub roles) = Just "duplicate role names"
@@ -366,8 +419,14 @@ rolesCheck d
     templates = map snd (dRoleTemplates d)
     hasFull = MFullAttention `elem` dLayerMixers d
     hasGdn = MGatedDeltaNet `elem` dLayerMixers d
-    global = [REmbed, RLmHead, RFinalNorm, RInputNorm, RPostNorm, RMlpGate, RMlpUp, RMlpDown]
-    attn = if hasFull then [RAttnQ, RAttnK, RAttnV, RAttnO] else []
+    hasMoe = FMoe `elem` dLayerFfns d
+    global = [REmbed, RLmHead, RFinalNorm, RInputNorm, RPostNorm]
+            ++ if hasMoe then [RMoeRouter, RMoeExpertGate, RMoeExpertUp, RMoeExpertDown]
+               else [RMlpGate, RMlpUp, RMlpDown]
+    attn
+      | not hasFull = []
+      | dAttnQkNorm d = [RAttnQ, RAttnK, RAttnV, RAttnO, RAttnQNorm, RAttnKNorm]
+      | otherwise = [RAttnQ, RAttnK, RAttnV, RAttnO]
     gdn = if hasGdn
       then [RGdnQkv, RGdnZ, RGdnA, RGdnB, RGdnConv1d, RGdnDtBias, RGdnALog, RGdnOut, RGdnNorm]
       else []

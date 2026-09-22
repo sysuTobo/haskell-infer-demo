@@ -86,6 +86,7 @@ struct ModelDesc {
     int head_dim;
     int rotary_dim;
     double rotary_theta;
+    int attn_qk_norm;           /* attention has per-head q/k RMSNorm */
     int attn_output_gate;
     int q_gate_interleave;
 
@@ -97,6 +98,16 @@ struct ModelDesc {
     int gdn_conv_kernel;
     int fla_chunk_size;
     int max_chunk;              /* prefill batch size the engine chunks to */
+
+    /* Mixture-of-experts feed-forward (used when a layer's ffn kind is moe). */
+    int moe_num_experts;
+    int moe_top_k;
+    int moe_intermediate_size;
+    char moe_router_scoring[16];   /* "softmax" or "sigmoid" */
+    int moe_norm_topk_prob;
+    int moe_num_shared_experts;
+    int moe_shared_intermediate_size;
+    double moe_routed_scaling_factor;
 
     int eos_count;
     int eos_tokens[ENGINE_MAX_EOS];

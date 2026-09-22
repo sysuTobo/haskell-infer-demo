@@ -81,9 +81,11 @@ The native engine is `csrc/build-libs/libengine.so`; Haskell links to this share
 library so rebuilding CUDA does not leave a stale statically linked engine.
 Runtime requires neither Python nor PyTorch.
 
-Architectures: one `libengine.so` carries SASS for `86;89;90a` plus `compute_90`
-PTX, so the same build runs on A40 (sm_86), L20 (sm_89) and H200 (sm_90a); the
-PTX is the forward-compatibility path for newer devices. The Triton AOT cubins of
+Architectures: one `libengine.so` carries SASS for `86;89;90a` plus PTX, so the
+same build runs on A40 (sm_86), L20 (sm_89) and H200 (sm_90a); the PTX is the
+forward-compatibility path for newer devices. Verified at runtime on sm_86
+(A40, full-model tests) and sm_89 (L20, operator suite incl. the FLA cubins);
+sm_90a is compile- and artifact-verified (`cuobjdump`) pending H200 hardware. The Triton AOT cubins of
 the FLA kernels have no PTX equivalent, so they are compiled per architecture
 (`ENGINE_TRITON_ARCHS`, default `86;89;90`) and picked at runtime from the
 device's compute capability -- a device with no matching cubin fails with an

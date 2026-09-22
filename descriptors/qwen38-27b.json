@@ -14,6 +14,7 @@
   "head_dim": 256,
   "rotary_dim": 64,
   "rotary_theta": 10000000.0,
+  "attn_qk_norm": true,
   "attn_output_gate": true,
   "q_gate_interleave": true,
   "gdn_conv_dim": 10240,
@@ -24,6 +25,14 @@
   "gdn_conv_kernel": 4,
   "fla_chunk_size": 64,
   "max_chunk": 128,
+  "moe_num_experts": 0,
+  "moe_top_k": 0,
+  "moe_intermediate_size": 0,
+  "moe_router_scoring": "softmax",
+  "moe_norm_topk_prob": false,
+  "moe_num_shared_experts": 0,
+  "moe_shared_intermediate_size": 0,
+  "moe_routed_scaling_factor": 1.0,
   "eos_tokens": [
     248046,
     248044

@@ -25,6 +25,9 @@ executable haskell-infer-demo
   other-modules:
                       Infer.Config
                       Infer.Descriptor
+                      Infer.Descriptor.Adapter
+                      Infer.Descriptor.Adapter.Json
+                      Infer.Descriptor.Adapter.Mixtral
                       Infer.Descriptor.Adapter.Qwen35
                       Infer.Model
                       Infer.Placement
@@ -63,6 +66,9 @@ test-suite infer-tests
   other-modules:
                       Infer.Config
                       Infer.Descriptor
+                      Infer.Descriptor.Adapter
+                      Infer.Descriptor.Adapter.Json
+                      Infer.Descriptor.Adapter.Mixtral
                       Infer.Descriptor.Adapter.Qwen35
                       Infer.Model
                       Infer.Placement

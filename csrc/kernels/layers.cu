@@ -9,6 +9,20 @@
 #include <stdexcept>
 #include <string>
 
+/* Input/post/q/k norms come in two flavours: Gemma-style (weight + 1) and the
+ * plain RMSNorm that Qwen3-MoE/Mixtral use. The descriptor picks; a family that
+ * has no such norm (e.g. no q/k norm) passes a null weight and skips it. */
+static void layer_norm(__nv_bfloat16 *out, const __nv_bfloat16 *x,
+                       const __nv_bfloat16 *weight, int cols, int rows,
+                       const ModelDims *dims, cudaStream_t stream) {
+    if (weight == nullptr) return;
+    if (dims->norm_style == 1) {
+        kernel_rms_norm_plain(out, x, weight, cols, rows, dims->rms_eps, stream);
+    } else {
+        kernel_gemma_rms_norm(out, x, weight, cols, rows, dims->rms_eps, stream);
+    }
+}
+
 static void check_tokens(int tokens, const ModelDims *dims) {
     const int limit = dims != nullptr && dims->max_chunk > 0 ? dims->max_chunk : ENGINE_MAX_CHUNK;
     if (tokens < 1 || tokens > limit)
@@ -86,8 +100,7 @@ int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
     __nv_bfloat16 *up = gate + TI;
     __nv_bfloat16 *mlp_act = up + TI;
 
-    kernel_gemma_rms_norm(normed, residual, w->post_norm_w,
-                          H, tokens, dims->rms_eps, stream);
+    layer_norm(normed, residual, w->post_norm_w, H, tokens, dims, stream);
     checked_gemm(cublas, gate, normed, w->gate_proj_w, tokens, I, H);
     checked_gemm(cublas, up, normed, w->up_proj_w, tokens, I, H);
     kernel_silu_mul(mlp_act, gate, up, tokens * I, stream);
@@ -120,21 +133,23 @@ int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
     __nv_bfloat16 *attn_out = gate + T * Q;
     __nv_bfloat16 *gated = attn_out + T * Q;
 
-    kernel_gemma_rms_norm(normed, residual, w->input_norm_w,
-                          H, tokens, dims->rms_eps, stream);
-    checked_gemm(cublas, q_raw, normed, w->q_proj_w, tokens, 2 * Q, H);
+    layer_norm(normed, residual, w->input_norm_w, H, tokens, dims, stream);
+    checked_gemm(cublas, q_raw, normed, w->q_proj_w, tokens,
+                 dims->attn_output_gate ? 2 * Q : Q, H);
     checked_gemm(cublas, k_out, normed, w->k_proj_w, tokens, KV, H);
     checked_gemm(cublas, v_out, normed, w->v_proj_w, tokens, KV, H);
 
-    const int total = tokens * Q;
-    deinterleave_qg_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
-        q, gate, q_raw, total, hd);
-    check_launch();
-    kernel_gemma_rms_norm(q, q, w->q_norm_w, hd, tokens * nH, dims->rms_eps, stream);
-    check_launch();
-    kernel_gemma_rms_norm(k_out, k_out, w->k_norm_w, hd, tokens * nKV,
-                          dims->rms_eps, stream);
-    check_launch();
+    if (dims->attn_output_gate) {
+        const int total = tokens * Q;
+        deinterleave_qg_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+            q, gate, q_raw, total, hd);
+        check_launch();
+    } else {
+        /* No fused gate: q_proj already produced [tokens, Q] directly. */
+        check_launch();
+    }
+    layer_norm(q, q, w->q_norm_w, hd, tokens * nH, dims, stream);
+    layer_norm(k_out, k_out, w->k_norm_w, hd, tokens * nKV, dims, stream);
     kernel_flashinfer_rope(q, k_out, positions, tokens, nH, nKV, hd,
                            dims->rotary_dim, dims->rope_theta, stream);
     check_launch();
@@ -146,8 +161,12 @@ int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
     kernel_attention(attn_out, q, kv_cache, seq_start, tokens, seq_len,
                       nH, nKV, hd, 1.0f / sqrtf((float)hd), dims->max_seq_len, stream);
     check_launch();
-    kernel_sigmoid_mul(gated, attn_out, gate, Q, tokens, Q, 0, stream);
-    checked_gemm(cublas, layer_out, gated, w->o_proj_w, tokens, H, Q);
+    if (dims->attn_output_gate) {
+        kernel_sigmoid_mul(gated, attn_out, gate, Q, tokens, Q, 0, stream);
+        checked_gemm(cublas, layer_out, gated, w->o_proj_w, tokens, H, Q);
+    } else {
+        checked_gemm(cublas, layer_out, attn_out, w->o_proj_w, tokens, H, Q);
+    }
     return 0;
 }
 

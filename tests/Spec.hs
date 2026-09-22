@@ -36,6 +36,7 @@ qwen38 = Descriptor
   , dHeadDim = 256
   , dRotaryDim = 64
   , dRotaryTheta = 1e7
+  , dNormStyle = "gemma"
   , dAttnQkNorm = True
   , dAttnOutputGate = True
   , dQGateInterleave = True

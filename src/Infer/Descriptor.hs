@@ -99,6 +99,7 @@ data Descriptor = Descriptor
   , dHeadDim :: !Int
   , dRotaryDim :: !Int
   , dRotaryTheta :: !Double
+  , dNormStyle :: !String         -- ^ "gemma" (weight + 1) or "plain"
   , dAttnQkNorm :: !Bool          -- ^ attention applies per-head q/k RMSNorm
   , dAttnOutputGate :: !Bool      -- ^ q_proj carries a fused output gate
   , dQGateInterleave :: !Bool     -- ^ fused Q+gate rows are interleaved per head
@@ -147,7 +148,8 @@ descriptorKeys =
   [ "desc_version", "family", "model_type", "num_layers", "hidden_size"
   , "intermediate_size", "vocab_size", "rms_eps", "max_position_embeddings"
   , "max_seq_len", "num_heads", "num_kv_heads", "head_dim", "rotary_dim"
-  , "rotary_theta", "attn_qk_norm", "attn_output_gate", "q_gate_interleave", "gdn_conv_dim"
+  , "rotary_theta", "norm_style", "attn_qk_norm", "attn_output_gate"
+  , "q_gate_interleave", "gdn_conv_dim"
   , "gdn_value_dim", "gdn_num_v_heads", "gdn_num_k_heads", "gdn_head_dim"
   , "gdn_conv_kernel", "fla_chunk_size", "max_chunk", "moe_num_experts", "moe_top_k"
   , "moe_intermediate_size", "moe_router_scoring", "moe_norm_topk_prob"
@@ -174,6 +176,7 @@ encodeDescriptor d = BL.toStrict . encode $ object
   , "head_dim" .= dHeadDim d
   , "rotary_dim" .= dRotaryDim d
   , "rotary_theta" .= dRotaryTheta d
+  , "norm_style" .= dNormStyle d
   , "attn_qk_norm" .= dAttnQkNorm d
   , "attn_output_gate" .= dAttnOutputGate d
   , "q_gate_interleave" .= dQGateInterleave d
@@ -228,6 +231,7 @@ decodeDescriptor bytes = do
   headDim <- reqInt obj "head_dim"
   rotaryDim <- reqInt obj "rotary_dim"
   theta <- reqDouble obj "rotary_theta"
+  normStyle <- reqText obj "norm_style"
   qkNorm <- reqBool obj "attn_qk_norm"
   outGate <- reqBool obj "attn_output_gate"
   qgInterleave <- reqBool obj "q_gate_interleave"
@@ -258,7 +262,8 @@ decodeDescriptor bytes = do
     , dNumLayers = numLayers, dHiddenSize = hidden, dIntermediateSize = intermediate
     , dVocabSize = vocab, dRmsEps = eps, dMaxPositionEmbeddings = maxPos
     , dMaxSeqLen = maxSeq, dNumHeads = heads, dNumKvHeads = kvHeads, dHeadDim = headDim
-    , dRotaryDim = rotaryDim, dRotaryTheta = theta, dAttnQkNorm = qkNorm
+    , dRotaryDim = rotaryDim, dRotaryTheta = theta, dNormStyle = normStyle
+    , dAttnQkNorm = qkNorm
     , dAttnOutputGate = outGate
     , dQGateInterleave = qgInterleave, dGdnConvDim = convDim, dGdnValueDim = valueDim
     , dGdnNumVHeads = vHeads, dGdnNumKHeads = kHeads, dGdnHeadDim = gdnHeadDim
@@ -361,6 +366,8 @@ checks d =
   , err (dRotaryDim d < 0 || dRotaryDim d > dHeadDim d || odd (dRotaryDim d))
         "rotary_dim must be even and <= head_dim"
   , err (dRotaryTheta d <= 0) "rotary_theta must be positive"
+  , err (dNormStyle d `notElem` ["gemma", "plain"])
+        "norm_style must be gemma or plain"
   , err (dRmsEps d <= 0) "rms_eps must be positive"
   , err (dMaxChunk d < 1 || dMaxChunk d > 128)
         "max_chunk must be in [1,128] (the kernels' batch limit)"

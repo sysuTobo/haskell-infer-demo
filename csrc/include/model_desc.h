@@ -86,6 +86,7 @@ struct ModelDesc {
     int head_dim;
     int rotary_dim;
     double rotary_theta;
+    char norm_style[16];        /* "gemma" (weight + 1) or "plain" */
     int attn_qk_norm;           /* attention has per-head q/k RMSNorm */
     int attn_output_gate;
     int q_gate_interleave;

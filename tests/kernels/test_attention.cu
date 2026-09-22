@@ -151,6 +151,9 @@ bool test_attention_layer_all_heads(cudaStream_t stream) {
     dims.num_kv_heads = kKvHeads;
     dims.head_dim = kHeadDim;
     dims.rotary_dim = 64;
+    dims.norm_style = 0;          /* Gemma: the Qwen3.8 family norm */
+    dims.attn_output_gate = 1;    /* q_proj carries the fused output gate */
+    dims.q_gate_interleave = 1;
     dims.rope_theta = 1e7f;
     dims.rms_eps = eps;
     dims.max_seq_len = max_seq;

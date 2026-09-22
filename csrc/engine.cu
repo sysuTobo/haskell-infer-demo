@@ -323,6 +323,9 @@ static void fill_dims(ModelDims &dims, const struct ModelDesc &desc) {
     dims.num_kv_heads = desc.num_kv_heads;
     dims.head_dim = desc.head_dim;
     dims.rotary_dim = desc.rotary_dim;
+    dims.norm_style = strcmp(desc.norm_style, "plain") == 0 ? 1 : 0;
+    dims.attn_output_gate = desc.attn_output_gate;
+    dims.q_gate_interleave = desc.q_gate_interleave;
     dims.num_layers = desc.num_layers;
     dims.vocab_size = desc.vocab_size;
     dims.rms_eps = (float)desc.rms_eps;
@@ -393,6 +396,9 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
         eng->ctx = new DeviceCtx[eng->num_devices]();
         eng->layers = new LayerWeights[num_layers]();
         const int max_chunk = eng->dims.max_chunk;
+        bool has_gdn = false;
+        for (int i = 0; i < num_layers; ++i)
+            has_gdn = has_gdn || eng->desc.layer_mixers[i] == ENGINE_MIXER_GDN;
         const size_t activation_bytes = (size_t)max_chunk * hidden * sizeof(__nv_bfloat16);
         for (int d = 0; d < eng->num_devices; ++d) {
             DeviceCtx &ctx = eng->ctx[d];
@@ -408,14 +414,20 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             ctx.ws_size = layer_workspace_size(max_chunk, &eng->dims);
             check_cuda(cudaMalloc(&ctx.workspace, ctx.ws_size), "Allocate layer workspace");
                     ctx.moe_scratch = nullptr;
-            ctx.fla_size = kernel_fla_workspace_size(max_chunk, eng->dims.gdn_num_v_heads);
-            check_cuda(cudaMalloc(&ctx.fla_scratch, ctx.fla_size), "Allocate FLA scratch");
+            if (has_gdn) {
+                ctx.fla_size = kernel_fla_workspace_size(max_chunk, eng->dims.gdn_num_v_heads);
+                check_cuda(cudaMalloc(&ctx.fla_scratch, ctx.fla_size), "Allocate FLA scratch");
+            }
             check_cuda(cudaMalloc(&ctx.positions, max_chunk * sizeof(int64_t)), "Allocate positions");
-            check_cuda(cudaMalloc(&ctx.conv_bias_zero, eng->dims.gdn_conv_dim * sizeof(__nv_bfloat16)),
-                       "Allocate conv bias");
-            check_cuda(cudaMemsetAsync(ctx.conv_bias_zero, 0,
-                                       eng->dims.gdn_conv_dim * sizeof(__nv_bfloat16), ctx.stream),
-                       "Zero conv bias");
+            if (eng->dims.gdn_conv_dim > 0) {
+                check_cuda(cudaMalloc(&ctx.conv_bias_zero,
+                                      eng->dims.gdn_conv_dim * sizeof(__nv_bfloat16)),
+                           "Allocate conv bias");
+                check_cuda(cudaMemsetAsync(ctx.conv_bias_zero, 0,
+                                           eng->dims.gdn_conv_dim * sizeof(__nv_bfloat16),
+                                           ctx.stream),
+                           "Zero conv bias");
+            }
         }
 
         load_role(index, eng->desc, ROLE_EMBED, 0, eng->devices.front(), &eng->embed_w);

@@ -10,6 +10,11 @@ void kernel_gemma_rms_norm(__nv_bfloat16 *out, const __nv_bfloat16 *x,
                            const __nv_bfloat16 *raw_weight, int cols, int rows,
                            float eps, cudaStream_t stream);
 
+// Plain RMSNorm (weight used as-is), the variant Qwen3-MoE/Mixtral use.
+void kernel_rms_norm_plain(__nv_bfloat16 *out, const __nv_bfloat16 *x,
+                           const __nv_bfloat16 *raw_weight, int cols, int rows,
+                           float eps, cudaStream_t stream);
+
 // In-place contiguous Q/K [tokens, heads, head_dim], split-half RoPE; device-local positions.
 void kernel_flashinfer_rope(__nv_bfloat16 *q, __nv_bfloat16 *k,
                             const int64_t *positions, int tokens,

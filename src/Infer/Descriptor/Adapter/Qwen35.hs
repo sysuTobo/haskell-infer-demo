@@ -76,6 +76,7 @@ qwen35DescriptorFromConfig tc tokenizer = do
     , dHeadDim = headDim
     , dRotaryDim = rotaryDim
     , dRotaryTheta = theta
+    , dNormStyle = "gemma"
     , dAttnQkNorm = True
     , dAttnOutputGate = outGate
     , dQGateInterleave = outGate

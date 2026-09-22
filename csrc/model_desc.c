@@ -30,7 +30,8 @@ enum {
     K_DESC_VERSION = 0, K_FAMILY, K_MODEL_TYPE, K_NUM_LAYERS, K_HIDDEN_SIZE,
     K_INTERMEDIATE_SIZE, K_VOCAB_SIZE, K_RMS_EPS, K_MAX_POSITION_EMBEDDINGS,
     K_MAX_SEQ_LEN, K_NUM_HEADS, K_NUM_KV_HEADS, K_HEAD_DIM, K_ROTARY_DIM,
-    K_ROTARY_THETA, K_ATTN_QK_NORM, K_ATTN_OUTPUT_GATE, K_Q_GATE_INTERLEAVE, K_GDN_CONV_DIM,
+    K_ROTARY_THETA, K_NORM_STYLE, K_ATTN_QK_NORM, K_ATTN_OUTPUT_GATE, K_Q_GATE_INTERLEAVE,
+    K_GDN_CONV_DIM,
     K_GDN_VALUE_DIM, K_GDN_NUM_V_HEADS, K_GDN_NUM_K_HEADS, K_GDN_HEAD_DIM,
     K_GDN_CONV_KERNEL, K_FLA_CHUNK_SIZE, K_MAX_CHUNK, K_MOE_NUM_EXPERTS, K_MOE_TOP_K,
     K_MOE_INTERMEDIATE_SIZE, K_MOE_ROUTER_SCORING, K_MOE_NORM_TOPK_PROB,
@@ -59,6 +60,7 @@ static const struct {
     {"head_dim", KV_INT},
     {"rotary_dim", KV_INT},
     {"rotary_theta", KV_DOUBLE},
+    {"norm_style", KV_TEXT},
     {"attn_qk_norm", KV_BOOL},
     {"attn_output_gate", KV_BOOL},
     {"q_gate_interleave", KV_BOOL},
@@ -336,6 +338,12 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
                 return -1;
             }
             break;
+        case K_NORM_STYLE:
+            if (parse_string(&c, out->norm_style, sizeof(out->norm_style)) != 0) {
+                fail(err, err_len, "key %s must be a string", key);
+                return -1;
+            }
+            break;
         case K_MOE_ROUTER_SCORING:
             if (parse_string(&c, out->moe_router_scoring, sizeof(out->moe_router_scoring)) != 0) {
                 fail(err, err_len, "key %s must be a string", key);
@@ -496,6 +504,10 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
     }
     if (d->max_chunk < 1 || d->max_chunk > 128) {
         fail(err, err_len, "max_chunk %d is outside the supported range [1,128]", d->max_chunk);
+        return -1;
+    }
+    if (strcmp(d->norm_style, "gemma") != 0 && strcmp(d->norm_style, "plain") != 0) {
+        fail(err, err_len, "norm_style must be gemma or plain");
         return -1;
     }
     if (d->eos_count <= 0) {
@@ -680,6 +692,7 @@ int model_desc_format(const struct ModelDesc *d, char *buf, int buf_len) {
     if (append(buf, buf_len, &used, "\"head_dim\":%d,", d->head_dim) != 0) return -1;
     if (append(buf, buf_len, &used, "\"rotary_dim\":%d,", d->rotary_dim) != 0) return -1;
     if (append(buf, buf_len, &used, "\"rotary_theta\":%.17g,", d->rotary_theta) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"norm_style\":\"%s\",", d->norm_style) != 0) return -1;
     if (append(buf, buf_len, &used, "\"attn_qk_norm\":%s,", d->attn_qk_norm ? "true" : "false") != 0) return -1;
     if (append(buf, buf_len, &used, "\"attn_output_gate\":%s,", d->attn_output_gate ? "true" : "false") != 0) return -1;
     if (append(buf, buf_len, &used, "\"q_gate_interleave\":%s,", d->q_gate_interleave ? "true" : "false") != 0) return -1;

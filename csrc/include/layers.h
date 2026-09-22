@@ -23,6 +23,9 @@ typedef struct ModelDims {
     int num_kv_heads;
     int head_dim;
     int rotary_dim;
+    int norm_style;           /* 0 = gemma (weight + 1), 1 = plain */
+    int attn_output_gate;     /* q_proj carries a fused output gate */
+    int q_gate_interleave;    /* the fused Q/gate rows are interleaved per head */
     int num_layers;
     int vocab_size;
     float rms_eps;

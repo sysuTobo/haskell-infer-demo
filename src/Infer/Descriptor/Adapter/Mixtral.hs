@@ -72,6 +72,7 @@ moeDenseDescriptorFromConfig cfg tokenizer = do
     , dHeadDim = headDim
     , dRotaryDim = headDim            -- these families rotate every head dim
     , dRotaryTheta = theta
+    , dNormStyle = "plain"    -- Qwen3-MoE and Mixtral use plain RMSNorm
     , dAttnQkNorm = family /= "mixtral"   -- Qwen3-MoE normalizes q/k; Mixtral does not
     , dAttnOutputGate = False
     , dQGateInterleave = False

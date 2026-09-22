@@ -43,6 +43,29 @@ void kernel_gemma_rms_norm(__nv_bfloat16 *out, const __nv_bfloat16 *x,
     check_cuda(cudaGetLastError(), "kernel_gemma_rms_norm launch");
 }
 
+void kernel_rms_norm_plain(__nv_bfloat16 *out, const __nv_bfloat16 *x,
+                           const __nv_bfloat16 *raw_weight, int cols, int rows,
+                           float eps, cudaStream_t stream) {
+    if (rows < 0 || cols <= 0 || !std::isfinite(eps) || eps <= 0.0f) {
+        throw std::runtime_error("kernel_rms_norm_plain: invalid shape or epsilon");
+    }
+    if (rows == 0) return;
+    if (!out || !x || !raw_weight) {
+        throw std::runtime_error("kernel_rms_norm_plain: null buffer");
+    }
+    cudaError_t status;
+    try {
+        status = flashinfer::norm::RMSNorm<__nv_bfloat16>(
+            const_cast<__nv_bfloat16 *>(x), const_cast<__nv_bfloat16 *>(raw_weight),
+            out, rows, cols, /*stride_input=*/cols, /*stride_output=*/cols,
+            eps, /*enable_pdl=*/false, stream);
+    } catch (const std::exception &error) {
+        throw std::runtime_error(std::string("kernel_rms_norm_plain: ") + error.what());
+    }
+    check_cuda(status, "kernel_rms_norm_plain");
+    check_cuda(cudaGetLastError(), "kernel_rms_norm_plain launch");
+}
+
 void kernel_flashinfer_rope(__nv_bfloat16 *q, __nv_bfloat16 *k,
                             const int64_t *positions, int tokens,
                             int q_heads, int kv_heads, int head_dim,

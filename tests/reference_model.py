@@ -5,10 +5,26 @@ from pathlib import Path
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    torch_chunk_gated_delta_rule,
-    torch_recurrent_gated_delta_rule,
-)
+
+
+def model_type_of(model_dir):
+    config = json.loads((Path(model_dir) / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    return text_config.get("model_type", config.get("model_type", ""))
+
+
+def patch_gdn_fallbacks(model):
+    """Qwen3.5's GatedDeltaNet needs the pytorch chunk/recurrent implementations:
+    the fused kernels are optional and absent here, and without the patch the
+    remote-code fallback path is what the engine is compared against."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        torch_chunk_gated_delta_rule,
+        torch_recurrent_gated_delta_rule,
+    )
+    for module in model.modules():
+        if hasattr(module, "chunk_gated_delta_rule"):
+            module.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+            module.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
 
 
 def main():
@@ -18,6 +34,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=10)
     args = parser.parse_args()
     torch.manual_seed(0)
+    family = model_type_of(args.model_dir)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir,
@@ -25,10 +42,12 @@ def main():
         device_map="auto",
         attn_implementation="eager",
     ).eval()
-    for module in model.modules():
-        if hasattr(module, "chunk_gated_delta_rule"):
-            module.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
-            module.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
+    if family.startswith("qwen3_5"):
+        patch_gdn_fallbacks(model)
+    elif family in ("qwen3_moe", "mixtral"):
+        pass  # sparse FFN only: no fused-kernel fallback to patch
+    else:
+        raise SystemExit(f"no reference adapter for model_type {family!r}")
     arrays = {}
     cases = []
     with torch.inference_mode():

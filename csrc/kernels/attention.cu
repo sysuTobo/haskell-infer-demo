@@ -85,6 +85,22 @@ void kernel_kv_cache_write(__nv_bfloat16 *kv_cache,
     check_cuda(cudaGetLastError(), "kernel_kv_cache_write");
 }
 
+namespace {
+
+/* FlashInfer's prefill kernel is templated on the qk and v head dimensions, so
+ * each supported head width needs its own instantiation. */
+template <int QK_DIM, int V_DIM>
+cudaError_t launch_single_prefill(
+    const flashinfer::SinglePrefillParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16> &params,
+    cudaStream_t stream) {
+    using Attention = flashinfer::DefaultAttention<false, false, false, false>;
+    return flashinfer::SinglePrefillWithKVCacheDispatched<
+        QK_DIM, V_DIM, flashinfer::PosEncodingMode::kNone, false,
+        flashinfer::MaskMode::kCausal, Attention>(params, /*tmp=*/nullptr, stream);
+}
+
+}  // namespace
+
 void kernel_attention(__nv_bfloat16 *out, const __nv_bfloat16 *q,
                       const __nv_bfloat16 *kv_cache,
                       int seq_start, int tokens, int seq_len,
@@ -92,10 +108,10 @@ void kernel_attention(__nv_bfloat16 *out, const __nv_bfloat16 *q,
                       float scale, int max_seq_len, cudaStream_t stream) {
     if (tokens < 0 || seq_start < 0 || max_seq_len < seq_start ||
         tokens > max_seq_len - seq_start || seq_len != seq_start + tokens ||
-        head_dim != 256 || num_heads <= 0 || num_kv_heads <= 0 ||
+        (head_dim != 128 && head_dim != 256) || num_heads <= 0 || num_kv_heads <= 0 ||
         num_heads % num_kv_heads != 0 ||
         num_heads > std::numeric_limits<int>::max() / head_dim || !std::isfinite(scale)) {
-        throw std::runtime_error("kernel_attention: expected head_dim=256, valid GQA and seq_len=seq_start+tokens within cache");
+        throw std::runtime_error("kernel_attention: expected head_dim 128 or 256, valid GQA and seq_len=seq_start+tokens within cache");
     }
     if (tokens == 0) return;
     if (!out || !q || !kv_cache) {
@@ -103,7 +119,6 @@ void kernel_attention(__nv_bfloat16 *out, const __nv_bfloat16 *q,
     }
 
     using Params = flashinfer::SinglePrefillParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>;
-    using Attention = flashinfer::DefaultAttention<false, false, false, false>;
     const int kv_stride = num_kv_heads * head_dim;
     Params params(
         const_cast<__nv_bfloat16 *>(q),
@@ -117,10 +132,9 @@ void kernel_attention(__nv_bfloat16 *out, const __nv_bfloat16 *q,
 
     cudaError_t status;
     try {
-        // Prefill also handles single-token GQA6; nullptr disables split-KV workspace.
-        status = flashinfer::SinglePrefillWithKVCacheDispatched<
-            256, 256, flashinfer::PosEncodingMode::kNone, false,
-            flashinfer::MaskMode::kCausal, Attention>(params, /*tmp=*/nullptr, stream);
+        // Prefill also handles single-token GQA; nullptr disables split-KV workspace.
+        status = head_dim == 256 ? launch_single_prefill<256, 256>(params, stream)
+                                 : launch_single_prefill<128, 128>(params, stream);
     } catch (const std::exception &error) {
         throw std::runtime_error(std::string("kernel_attention: ") + error.what());
     }

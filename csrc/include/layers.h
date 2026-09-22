@@ -9,6 +9,8 @@
 #include <cublas_v2.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string>
+#include <vector>
 
 /* Model dimensions (shared across all layers). Filled from the model descriptor;
  * no per-family constants live on the C side. */
@@ -69,6 +71,74 @@ typedef struct {
     const __nv_bfloat16 *input_norm_w;  // [hidden], raw Gemma weight
 } GdnWeights;
 
+/* ------------------------------------------------------------------ */
+/* Layer plan and dispatch                                            */
+/* ------------------------------------------------------------------ */
+
+/* What a layer does: which token mixer and which feed-forward sublayer. Kinds
+ * come from the model descriptor (ENGINE_MIXER_* / ENGINE_FFN_* in
+ * model_desc.h). Adding a kind means one enum value, one kernel file and one row
+ * in the dispatch table in layer_dispatch.cu -- the engine's layer loop does not
+ * change. */
+typedef struct {
+    int mixer;
+    int ffn;
+} LayerPlan;
+
+/* Per-layer weights. The owned/state registries are filled while loading, so the
+ * lifecycle (destroy frees, reset zeroes) needs no per-kind bookkeeping. */
+struct LayerWeights {
+    LayerPlan plan;
+    __nv_bfloat16 *input_norm_w;
+    __nv_bfloat16 *post_norm_w;
+    __nv_bfloat16 *gate_proj_w;
+    __nv_bfloat16 *up_proj_w;
+    __nv_bfloat16 *down_proj_w;
+    __nv_bfloat16 *q_proj_w;
+    __nv_bfloat16 *k_proj_w;
+    __nv_bfloat16 *v_proj_w;
+    __nv_bfloat16 *o_proj_w;
+    __nv_bfloat16 *q_norm_w;
+    __nv_bfloat16 *k_norm_w;
+    __nv_bfloat16 *in_proj_qkv_w;
+    __nv_bfloat16 *in_proj_z_w;
+    __nv_bfloat16 *in_proj_a_w;
+    __nv_bfloat16 *in_proj_b_w;
+    __nv_bfloat16 *conv1d_w;
+    __nv_bfloat16 *dt_bias;
+    __nv_bfloat16 *A_log;
+    __nv_bfloat16 *gdn_out_proj_w;
+    __nv_bfloat16 *gdn_norm_w;
+    float *gdn_norm_f32;
+    __nv_bfloat16 *kv_cache;
+    __nv_bfloat16 *conv_state;
+    float *ssm_state;
+
+    /* Weight/inner-state buffers owned by this layer (freed on destroy). */
+    std::vector<void *> owned;
+    /* Buffers cleared by engine_reset (KV cache / GDN conv and SSM state). */
+    std::vector<std::pair<void *, size_t>> reset_zero;
+};
+
+/* Per-invocation context: device handles, scratch and sequence position. */
+typedef struct {
+    cublasHandle_t cublas;
+    cudaStream_t stream;
+    __nv_bfloat16 *workspace;
+    __nv_bfloat16 *conv_bias_zero;
+    const int64_t *positions;
+    void *fla_scratch;
+    int tokens;
+    int seq_len;              /* sequence length including the current tokens */
+    int layer_index;          /* for diagnostics only */
+    const ModelDims *dims;
+} LayerContext;
+
+/* norm -> mixer -> residual -> norm -> ffn -> residual, dispatched on the plan.
+ * Returns 0 on success or a non-zero kernel error status. */
+int forward_layer(const LayerContext *ctx, const struct LayerWeights *w,
+                  const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out);
+
 /* Bytes for reusable attention/GDN/MLP workspace; excludes FLA scratch and
  * the independent residual/layer_out buffers. tokens must be in [1, 128]. */
 size_t layer_workspace_size(int tokens, const ModelDims *dims);
@@ -103,8 +173,6 @@ int gemm_bf16_f32out(cublasHandle_t handle, float *out,
                      int M, int N, int K);
 
 /* Safetensors loader declarations */
-#include <string>
-#include <vector>
 #include <map>
 
 struct TensorInfo {

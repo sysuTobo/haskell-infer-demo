@@ -32,6 +32,7 @@ Haskell (GHC 9.6)
          ▼
 C/CUDA (sm_86, CUDA 12.9)
 ├── model_desc.c     Strict parser for the descriptor (no family knowledge)
+├── layer_dispatch.cu  Per-layer norm -> mixer -> ffn sequence, kind dispatch
 ├── engine.cu        Multi-GPU forward, bounded chunked prefill
 ├── triton/          FLA-derived chunk kernels and upstream FLA decode AOT
 └── kernels/

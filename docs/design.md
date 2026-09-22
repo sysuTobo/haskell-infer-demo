@@ -136,6 +136,20 @@ State S is [48, 128, 128] F32 = 3 MiB per layer, 147 MiB total.
 tokens but guarantees correctness and code reuse. Chunked prefill is a
 future optimization.
 
+### Layer kinds
+
+A layer is `norm -> mixer -> residual -> norm -> ffn -> residual`. The mixer
+(`full_attn`, `gdn`, later `mla`) and the feed-forward kind (`dense`, later `moe`)
+come from the descriptor and select a row in the dispatch tables in
+`csrc/layer_dispatch.cu`. The engine's layer loop calls `forward_layer` and knows
+nothing about kinds, so a new kind is a descriptor field plus a kernel file plus
+a table row -- not a change to the loop.
+
+Buffers are registered while loading (`LayerWeights::owned` for allocation,
+`reset_zero` for per-sequence state), which makes `engine_destroy` and
+`engine_reset` kind-agnostic; the hand-written free list they replaced would not
+have survived per-expert weights.
+
 ### Weight loading
 
 Safetensors format: 8-byte LE header length → JSON header → raw BF16 data.

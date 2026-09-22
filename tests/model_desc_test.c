@@ -265,6 +265,25 @@ static void test_errors(void) {
     set_literal(buf, "\"eos_tokens\":[7,9]", "\"eos_tokens\":[7,999]");
     test_rejects(buf, "outside the vocabulary", "out-of-vocab EOS is rejected");
 
+    /* Fused GDN projections: replacing the four separate roles with qkvz+ba
+     * describes the same layer, so the descriptor must still validate. */
+    snprintf(buf, sizeof(buf), "%s", kGoodDesc);
+    set_literal(buf, "\"gdnQkv\",\"gdnZ\",\"gdnA\",\"gdnB\",", "\"gdnQkvz\",\"gdnBa\",");
+    set_literal(buf, "\"gq.w\",\"gz.w\",\"ga.w\",\"gb.w\",", "\"gqz.w\",\"gba.w\",");
+    {
+        struct ModelDesc fused;
+        char err_fused[256] = {0};
+        int rc = model_desc_parse(buf, &fused, err_fused, sizeof(err_fused));
+        check(rc == 0, err_fused[0] ? err_fused : "fused GDN roles are rejected");
+        check(model_desc_role_index(&fused, ROLE_GDN_QKVZ) >= 0, "fused qkvz role present");
+    }
+
+    /* Neither layout complete: the layer has no usable projections. */
+    snprintf(buf, sizeof(buf), "%s", kGoodDesc);
+    set_literal(buf, "\"gdnQkv\",\"gdnZ\",\"gdnA\",\"gdnB\",", "\"gdnQkv\",");
+    set_literal(buf, "\"gq.w\",\"gz.w\",\"ga.w\",\"gb.w\",", "\"gq.w\",");
+    test_rejects(buf, "qkv/z/a/b or the fused", "incomplete GDN projections are rejected");
+
     /* Gate enabled without a shared-expert gate template. */
     snprintf(buf, sizeof(buf), "%s", kMoeDesc);
     set_literal(buf, "\"moe_shared_gate_scalar\":false", "\"moe_shared_gate_scalar\":true");

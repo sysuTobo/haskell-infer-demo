@@ -180,10 +180,12 @@ def main():
         "USE_GATE_IN_KERNEL": False, "HAS_DT_BIAS": False,
         "APPLY_BETA_SIGMOID": False, "ALLOW_NEG_EIGVAL": False,
     }
-    # The recurrent kernel is compiled per (q/k heads, v heads): Qwen3.5 uses
-    # 16/48, Qwen3-Next 16/32.
+    # The recurrent kernel indexes q/k by `i_h = i_hv // (HV // H)`, so H must be
+    # the number of q/k rows the caller feeds per token: the layer's prepare stage
+    # (like the reference) repeats them per value head, i.e. H == HV. Only the
+    # 16/48 entry keeps FLA's other (unexpanded) convention, for the kernel test.
     for name, heads, value_heads in (("recurrent16", 16, 48), ("recurrent48", 48, 48),
-                                     ("recurrent32", 16, 32)):
+                                     ("recurrent32", 32, 32)):
         constants["H"] = heads
         constants["HV"] = value_heads
         h, cc = emit(name, fn, signature, constants, ("16", str(value_heads), "1"), 1, 3, arches)

@@ -50,9 +50,10 @@ static int run_mixer(const LayerContext *ctx, const struct LayerWeights *w,
         gw.out_proj_w = w->gdn_out_proj_w;
         gw.gdn_norm_w = w->gdn_norm_f32;
         gw.input_norm_w = w->input_norm_w;
+        const GdnTapSites sites{ctx->taps, ctx->layer_index, ctx->device};
         return forward_gdn_layer(ctx->cublas, ctx->stream, residual, ctx->workspace,
                                  layer_out, &gw, w->conv_state, w->ssm_state,
-                                 ctx->fla_scratch, ctx->tokens, ctx->dims);
+                                 ctx->fla_scratch, ctx->tokens, ctx->dims, &sites);
     }
     default:
         throw std::runtime_error("unsupported mixer kind " + std::to_string(w->plan.mixer));

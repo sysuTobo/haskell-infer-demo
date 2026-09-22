@@ -227,9 +227,8 @@ static size_t ssm_state_bytes(const EngineHandle *eng) {
 }
 
 /* Load a tensor by role: expand the template, validate the shape, upload. */
-static void load_role(const std::map<std::string, TensorInfo> &index,
-                      const struct ModelDesc &desc, int role, int layer,
-                      int device, __nv_bfloat16 **dst) {
+static const TensorInfo &find_role(const std::map<std::string, TensorInfo> &index,
+                                   const struct ModelDesc &desc, int role, int layer) {
     int slot = model_desc_role_index(&desc, role);
     if (slot < 0)
         throw EngineError(ENGINE_ERR_WEIGHTS,
@@ -250,6 +249,13 @@ static void load_role(const std::map<std::string, TensorInfo> &index,
         throw EngineError(ENGINE_ERR_WEIGHTS,
                           std::string("Unexpected shape for ") + name + " (" +
                               std::to_string(ti.ndim) + " dims)");
+    return ti;
+}
+
+static void load_role(const std::map<std::string, TensorInfo> &index,
+                      const struct ModelDesc &desc, int role, int layer,
+                      int device, __nv_bfloat16 **dst) {
+    const TensorInfo &ti = find_role(index, desc, role, layer);
     long long elements = 1;
     for (int i = 0; i < ti.ndim; ++i) elements *= ti.shape[i];
     const size_t bytes = (size_t)elements * sizeof(__nv_bfloat16);
@@ -258,9 +264,62 @@ static void load_role(const std::map<std::string, TensorInfo> &index,
     int status = safetensors_load_tensor(ti, *dst, device);
     check_cuda(cudaGetLastError(), "Upload weight");
     if (status != 0)
-        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + name);
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + ti.name);
     // The loader uploads on the default stream; compute streams are nonblocking.
     check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
+}
+
+/* Load a role's rows gathered into the order `order` names (see the fused GDN
+ * layout below). The destination holds exactly order.size() rows. */
+static void load_role_rows(const std::map<std::string, TensorInfo> &index,
+                           const struct ModelDesc &desc, int role, int layer, int device,
+                           const std::vector<int> &order, __nv_bfloat16 **dst) {
+    const TensorInfo &ti = find_role(index, desc, role, layer);
+    const long long row_bytes = (long long)ti.shape[ti.ndim - 1] * sizeof(__nv_bfloat16);
+    const long long rows = (long long)order.size();
+    check_cuda(cudaSetDevice(device), "Set weight device");
+    check_cuda(cudaMalloc(dst, (size_t)(rows * row_bytes)), "Allocate weight");
+    int status = safetensors_load_tensor_rows(ti, *dst, device, order.data(), rows, row_bytes);
+    check_cuda(cudaGetLastError(), "Upload weight");
+    if (status != 0)
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + ti.name);
+    check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
+}
+
+/* Row orders that turn a fused qkvz/ba checkpoint into the views the kernels
+ * want. The reference derives its q/k/v/z from the fused rows with
+ * `fix_query_key_value_ordering`: each key head owns a [q, k, v, z] block, with
+ * the block's v/z split over its `repeat = num_v_heads / num_k_heads` value
+ * heads, and in_proj_ba holds [b, a] pairs per key head. The kernels want plain
+ * [q | k | v] plus [z] (and b/a) blocks in value-head order, so the rows are
+ * gathered while loading. */
+static void fused_gdn_row_orders(const ModelDims &dims, std::vector<int> &qkv_order,
+                                 std::vector<int> &z_order, std::vector<int> &b_order,
+                                 std::vector<int> &a_order) {
+    const int key_heads = dims.gdn_num_k_heads;
+    const int repeat = dims.gdn_num_v_heads / key_heads;
+    const int head_dim = dims.gdn_head_dim;
+    const int group = 2 * head_dim + 2 * repeat * head_dim;
+    qkv_order.clear();
+    z_order.clear();
+    b_order.clear();
+    a_order.clear();
+    for (int head = 0; head < key_heads; ++head)
+        for (int d = 0; d < head_dim; ++d)
+            qkv_order.push_back(head * group + d);                                    // all q
+    for (int head = 0; head < key_heads; ++head)
+        for (int d = 0; d < head_dim; ++d)
+            qkv_order.push_back(head * group + head_dim + d);                         // all k
+    for (int head = 0; head < key_heads; ++head)
+        for (int d = 0; d < repeat * head_dim; ++d)
+            qkv_order.push_back(head * group + 2 * head_dim + d);                     // all v
+    for (int head = 0; head < key_heads; ++head) {
+        const int base = head * group;
+        for (int d = 0; d < repeat * head_dim; ++d)
+            z_order.push_back(base + 2 * head_dim + repeat * head_dim + d);            // z
+        for (int r = 0; r < repeat; ++r) b_order.push_back(head * 2 * repeat + r);
+        for (int r = 0; r < repeat; ++r) a_order.push_back(head * 2 * repeat + repeat + r);
+    }
 }
 
 /* Load one expert's tensor straight into its slot of a fused [E, ...] buffer. */
@@ -538,21 +597,24 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                     ctx.moe_ws_size = bytes;
                 }
             }
-            /* A fused qkvz/ba checkpoint fills the same views: rows are
-             * contiguous, so qkv = base and z = base + conv_dim rows, and
-             * "ba" stores b first (matching the reference's chunk order). */
+            /* A fused qkvz/ba checkpoint stores the reference's own row grouping,
+             * so its rows are gathered into the kernels' contiguous views. */
             const int qkvz_slot = model_desc_role_index(&eng->desc, ROLE_GDN_QKVZ);
             if (qkvz_slot >= 0 && lw.plan.mixer == ENGINE_MIXER_GDN) {
-                __nv_bfloat16 *fused = nullptr;
-                load_role(index, eng->desc, ROLE_GDN_QKVZ, i, ctx.device_id, &fused);
-                lw.in_proj_qkv_w = fused;
-                lw.in_proj_z_w = fused + (size_t)eng->dims.gdn_conv_dim * hidden;
-                lw.owned.push_back(fused);
-                __nv_bfloat16 *ba = nullptr;
-                load_role(index, eng->desc, ROLE_GDN_BA, i, ctx.device_id, &ba);
-                lw.in_proj_b_w = ba;
-                lw.in_proj_a_w = ba + (size_t)eng->dims.gdn_num_v_heads * hidden;
-                lw.owned.push_back(ba);
+                std::vector<int> qkv_order, z_order, b_order, a_order;
+                fused_gdn_row_orders(eng->dims, qkv_order, z_order, b_order, a_order);
+                load_role_rows(index, eng->desc, ROLE_GDN_QKVZ, i, ctx.device_id, qkv_order,
+                               &lw.in_proj_qkv_w);
+                load_role_rows(index, eng->desc, ROLE_GDN_QKVZ, i, ctx.device_id, z_order,
+                               &lw.in_proj_z_w);
+                load_role_rows(index, eng->desc, ROLE_GDN_BA, i, ctx.device_id, b_order,
+                               &lw.in_proj_b_w);
+                load_role_rows(index, eng->desc, ROLE_GDN_BA, i, ctx.device_id, a_order,
+                               &lw.in_proj_a_w);
+                lw.owned.push_back(lw.in_proj_qkv_w);
+                lw.owned.push_back(lw.in_proj_z_w);
+                lw.owned.push_back(lw.in_proj_b_w);
+                lw.owned.push_back(lw.in_proj_a_w);
             }
             if (lw.plan.mixer == ENGINE_MIXER_FULL_ATTN) {
                 check_cuda(cudaMalloc(&lw.kv_cache, kv_cache_bytes(eng)), "Allocate KV cache");

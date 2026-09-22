@@ -171,6 +171,42 @@ int safetensors_load_tensor(const TensorInfo &ti, void *dst, int device) {
 }
 
 /**
+ * Load a tensor whose rows the caller wants in a different order: row i of [dst]
+ * comes from row order[i] of the file. Fused checkpoints store their rows in the
+ * reference implementation's own grouping (see the fused qkvz/ba roles in
+ * engine.cu), and this keeps the gather off the forward path.
+ */
+int safetensors_load_tensor_rows(const TensorInfo &ti, void *dst, int device,
+                                 const int *order, long long rows, long long row_bytes) {
+    long long size = ti.data_end - ti.data_start;
+    long long file_offset = ti.file_data_offset + ti.data_start;
+    // [rows] is how many rows the caller keeps, which may be a subset of the
+    // tensor's own row count (e.g. qkv out of a fused qkvz).
+    if (rows <= 0 || row_bytes <= 0 || rows * row_bytes > size) return -3;
+    const long long source_rows = size / row_bytes;
+
+    std::vector<char> host_buf(size);
+    FILE *f = fopen(ti.file_path.c_str(), "rb");
+    if (!f) return -1;
+    fseek(f, file_offset, SEEK_SET);
+    size_t read = fread(host_buf.data(), 1, size, f);
+    fclose(f);
+    if ((long long)read != size) return -2;
+
+    std::vector<char> gathered(rows * row_bytes);
+    for (long long row = 0; row < rows; ++row) {
+        long long source = order[row];
+        if (source < 0 || source >= source_rows) return -4;
+        memcpy(gathered.data() + row * row_bytes, host_buf.data() + source * row_bytes,
+               (size_t)row_bytes);
+    }
+
+    cudaSetDevice(device);
+    cudaMemcpy(dst, gathered.data(), rows * row_bytes, cudaMemcpyHostToDevice);
+    return 0;
+}
+
+/**
  * Scan model directory for all safetensors files and build a tensor index.
  */
 int safetensors_scan_dir(const char *model_dir, std::map<std::string, TensorInfo> &index) {

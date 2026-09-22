@@ -33,14 +33,27 @@ void tap_parse_env(TapConfig *taps) {
     fprintf(stderr, "[tap] dumping %zu layer(s) to %s\n", taps->layers.size(), taps->dir.c_str());
 }
 
-void tap_dump(const TapConfig *taps, const char *kind, int layer, int device,
-              const __nv_bfloat16 *data, int tokens, const ModelDims *dims) {
-    if (taps == nullptr || taps->dir.empty()) return;
-    if (std::find(taps->layers.begin(), taps->layers.end(), layer) == taps->layers.end())
-        return;
-    const size_t elements = (size_t)tokens * dims->hidden_size;
+static bool tap_wanted(const TapConfig *taps, int layer) {
+    return taps != nullptr && !taps->dir.empty() &&
+           std::find(taps->layers.begin(), taps->layers.end(), layer) != taps->layers.end();
+}
+
+void tap_dump_rows(const TapConfig *taps, const char *kind, int layer, int device,
+                   cudaStream_t stream, const __nv_bfloat16 *data, int tokens, int cols) {
+    if (!tap_wanted(taps, layer)) return;
+    const size_t elements = (size_t)tokens * cols;
     std::vector<__nv_bfloat16> staged(elements);
     cudaSetDevice(device);
+    /* Compute streams are nonblocking, so a tap inside a sub-layer must wait for
+     * the kernels that produced it; the caller passes the producing stream. */
+    if (stream != nullptr) {
+        cudaError_t sync = cudaStreamSynchronize(stream);
+        if (sync != cudaSuccess) {
+            fprintf(stderr, "[tap] %s layer %d stream sync failed: %s\n", kind, layer,
+                    cudaGetErrorString(sync));
+            return;
+        }
+    }
     cudaError_t status = cudaMemcpy(staged.data(), data, elements * sizeof(__nv_bfloat16),
                                     cudaMemcpyDeviceToHost);
     if (status != cudaSuccess) {
@@ -60,4 +73,9 @@ void tap_dump(const TapConfig *taps, const char *kind, int layer, int device,
     for (size_t i = 0; i < elements; ++i) expanded[i] = __bfloat162float(staged[i]);
     fwrite(expanded.data(), sizeof(float), elements, file);
     fclose(file);
+}
+
+void tap_dump(const TapConfig *taps, const char *kind, int layer, int device,
+              const __nv_bfloat16 *data, int tokens, const ModelDims *dims) {
+    tap_dump_rows(taps, kind, layer, device, nullptr, data, tokens, dims->hidden_size);
 }

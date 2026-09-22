@@ -143,6 +143,19 @@ struct TapConfig {
 void tap_parse_env(TapConfig *taps);
 void tap_dump(const TapConfig *taps, const char *kind, int layer, int device,
               const __nv_bfloat16 *data, int tokens, const ModelDims *dims);
+/* Row width is explicit (GDN stages are wider than the hidden size) and the
+ * producer's stream is synchronized first, so a tap inside a sub-layer cannot
+ * race the kernels that wrote it (compute streams are nonblocking). */
+void tap_dump_rows(const TapConfig *taps, const char *kind, int layer, int device,
+                   cudaStream_t stream, const __nv_bfloat16 *data, int tokens, int cols);
+
+/* Where a GDN sub-layer's stage taps belong: the layer index and device are only
+ * known to forward_gdn_layer's caller. */
+struct GdnTapSites {
+    const TapConfig *config;
+    int layer;
+    int device;
+};
 
 /* Per-invocation context: device handles, scratch and sequence position. */
 typedef struct {
@@ -206,7 +219,8 @@ int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
 int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
     const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
     const GdnWeights *w, __nv_bfloat16 *conv_state,
-    float *ssm_state, void *fla_scratch, int tokens, const ModelDims *dims);
+    float *ssm_state, void *fla_scratch, int tokens, const ModelDims *dims,
+    const GdnTapSites *taps = nullptr);
 
 int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
     const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
@@ -236,5 +250,10 @@ struct TensorInfo {
 
 int safetensors_scan_dir(const char *model_dir, std::map<std::string, TensorInfo> &index);
 int safetensors_load_tensor(const TensorInfo &ti, void *dst, int device);
+/* Row-permuting variant: row i of [dst] receives row order[i] of the tensor.
+ * Fused checkpoints store rows in the reference's own grouping, so the engine
+ * gathers them into the contiguous views its kernels expect. */
+int safetensors_load_tensor_rows(const TensorInfo &ti, void *dst, int device,
+                                 const int *order, long long rows, long long row_bytes);
 
 #endif /* HASKELL_INFER_LAYERS_H */

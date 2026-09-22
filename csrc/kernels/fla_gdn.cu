@@ -43,7 +43,8 @@ void kernel_fla_gdn(__nv_bfloat16 *out, const __nv_bfloat16 *qkv,
                     const __nv_bfloat16 *a, const __nv_bfloat16 *b,
                     const __nv_bfloat16 *A_log, const __nv_bfloat16 *dt_bias,
                     float *state, void *workspace, int tokens,
-                    int key_heads, int value_heads, cudaStream_t stream) {
+                    int key_heads, int value_heads, cudaStream_t stream,
+                    const GdnTapSites *taps) {
     kernel_fla_workspace_size(tokens, value_heads);
     if (key_heads != 16)
         throw std::invalid_argument("FLA requires 16 key heads");
@@ -65,6 +66,16 @@ void kernel_fla_gdn(__nv_bfloat16 *out, const __nv_bfloat16 *qkv,
 
     aot_prepare(stream, qkv, b, a, dt_bias, A_log, q, k, v, g, beta,
                 key_heads, value_heads, (2 * key_heads + value_heads) * 128, tokens);
+    // The prepared (L2-normalized, head-expanded) q/k/v, one row per (token, head).
+    if (taps != nullptr) {
+        const int head_dim = 128;
+        tap_dump_rows(taps->config, "gdn_q", taps->layer, taps->device, stream, q, tokens,
+                      value_heads * head_dim);
+        tap_dump_rows(taps->config, "gdn_k", taps->layer, taps->device, stream, k, tokens,
+                      value_heads * head_dim);
+        tap_dump_rows(taps->config, "gdn_v", taps->layer, taps->device, stream, v, tokens,
+                      value_heads * head_dim);
+    }
     if (tokens == 1) {
         /* The recurrent kernel is AOT-compiled per value-head count; 48 is
          * Qwen3.5's GDN layout and 32 is Qwen3-Next's. */

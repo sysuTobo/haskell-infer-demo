@@ -173,7 +173,8 @@ int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
 int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
     const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
     const GdnWeights *w, __nv_bfloat16 *conv_state,
-    float *ssm_state, void *fla_scratch, int tokens, const ModelDims *dims) {
+    float *ssm_state, void *fla_scratch, int tokens, const ModelDims *dims,
+    const GdnTapSites *taps) {
     check_tokens(tokens, dims);
     bind_stream(cublas, stream);
     const int H = dims->hidden_size;
@@ -193,12 +194,22 @@ int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
     __nv_bfloat16 *delta_out = conv_out + T * C;
     __nv_bfloat16 *norm_delta = delta_out + T * V;
 
+    // Stage taps, compared against tests/synth/taps.py `stages`.
+    auto tap = [&](const char *kind, const __nv_bfloat16 *data, int cols) {
+        if (taps != nullptr)
+            tap_dump_rows(taps->config, kind, taps->layer, taps->device, stream, data, tokens, cols);
+    };
+
     kernel_gemma_rms_norm(normed, residual, w->input_norm_w,
                           H, tokens, dims->rms_eps, stream);
+    tap("gdn_in", normed, H);
     checked_gemm(cublas, qkv, normed, w->in_proj_qkv_w, tokens, C, H);
     checked_gemm(cublas, z, normed, w->in_proj_z_w, tokens, V, H);
     checked_gemm(cublas, a, normed, w->in_proj_a_w, tokens, nVH, H);
     checked_gemm(cublas, b, normed, w->in_proj_b_w, tokens, nVH, H);
+    tap("gdn_z", z, V);
+    tap("gdn_a", a, nVH);
+    tap("gdn_b", b, nVH);
 
     kernel_causal_conv1d(conv_out, qkv, w->conv1d_w, w->conv1d_bias,
                          conv_state, C, tokens, dims->gdn_conv_kernel, stream);
@@ -206,11 +217,14 @@ int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
     // Convolution returns unfused BF16; preserve its rounding before SiLU.
     silu_inplace_kernel<<<(tokens * C + 255) / 256, 256, 0, stream>>>(conv_out, tokens * C);
     check_launch();
+    tap("gdn_conv", conv_out, C);
     kernel_fla_gdn(delta_out, conv_out, a, b, w->A_log, w->dt_bias,
-                    ssm_state, fla_scratch, tokens, nKH, nVH, stream);
+                    ssm_state, fla_scratch, tokens, nKH, nVH, stream, taps);
     check_launch();
+    tap("gdn_delta", delta_out, V);
     kernel_gdn_gated_norm(norm_delta, delta_out, z, w->gdn_norm_w,
                           hd, tokens * nVH, dims->rms_eps, stream);
+    tap("gdn_gated", norm_delta, V);
     checked_gemm(cublas, layer_out, norm_delta, w->out_proj_w, tokens, H, V);
     return 0;
 }

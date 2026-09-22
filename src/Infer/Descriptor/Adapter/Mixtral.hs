@@ -1,7 +1,9 @@
--- | Family adapter for dense-attention + MoE feed-forward models: the Mixtral
--- class (`mixtral`) and Qwen3-MoE (`qwen3_moe`). Both are GQA attention blocks
--- followed by a sparse mixture-of-experts FFN, so they differ only in field
--- names and weight templates -- which is exactly what this module holds.
+-- | Family adapter for the dense-attention line: Qwen3 (`qwen3`), Mixtral
+-- (`mixtral`) and Qwen3-MoE (`qwen3_moe`). They share the GQA attention block and
+-- differ in whether the feed-forward is dense or a sparse mixture of experts, in
+-- field names and in weight templates -- which is exactly what this module holds.
+-- Qwen3-MoE detects its sparse layers from @num_experts@; a config without it
+-- gets ordinary MLP layers.
 --
 -- Note on @norm_topk_prob@: Mixtral's checkpoints predate the flag. The value is
 -- taken from the config when present and otherwise left false here; the MoE
@@ -49,13 +51,18 @@ moeDenseDescriptorFromConfig cfg tokenizer = do
       -- `moe_intermediate_size` and keeps `intermediate_size` for dense layers.
       expertIntermediate = fromMaybe intermediate (lookupInt cfg "moe_intermediate_size")
       numExperts = fromMaybe 0 (lookupInt cfg "num_local_experts" `orElse` lookupInt cfg "num_experts")
+      tied = fromMaybe False (lookupBool cfg "tie_word_embeddings")
+      hasMoe = numExperts > 0
       topK = fromMaybe 2 (lookupInt cfg "num_experts_per_tok")
       sparseStep = max 1 (fromMaybe 1 (lookupInt cfg "decoder_sparse_step"))
       denseLayers = fromMaybe [] (lookupIntList cfg "mlp_only_layers")
       eps = fromMaybe 1e-5 (lookupDouble cfg "rms_norm_eps")
       maxPos = fromMaybe 4096 (lookupInt cfg "max_position_embeddings")
       theta = fromMaybe 1e6 (lookupDouble cfg "rope_theta")
-      ffnFor i = if i `elem` denseLayers || (i + 1) `mod` sparseStep /= 0 then FDense else FMoe
+      ffnFor i
+        | not hasMoe = FDense
+        | i `elem` denseLayers || (i + 1) `mod` sparseStep /= 0 = FDense
+        | otherwise = FMoe
   pure Descriptor
     { dVersion = descVersion
     , dFamily = family
@@ -92,22 +99,26 @@ moeDenseDescriptorFromConfig cfg tokenizer = do
     , dMoeNumSharedExperts = 0
     , dMoeSharedIntermediateSize = 0
     , dMoeRoutedScalingFactor = 1.0
+    , dMoeSharedGateScalar = False
     , dEosTokens = eosTokens cfg tokenizer
     , dLayerMixers = replicate numLayers MFullAttention
     , dLayerFfns = map ffnFor [0 .. numLayers - 1]
-    , dRoleTemplates = weightRoles family
+    , dRoleTemplates = weightRoles family hasMoe tied
     }
   where
     orElse (Just x) _ = Just x
     orElse Nothing y = y
 
--- | Shared-expert and GDN roles are absent for these families.
-weightRoles :: String -> [(Role, String)]
-weightRoles family = common ++ attn ++ router ++ experts
+-- | Shared-expert and GDN roles are absent for these families; the feed-forward
+-- roles depend on whether the layers are sparse, and a tied checkpoint points
+-- lm_head at the embedding tensor (the descriptor carries the name, so the engine
+-- needs no tie logic).
+weightRoles :: String -> Bool -> Bool -> [(Role, String)]
+weightRoles family hasMoe tied = common ++ attn ++ ffn
   where
     common =
       [ (REmbed, "model.embed_tokens.weight")
-      , (RLmHead, "lm_head.weight")
+      , (RLmHead, if tied then "model.embed_tokens.weight" else "lm_head.weight")
       , (RFinalNorm, "model.norm.weight")
       , (RInputNorm, layer "input_layernorm.weight")
       , (RPostNorm, layer "post_attention_layernorm.weight")
@@ -127,6 +138,13 @@ weightRoles family = common ++ attn ++ router ++ experts
     -- Mixtral keeps the block under `block_sparse_moe` and names the three
     -- projections w1/w3 (gate/up) and w2 (down); Qwen3-MoE uses `mlp.gate`
     -- with per-expert `gate_proj`/`up_proj`/`down_proj`.
+    ffn
+      | not hasMoe =
+          [ (RMlpGate, layer "mlp.gate_proj.weight")
+          , (RMlpUp, layer "mlp.up_proj.weight")
+          , (RMlpDown, layer "mlp.down_proj.weight")
+          ]
+      | otherwise = router ++ experts
     (router, experts)
       | family == "mixtral" =
           ( [(RMoeRouter, layer "block_sparse_moe.gate.weight")]

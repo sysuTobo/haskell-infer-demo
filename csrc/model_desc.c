@@ -36,6 +36,7 @@ enum {
     K_GDN_CONV_KERNEL, K_FLA_CHUNK_SIZE, K_MAX_CHUNK, K_MOE_NUM_EXPERTS, K_MOE_TOP_K,
     K_MOE_INTERMEDIATE_SIZE, K_MOE_ROUTER_SCORING, K_MOE_NORM_TOPK_PROB,
     K_MOE_NUM_SHARED_EXPERTS, K_MOE_SHARED_INTERMEDIATE_SIZE, K_MOE_ROUTED_SCALING_FACTOR,
+    K_MOE_SHARED_GATE_SCALAR,
     K_EOS_TOKENS, K_LAYER_MIXERS,
     K_LAYER_FFNS, K_ROLE_NAMES, K_ROLE_TEMPLATES,
     K_COUNT
@@ -80,6 +81,7 @@ static const struct {
     {"moe_num_shared_experts", KV_INT},
     {"moe_shared_intermediate_size", KV_INT},
     {"moe_routed_scaling_factor", KV_DOUBLE},
+    {"moe_shared_gate_scalar", KV_BOOL},
     {"eos_tokens", KV_INT_ARRAY},
     {"layer_mixers", KV_TEXT_ARRAY},
     {"layer_ffns", KV_TEXT_ARRAY},
@@ -332,7 +334,7 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
             }
             break;
         case K_ATTN_QK_NORM: case K_ATTN_OUTPUT_GATE: case K_Q_GATE_INTERLEAVE:
-        case K_MOE_NORM_TOPK_PROB:
+        case K_MOE_NORM_TOPK_PROB: case K_MOE_SHARED_GATE_SCALAR:
             if (parse_bool(&c, &boolean) != 0) {
                 fail(err, err_len, "key %s must be a boolean", key);
                 return -1;
@@ -421,6 +423,7 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         case K_MOE_NUM_SHARED_EXPERTS: out->moe_num_shared_experts = (int)number; break;
         case K_MOE_SHARED_INTERMEDIATE_SIZE: out->moe_shared_intermediate_size = (int)number; break;
         case K_MOE_NORM_TOPK_PROB: out->moe_norm_topk_prob = boolean; break;
+        case K_MOE_SHARED_GATE_SCALAR: out->moe_shared_gate_scalar = boolean; break;
         case K_EOS_TOKENS: out->eos_count = eos_count; break;
         default: break;
         }
@@ -647,12 +650,22 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
             fail(err, err_len, "moe_routed_scaling_factor must be positive");
             return -1;
         }
+        if (d->moe_shared_gate_scalar && d->moe_num_shared_experts == 0) {
+            fail(err, err_len, "moe_shared_gate_scalar needs at least one shared expert");
+            return -1;
+        }
         if (d->moe_num_shared_experts > 0) {
             const int shared_roles[] = {ROLE_MOE_SHARED_GATE, ROLE_MOE_SHARED_UP,
                                         ROLE_MOE_SHARED_DOWN};
             for (size_t i = 0; i < sizeof(shared_roles) / sizeof(shared_roles[0]); ++i) {
                 if (require_role(d, shared_roles[i], "needed by shared experts", err, err_len) != 0)
                     return -1;
+            }
+            if (d->moe_shared_gate_scalar &&
+                model_desc_role_index(d, ROLE_MOE_SHARED_GATE_SCALAR) < 0) {
+                fail(err, err_len, "descriptor has no 'moeSharedGateScalar' template "
+                                   "(moe_shared_gate_scalar is enabled)");
+                return -1;
             }
         }
     }
@@ -712,6 +725,7 @@ int model_desc_format(const struct ModelDesc *d, char *buf, int buf_len) {
     if (append(buf, buf_len, &used, "\"moe_num_shared_experts\":%d,", d->moe_num_shared_experts) != 0) return -1;
     if (append(buf, buf_len, &used, "\"moe_shared_intermediate_size\":%d,", d->moe_shared_intermediate_size) != 0) return -1;
     if (append(buf, buf_len, &used, "\"moe_routed_scaling_factor\":%.17g,", d->moe_routed_scaling_factor) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"moe_shared_gate_scalar\":%s,", d->moe_shared_gate_scalar ? "true" : "false") != 0) return -1;
     if (append(buf, buf_len, &used, "\"eos_tokens\":[") != 0) return -1;
     for (int i = 0; i < d->eos_count; ++i) {
         if (append(buf, buf_len, &used, "%s%d", i ? "," : "", d->eos_tokens[i]) != 0) return -1;

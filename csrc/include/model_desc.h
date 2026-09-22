@@ -109,6 +109,7 @@ struct ModelDesc {
     int moe_num_shared_experts;
     int moe_shared_intermediate_size;
     double moe_routed_scaling_factor;
+    int moe_shared_gate_scalar;
 
     int eos_count;
     int eos_tokens[ENGINE_MAX_EOS];

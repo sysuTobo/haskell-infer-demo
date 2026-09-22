@@ -56,6 +56,7 @@ qwen38 = Descriptor
   , dMoeNumSharedExperts = 0
   , dMoeSharedIntermediateSize = 0
   , dMoeRoutedScalingFactor = 1.0
+  , dMoeSharedGateScalar = False
   , dEosTokens = [248046, 248044]
   , dLayerMixers =
       [ if (i + 1) `mod` 4 == 0 then MFullAttention else MGatedDeltaNet

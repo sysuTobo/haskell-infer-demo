@@ -215,6 +215,22 @@ void kernel_moe_combine(const __nv_bfloat16 *expert_out, const int *slot_of,
                                                         top_k, width, out);
 }
 
+__global__ void moe_scale_add_kernel(__nv_bfloat16 *out, const __nv_bfloat16 *extra,
+                                     const float *gate, int width) {
+    const int token = blockIdx.x;
+    const float scale = gate != nullptr ? 1.0f / (1.0f + __expf(-gate[token])) : 1.0f;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        const float value = __bfloat162float(extra[(size_t)token * width + j]);
+        const float current = __bfloat162float(out[(size_t)token * width + j]);
+        out[(size_t)token * width + j] = __float2bfloat16_rn(current + scale * value);
+    }
+}
+
+void kernel_moe_scale_add(__nv_bfloat16 *out, const __nv_bfloat16 *extra,
+                          const float *gate, int tokens, int width, cudaStream_t stream) {
+    moe_scale_add_kernel<<<tokens, kThreads, 0, stream>>>(out, extra, gate, width);
+}
+
 /* ----------------------------------------------------------------------- */
 /* Forward                                                                 */
 /* ----------------------------------------------------------------------- */
@@ -240,6 +256,14 @@ size_t moe_workspace_size(int tokens, const ModelDims *dims, const MoeConfig *mo
     bytes += align_up(2 * t * k * inner * sizeof(__nv_bfloat16));  // [gate; up] per slice
     bytes += align_up(t * k * inner * sizeof(__nv_bfloat16));   // activated
     bytes += align_up(t * k * hidden * sizeof(__nv_bfloat16));  // expert output
+    const size_t s = (size_t)moe->num_shared_experts;
+    const size_t sis = (size_t)moe->shared_intermediate_size;
+    if (s > 0) {
+        bytes += align_up(t * hidden * sizeof(__nv_bfloat16));      // shared output
+        bytes += align_up(2 * t * sis * sizeof(__nv_bfloat16));     // shared [gate; up]
+        bytes += align_up(t * sis * sizeof(__nv_bfloat16));         // shared activated
+    }
+    if (moe->shared_gate_scalar) bytes += align_up(t * sizeof(float));  // gate scalar
     return bytes;
 }
 
@@ -256,6 +280,12 @@ int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
          * of 8 bf16 elements, so the per-expert width must be a multiple of 8. */
         if (moe->intermediate_size % 8 != 0)
             throw std::invalid_argument("MoE expert width must be a multiple of 8");
+        const int shared = moe->num_shared_experts;
+        if (shared > 0 && moe->shared_intermediate_size % 8 != 0)
+            throw std::invalid_argument("shared expert width must be a multiple of 8");
+        if (shared > 0 && (w->shared_gate == nullptr || w->shared_up == nullptr ||
+                           w->shared_down == nullptr))
+            throw std::invalid_argument("shared expert weights are missing");
 
         const int hidden = dims->hidden_size;
         const int inner = moe->intermediate_size;
@@ -284,6 +314,18 @@ int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
         __nv_bfloat16 *gate_up = (__nv_bfloat16 *)take((size_t)entries * 2 * inner * 2);
         __nv_bfloat16 *activated = (__nv_bfloat16 *)take((size_t)entries * inner * 2);
         __nv_bfloat16 *expert_out = (__nv_bfloat16 *)take((size_t)entries * hidden * 2);
+        __nv_bfloat16 *shared_out = shared > 0
+            ? (__nv_bfloat16 *)take((size_t)tokens * hidden * 2) : nullptr;
+        const size_t shared_inner = (size_t)moe->shared_intermediate_size;
+        /* [gate; up] adjacency is what the activation kernel consumes. */
+        __nv_bfloat16 *shared_gate = shared > 0
+            ? (__nv_bfloat16 *)take(2 * (size_t)tokens * shared_inner * 2) : nullptr;
+        __nv_bfloat16 *shared_up = shared > 0
+            ? shared_gate + (size_t)tokens * shared_inner : nullptr;
+        __nv_bfloat16 *shared_act = shared > 0
+            ? (__nv_bfloat16 *)take((size_t)tokens * shared_inner * 2) : nullptr;
+        float *shared_scale = moe->shared_gate_scalar
+            ? (float *)take((size_t)tokens * sizeof(float)) : nullptr;
 
         if (w->post_norm_w != nullptr) {
             if (dims->norm_style == 1) {
@@ -349,6 +391,35 @@ int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
         }
 
         kernel_moe_combine(expert_out, slot_of, weights, tokens, top_k, hidden, out, stream);
+
+        /* Always-on experts: a dense MLP (or several, summed) on the same normed
+         * input, optionally scaled per token by sigmoid(x @ w). The gate is a
+         * single projection over the hidden state, so compute it first. */
+        if (shared > 0 && moe->shared_gate_scalar && w->shared_gate_scalar_w != nullptr) {
+            const int status = gemm_bf16_f32out(cublas, shared_scale, normed_input,
+                                                w->shared_gate_scalar_w, tokens, 1, hidden);
+            if (status != 0) return status;
+        }
+        for (int e = 0; e < shared; ++e) {
+            const int status_gate = gemm_bf16(cublas, shared_gate, normed_input,
+                                              w->shared_gate + (size_t)e * shared_inner * hidden,
+                                              tokens, (int)shared_inner, hidden);
+            if (status_gate != 0) return status_gate;
+            const int status_up = gemm_bf16(cublas, shared_up, normed_input,
+                                            w->shared_up + (size_t)e * shared_inner * hidden,
+                                            tokens, (int)shared_inner, hidden);
+            if (status_up != 0) return status_up;
+            kernel_silu_mul(shared_act, shared_gate, shared_up, tokens * (int)shared_inner, stream);
+            const int status_down = gemm_bf16(cublas, shared_out, shared_act,
+                                              w->shared_down + (size_t)e * hidden * shared_inner,
+                                              tokens, hidden, (int)shared_inner);
+            if (status_down != 0) return status_down;
+            if (e == 0) {
+                kernel_moe_scale_add(out, shared_out, shared_scale, tokens, hidden, stream);
+            } else {
+                kernel_moe_scale_add(out, shared_out, nullptr, tokens, hidden, stream);
+            }
+        }
         check_cuda(cudaGetLastError(), "MoE forward");
         return 0;
     } catch (const std::exception &e) {

@@ -92,6 +92,7 @@ qwen35DescriptorFromConfig tc tokenizer = do
     , dMoeRouterScoring = "softmax", dMoeNormTopkProb = False
     , dMoeNumSharedExperts = 0, dMoeSharedIntermediateSize = 0
     , dMoeRoutedScalingFactor = 1.0
+    , dMoeSharedGateScalar = False
     , dEosTokens = eosTokens tc tokenizer
     , dLayerMixers = mixers
     , dLayerFfns = replicate numLayers FDense

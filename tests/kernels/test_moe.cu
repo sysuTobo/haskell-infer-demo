@@ -19,7 +19,8 @@ constexpr int kTokens = 4;
 constexpr int kExperts = 6;
 constexpr int kTopK = 2;
 constexpr int kHidden = 8;
-constexpr int kInner = 8;  // multiple of 8: the activation kernel vectorizes
+constexpr int kInner = 8;         // multiple of 8: the activation kernel vectorizes
+constexpr int kSharedInner = 8;   // shared expert width, also a multiple of 8
 
 /* Routing reference: softmax in double, deterministic lowest-index tie break,
  * optional renormalization and scaling -- written from the definition. */
@@ -115,6 +116,47 @@ std::vector<Bf16> cpu_moe(const std::vector<Bf16> &input, const std::vector<int>
                 acc += weights[t * kTopK + k] * projected[h];
             }
             out[t * kHidden + h] = test::bf16((float)acc);
+        }
+    }
+    return out;
+}
+
+/* Shared expert reference: a dense MLP on the normed input, scaled per token by
+ * sigmoid(x @ w) when a gate is present, added to the routed result. */
+std::vector<Bf16> cpu_shared_expert(const std::vector<Bf16> &normed,
+                                    const std::vector<Bf16> &gate_w,
+                                    const std::vector<Bf16> &up_w,
+                                    const std::vector<Bf16> &down_w,
+                                    const std::vector<Bf16> &scalar_w, bool use_gate) {
+    std::vector<Bf16> out((size_t)kTokens * kHidden);
+    for (int t = 0; t < kTokens; ++t) {
+        double hidden[kSharedInner];
+        for (int i = 0; i < kSharedInner; ++i) {
+            double g = 0.0, u = 0.0;
+            for (int j = 0; j < kHidden; ++j) {
+                const double x = (double)test::value(normed[t * kHidden + j]);
+                g += x * (double)test::value(gate_w[i * kHidden + j]);
+                u += x * (double)test::value(up_w[i * kHidden + j]);
+            }
+            const double gb = (double)test::value(test::bf16((float)g));
+            const double ub = (double)test::value(test::bf16((float)u));
+            const double silu = gb / (1.0 + std::exp(-gb));
+            hidden[i] = (double)test::value(test::bf16((float)(silu * ub)));
+        }
+        double scale = 1.0;
+        if (use_gate) {
+            double logit = 0.0;
+            for (int j = 0; j < kHidden; ++j)
+                logit += (double)test::value(normed[t * kHidden + j]) *
+                         (double)test::value(scalar_w[j]);
+            scale = 1.0 / (1.0 + std::exp(-logit));
+        }
+        for (int j = 0; j < kHidden; ++j) {
+            double value = 0.0;
+            for (int i = 0; i < kSharedInner; ++i)
+                value += hidden[i] * (double)test::value(down_w[j * kSharedInner + i]);
+            const double rounded = (double)test::value(test::bf16((float)value));
+            out[(size_t)t * kHidden + j] = test::bf16((float)(scale * rounded));
         }
     }
     return out;
@@ -253,6 +295,65 @@ int main() {
     const auto skewed_want = cpu_moe(normed_input, ids, route_weights, gate, up, down);
     ok &= test::compare("moe forward (single expert)", d_out.download(stream.get()),
                         skewed_want, 5e-2, 5e-2);
+
+    /* --- 4) Shared expert with its sigmoid gate, on the same normed input --- */
+    std::vector<Bf16> shared_gate((size_t)kSharedInner * kHidden);
+    std::vector<Bf16> shared_up((size_t)kSharedInner * kHidden);
+    std::vector<Bf16> shared_down((size_t)kHidden * kSharedInner);
+    std::vector<Bf16> gate_scalar(kHidden);
+    for (size_t i = 0; i < shared_gate.size(); ++i)
+        shared_gate[i] = test::bf16(test::sample(i, 41) * 0.5f);
+    for (size_t i = 0; i < shared_up.size(); ++i)
+        shared_up[i] = test::bf16(test::sample(i, 43) * 0.5f);
+    for (size_t i = 0; i < shared_down.size(); ++i)
+        shared_down[i] = test::bf16(test::sample(i, 47) * 0.5f);
+    for (size_t i = 0; i < gate_scalar.size(); ++i)
+        gate_scalar[i] = test::bf16(test::sample(i, 53));
+
+    DeviceBuffer<Bf16> d_shared_gate(shared_gate.size()), d_shared_up(shared_up.size());
+    DeviceBuffer<Bf16> d_shared_down(shared_down.size()), d_gate_scalar(gate_scalar.size());
+    d_shared_gate.upload(shared_gate, stream.get());
+    d_shared_up.upload(shared_up, stream.get());
+    d_shared_down.upload(shared_down, stream.get());
+    d_gate_scalar.upload(gate_scalar, stream.get());
+
+    MoeConfig moe_shared = moe;
+    moe_shared.num_shared_experts = 1;
+    moe_shared.shared_intermediate_size = kSharedInner;
+    moe_shared.shared_gate_scalar = 1;
+    MoeWeights weights_shared = weights;
+    weights_shared.shared_gate = d_shared_gate.get();
+    weights_shared.shared_up = d_shared_up.get();
+    weights_shared.shared_down = d_shared_down.get();
+    weights_shared.shared_gate_scalar_w = d_gate_scalar.get();
+
+    d_router.upload(router, stream.get());
+    const size_t shared_scratch_bytes = moe_workspace_size(kTokens, &dims, &moe_shared);
+    void *shared_scratch = nullptr;
+    CUDA_CHECK(cudaMalloc(&shared_scratch, shared_scratch_bytes));
+    MoeScratch shared_workspace{shared_scratch, shared_scratch_bytes};
+    const int shared_status = forward_moe_ffn(cublas, stream.get(), d_input.get(), d_out.get(),
+                                             &weights_shared, &moe_shared, shared_workspace,
+                                             kTokens, &dims);
+    if (shared_status != 0) {
+        std::fprintf(stderr, "shared-expert forward failed: %d\n", shared_status);
+        return EXIT_FAILURE;
+    }
+    const auto shared_logits = cpu_router_logits(normed_input, router);
+    cpu_router(shared_logits, /*norm_topk=*/true, 1.0f, ids, route_weights);
+    auto want_shared = cpu_moe(normed_input, ids, route_weights, gate, up, down);
+    const auto extra = cpu_shared_expert(normed_input, shared_gate, shared_up, shared_down,
+                                         gate_scalar, /*use_gate=*/true);
+    for (int t = 0; t < kTokens; ++t) {
+        for (int j = 0; j < kHidden; ++j) {
+            const double routed = (double)test::value(want_shared[t * kHidden + j]);
+            const double shared_value = (double)test::value(extra[t * kHidden + j]);
+            want_shared[t * kHidden + j] = test::bf16((float)(routed + shared_value));
+        }
+    }
+    ok &= test::compare("moe forward (shared expert + gate)",
+                        d_out.download(stream.get()), want_shared, 5e-2, 5e-2);
+    CUDA_CHECK(cudaFree(shared_scratch));
 
     cublasDestroy(cublas);
     CUDA_CHECK(cudaFree(scratch));

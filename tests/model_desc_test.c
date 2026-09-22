@@ -55,6 +55,7 @@ static const char *kGoodDesc =
     "\"moe_num_shared_experts\":0,"
     "\"moe_shared_intermediate_size\":0,"
     "\"moe_routed_scaling_factor\":1.0,"
+    "\"moe_shared_gate_scalar\":false,"
     "\"eos_tokens\":[7,9],"
     "\"layer_mixers\":[\"full_attn\",\"gdn\"],"
     "\"layer_ffns\":[\"dense\",\"dense\"],"
@@ -182,6 +183,7 @@ static const char *kMoeDesc =
     "\"moe_num_shared_experts\":1,"
     "\"moe_shared_intermediate_size\":6,"
     "\"moe_routed_scaling_factor\":1.0,"
+    "\"moe_shared_gate_scalar\":false,"
     "\"eos_tokens\":[2],"
     "\"layer_mixers\":[\"full_attn\",\"full_attn\"],"
     "\"layer_ffns\":[\"moe\",\"moe\"],"
@@ -262,6 +264,17 @@ static void test_errors(void) {
     copy_desc(buf, sizeof(buf));
     set_literal(buf, "\"eos_tokens\":[7,9]", "\"eos_tokens\":[7,999]");
     test_rejects(buf, "outside the vocabulary", "out-of-vocab EOS is rejected");
+
+    /* Gate enabled without a shared-expert gate template. */
+    snprintf(buf, sizeof(buf), "%s", kMoeDesc);
+    set_literal(buf, "\"moe_shared_gate_scalar\":false", "\"moe_shared_gate_scalar\":true");
+    test_rejects(buf, "moeSharedGateScalar", "shared gate without its template is rejected");
+
+    /* Gate enabled without any shared expert to scale. */
+    snprintf(buf, sizeof(buf), "%s", kMoeDesc);
+    set_literal(buf, "\"moe_shared_gate_scalar\":false", "\"moe_shared_gate_scalar\":true");
+    set_literal(buf, "\"moe_num_shared_experts\":1", "\"moe_num_shared_experts\":0");
+    test_rejects(buf, "at least one shared expert", "shared gate without shared experts is rejected");
 
     /* max_chunk beyond the kernels' limit. */
     copy_desc(buf, sizeof(buf));

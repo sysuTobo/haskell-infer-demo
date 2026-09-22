@@ -130,6 +130,12 @@ static ExpectedShape expected_shape(int role, const struct ModelDesc &d) {
         return {2, {d.moe_intermediate_size, hidden, 0}};
     case ROLE_MOE_EXPERT_DOWN:
         return {2, {hidden, d.moe_intermediate_size, 0}};
+    case ROLE_MOE_SHARED_GATE: case ROLE_MOE_SHARED_UP:
+        return {2, {d.moe_shared_intermediate_size, hidden, 0}};
+    case ROLE_MOE_SHARED_DOWN:
+        return {2, {hidden, d.moe_shared_intermediate_size, 0}};
+    case ROLE_MOE_SHARED_GATE_SCALAR:
+        return {2, {1, hidden, 0}};
     default:
         return {0, {0, 0, 0}};
     }
@@ -452,10 +458,13 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             if (lw.plan.ffn == ENGINE_FFN_MOE) {
                 const int experts = eng->desc.moe_num_experts;
                 const int inner = eng->desc.moe_intermediate_size;
+                const int shared = eng->desc.moe_num_shared_experts;
                 lw.moe_config = MoeConfig{experts, eng->desc.moe_top_k, inner,
                                           eng->desc.moe_norm_topk_prob,
                                           strcmp(eng->desc.moe_router_scoring, "sigmoid") == 0,
-                                          (float)eng->desc.moe_routed_scaling_factor};
+                                          (float)eng->desc.moe_routed_scaling_factor,
+                                          shared, eng->desc.moe_shared_intermediate_size,
+                                          eng->desc.moe_shared_gate_scalar};
                 __nv_bfloat16 *router = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
                 load_role(index, eng->desc, ROLE_MOE_ROUTER, i, ctx.device_id, &router);
                 const size_t gate_bytes = (size_t)experts * inner * hidden * sizeof(__nv_bfloat16);
@@ -472,6 +481,38 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                                      ctx.device_id, down + (size_t)e * hidden * inner);
                 }
                 check_cuda(cudaStreamSynchronize(nullptr), "Finish expert weight upload");
+                if (shared > 0) {
+                    const int shared_inner = eng->desc.moe_shared_intermediate_size;
+                    const size_t shared_gate_bytes =
+                        (size_t)shared * shared_inner * hidden * sizeof(__nv_bfloat16);
+                    const size_t shared_down_bytes =
+                        (size_t)shared * hidden * shared_inner * sizeof(__nv_bfloat16);
+                    __nv_bfloat16 *sgate = nullptr, *sup = nullptr, *sdown = nullptr;
+                    check_cuda(cudaMalloc(&sgate, shared_gate_bytes), "Allocate shared gate");
+                    check_cuda(cudaMalloc(&sup, shared_gate_bytes), "Allocate shared up");
+                    check_cuda(cudaMalloc(&sdown, shared_down_bytes), "Allocate shared down");
+                    for (int e = 0; e < shared; ++e) {
+                        load_expert_role(index, eng->desc, ROLE_MOE_SHARED_GATE, i, e,
+                                         ctx.device_id, sgate + (size_t)e * shared_inner * hidden);
+                        load_expert_role(index, eng->desc, ROLE_MOE_SHARED_UP, i, e,
+                                         ctx.device_id, sup + (size_t)e * shared_inner * hidden);
+                        load_expert_role(index, eng->desc, ROLE_MOE_SHARED_DOWN, i, e,
+                                         ctx.device_id, sdown + (size_t)e * hidden * shared_inner);
+                    }
+                    lw.moe.shared_gate = sgate;
+                    lw.moe.shared_up = sup;
+                    lw.moe.shared_down = sdown;
+                    lw.owned.push_back(sgate);
+                    lw.owned.push_back(sup);
+                    lw.owned.push_back(sdown);
+                    if (eng->desc.moe_shared_gate_scalar) {
+                        __nv_bfloat16 *scalar_w = nullptr;
+                        load_role(index, eng->desc, ROLE_MOE_SHARED_GATE_SCALAR, i,
+                                  ctx.device_id, &scalar_w);
+                        lw.moe.shared_gate_scalar_w = scalar_w;
+                        lw.owned.push_back(scalar_w);
+                    }
+                }
                 lw.moe.post_norm_w = lw.post_norm_w;
                 lw.moe.router_w = router;
                 lw.moe.experts_gate = gate;

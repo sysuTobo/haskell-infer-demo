@@ -34,6 +34,7 @@
   "moe_num_shared_experts": 0,
   "moe_shared_intermediate_size": 0,
   "moe_routed_scaling_factor": 1.0,
+  "moe_shared_gate_scalar": false,
   "eos_tokens": [
     248046,
     248044

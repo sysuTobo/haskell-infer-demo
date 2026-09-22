@@ -31,7 +31,7 @@ descriptorFromModelDir dir = do
         modelType <- modelTypeOf value
         cfg <- textConfig value
         let tok = tokenizer
-        if "mixtral" == modelType || "qwen3_moe" == modelType
+        if modelType `elem` ["mixtral", "qwen3_moe", "qwen3"]
           then moeDenseDescriptorFromConfig cfg tok
           else if "qwen3_5" `prefixOf` modelType || "qwen3_5_text" == modelType
             then qwen35DescriptorFromConfig cfg tok
@@ -47,7 +47,7 @@ descriptorFromConfigFile path = do
     Right value -> pure $ do
       modelType <- modelTypeOf value
       cfg <- textConfig value
-      if "mixtral" == modelType || "qwen3_moe" == modelType
+      if modelType `elem` ["mixtral", "qwen3_moe", "qwen3"]
         then moeDenseDescriptorFromConfig cfg Nothing
         else qwen35DescriptorFromConfig cfg Nothing
 

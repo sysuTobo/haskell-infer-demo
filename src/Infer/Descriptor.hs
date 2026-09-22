@@ -120,6 +120,7 @@ data Descriptor = Descriptor
   , dMoeNumSharedExperts :: !Int  -- ^ always-on experts (0 for Mixtral/Qwen3-MoE)
   , dMoeSharedIntermediateSize :: !Int
   , dMoeRoutedScalingFactor :: !Double
+  , dMoeSharedGateScalar :: !Bool   -- ^ scale the shared output by sigmoid(x @ w)
   , dEosTokens :: [Int]
   , dLayerMixers :: [MixerKind]
   , dLayerFfns :: [FfnKind]
@@ -154,6 +155,7 @@ descriptorKeys =
   , "gdn_conv_kernel", "fla_chunk_size", "max_chunk", "moe_num_experts", "moe_top_k"
   , "moe_intermediate_size", "moe_router_scoring", "moe_norm_topk_prob"
   , "moe_num_shared_experts", "moe_shared_intermediate_size", "moe_routed_scaling_factor"
+  , "moe_shared_gate_scalar"
   , "eos_tokens", "layer_mixers"
   , "layer_ffns", "role_names", "role_templates"
   ]
@@ -196,6 +198,7 @@ encodeDescriptor d = BL.toStrict . encode $ object
   , "moe_num_shared_experts" .= dMoeNumSharedExperts d
   , "moe_shared_intermediate_size" .= dMoeSharedIntermediateSize d
   , "moe_routed_scaling_factor" .= dMoeRoutedScalingFactor d
+  , "moe_shared_gate_scalar" .= dMoeSharedGateScalar d
   , "eos_tokens" .= dEosTokens d
   , "layer_mixers" .= map mixerName (dLayerMixers d)
   , "layer_ffns" .= map ffnName (dLayerFfns d)
@@ -251,6 +254,7 @@ decodeDescriptor bytes = do
   moeSharedExperts <- reqInt obj "moe_num_shared_experts"
   moeSharedIntermediate <- reqInt obj "moe_shared_intermediate_size"
   moeScaling <- reqDouble obj "moe_routed_scaling_factor"
+  moeSharedGate <- reqBool obj "moe_shared_gate_scalar"
   eos <- reqIntList obj "eos_tokens"
   mixers <- traverse parseMixer =<< reqTextList obj "layer_mixers"
   ffns <- traverse parseFfn =<< reqTextList obj "layer_ffns"
@@ -272,6 +276,7 @@ decodeDescriptor bytes = do
     , dMoeIntermediateSize = moeIntermediate, dMoeRouterScoring = moeScoring
     , dMoeNormTopkProb = moeNormTopk, dMoeNumSharedExperts = moeSharedExperts
     , dMoeSharedIntermediateSize = moeSharedIntermediate, dMoeRoutedScalingFactor = moeScaling
+    , dMoeSharedGateScalar = moeSharedGate
     , dEosTokens = eos
     , dLayerMixers = mixers, dLayerFfns = ffns
     , dRoleTemplates = zip roles templates
@@ -412,6 +417,8 @@ moeCheck d
   | dMoeNumSharedExperts d > 0 && dMoeSharedIntermediateSize d <= 0 =
       Just "moe_shared_intermediate_size is required when shared experts are used"
   | dMoeRoutedScalingFactor d <= 0 = Just "moe_routed_scaling_factor must be positive"
+  | dMoeSharedGateScalar d && dMoeNumSharedExperts d == 0 =
+      Just "moe_shared_gate_scalar needs at least one shared expert"
   | otherwise = Nothing
 
 rolesCheck :: Descriptor -> Maybe String

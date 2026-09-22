@@ -31,6 +31,9 @@ typedef struct {
     int norm_topk_prob;         /* renormalize the selected weights */
     int scoring_sigmoid;        /* 0 = softmax, 1 = sigmoid */
     float routed_scaling_factor;
+    int num_shared_experts;     /* always-on experts, 0 when the family has none */
+    int shared_intermediate_size;
+    int shared_gate_scalar;     /* scale the shared output by sigmoid(x @ w) */
 } MoeConfig;
 
 /* Per-layer routed-expert weights, fused per expert (owned by the layer). */
@@ -41,6 +44,11 @@ typedef struct {
     const __nv_bfloat16 *experts_gate; // [E, I, H]
     const __nv_bfloat16 *experts_up;   // [E, I, H]
     const __nv_bfloat16 *experts_down; // [E, H, I]
+    /* Always-on experts (may be null when the family has none). */
+    const __nv_bfloat16 *shared_gate;  // [S, Is, H]
+    const __nv_bfloat16 *shared_up;    // [S, Is, H]
+    const __nv_bfloat16 *shared_down;  // [S, H, Is]
+    const __nv_bfloat16 *shared_gate_scalar_w; // [H], optional
 } MoeWeights;
 
 /* Workspace for one MoE forward, sized by moe_workspace_size(). */
@@ -87,9 +95,14 @@ void kernel_moe_gather(const __nv_bfloat16 *input, const int *token_of_slot,
                        __nv_bfloat16 *packed, int rows, int width,
                        cudaStream_t stream);
 
-/* Combine: out[t, :] += sum_k weights[t, k] * expert_out[slot_of[t, k], :]. */
+/* Combine: out[t, :] = sum_k weights[t, k] * expert_out[slot_of[t, k], :]. */
 void kernel_moe_combine(const __nv_bfloat16 *expert_out, const int *slot_of,
                         const float *weights, int tokens, int top_k, int width,
                         __nv_bfloat16 *out, cudaStream_t stream);
+
+/* out[t, :] += scale(t) * extra[t, :] with scale(t) = sigmoid(gate[t]) when a
+ * gate is present, else 1. Used to fold the shared expert into the routed sum. */
+void kernel_moe_scale_add(__nv_bfloat16 *out, const __nv_bfloat16 *extra,
+                          const float *gate, int tokens, int width, cudaStream_t stream);
 
 #endif /* HASKELL_INFER_MOE_H */

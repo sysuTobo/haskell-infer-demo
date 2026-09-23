@@ -93,6 +93,9 @@ initRuntime cfg = do
     Nothing -> do
       err <- engineLastError
       putStrLn $ "ERROR: engine_create failed: " ++ err
+      -- The tokenizer is already live; release it before bailing out so a
+      -- failed engine brings the whole runtime down without a leak.
+      freeTokenizer tok
       exitFailure
     Just e -> return e
   vocab <- engineVocabSize engine

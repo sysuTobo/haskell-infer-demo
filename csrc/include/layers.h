@@ -240,11 +240,17 @@ int copy_across_devices(int from_device, cudaStream_t from_stream, cudaEvent_t *
                         void *dst, const void *src, size_t bytes);
 
 /* In-place sum of one bf16 buffer per device (elementwise, bf16 arithmetic), via
- * leader staging on devices[0]. events/streams are index-aligned with devices;
- * the caller synchronizes afterwards. */
+ * leader staging on devices[0].
+ *
+ * events[i] is the producer event of stream i: it orders rank i's data before
+ * the leader reads it. done_events[i] is recorded on stream i once its incoming
+ * broadcast copy has finished reading devices[0]'s buffer; the leader waits on
+ * all of them, so any later reuse of that buffer is ordered after every read.
+ * Both arrays and streams are index-aligned with devices. The caller
+ * synchronizes afterwards. */
 int allreduce_sum_bf16(const int *devices, cudaStream_t *streams, cudaEvent_t *events,
-                       int count, __nv_bfloat16 **buffers, __nv_bfloat16 *leader_staging,
-                       size_t elements);
+                       cudaEvent_t *done_events, int count, __nv_bfloat16 **buffers,
+                       __nv_bfloat16 *leader_staging, size_t elements);
 
 /* Bytes for reusable attention/GDN/MLP workspace; excludes FLA scratch and
  * the independent residual/layer_out buffers. tokens must be in [1, max_chunk]. */
@@ -285,6 +291,12 @@ int forward_mla_layer(cublasHandle_t cublas, cudaStream_t stream,
 /* Bytes for the MLA decoder scratch (decompressed K/V + repacked latent). */
 size_t kernel_mla_scratch_size(int max_seq, const ModelDims *dims);
 
+/* Longest sequence the MLA attention kernel can decode on the *current* device,
+ * given the per-block shared-memory ceiling it does not opt out of. The engine
+ * refuses a cache longer than this at initialization, and forward_mla_layer
+ * refuses a longer call. */
+int kernel_mla_max_seq_len(void);
+
 /* GEMM declarations (gemm.cu) */
 int gemm_bf16(cublasHandle_t handle, __nv_bfloat16 *out,
               const __nv_bfloat16 *x, const __nv_bfloat16 *W,
@@ -293,32 +305,8 @@ int gemm_bf16_f32out(cublasHandle_t handle, float *out,
                      const __nv_bfloat16 *x, const __nv_bfloat16 *W,
                      int M, int N, int K);
 
-/* Safetensors loader declarations */
-#include <map>
-
-struct TensorInfo {
-    std::string name;
-    int dtype;
-    int shape[4];
-    int ndim;
-    long long data_start;
-    long long data_end;
-    std::string file_path;
-    long long file_data_offset;
-};
-
-int safetensors_scan_dir(const char *model_dir, std::map<std::string, TensorInfo> &index);
-int safetensors_load_tensor(const TensorInfo &ti, void *dst, int device);
-/* Rectangular slice of a 2-D tensor: rows [row_off, row_off+rows) and, inside
- * each row, elements [col_off, col_off+cols). Destination rows are contiguous
- * (cols elements each). Whole-row slices are a single contiguous read. */
-int safetensors_load_tensor_slice(const TensorInfo &ti, void *dst, int device,
-                                  long long row_off, long long rows,
-                                  long long col_off, long long cols);
-/* Row-permuting variant: row i of [dst] receives row order[i] of the tensor.
- * Fused checkpoints store rows in the reference's own grouping, so the engine
- * gathers them into the contiguous views its kernels expect. */
-int safetensors_load_tensor_rows(const TensorInfo &ti, void *dst, int device,
-                                 const int *order, long long rows, long long row_bytes);
+/* Safetensors loader: TensorInfo and the parsing/validation entry points live
+ * in safetensors.h (CUDA-free, shared with the CPU test). */
+#include "safetensors.h"
 
 #endif /* HASKELL_INFER_LAYERS_H */

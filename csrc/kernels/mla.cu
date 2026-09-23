@@ -25,6 +25,15 @@
 
 namespace {
 
+/* Static reduction slots the attention kernel reserves on top of its dynamic
+ * score array; the maximum block size the launch uses. */
+const int kMlaReduceSlots = 256;
+
+/* Highest per-block shared-memory carve-out this kernel uses. Larger blocks
+ * need the opt-in carve-out (cudaFuncAttributeMaxDynamicSharedMemorySize), which
+ * this implementation does not request, so the default 48 KiB is the ceiling. */
+const int kMlaSharedMemoryCeiling = 48 * 1024;
+
 void check_cuda(cudaError_t status, const char *op) {
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string(op) + ": " + cudaGetErrorString(status));
@@ -86,7 +95,7 @@ __global__ void mla_attention_kernel(const __nv_bfloat16 *__restrict__ q,
                                      int nope, int rope, int vdim, float scale,
                                      __nv_bfloat16 *__restrict__ out) {
     extern __shared__ float scores[];
-    __shared__ float reduce[256];
+    __shared__ float reduce[kMlaReduceSlots];
     const int t = blockIdx.x;
     const int h = blockIdx.y;
     const int kv_len = query_offset + t + 1;
@@ -139,6 +148,25 @@ __global__ void mla_attention_kernel(const __nv_bfloat16 *__restrict__ q,
 
 }  // namespace
 
+int kernel_mla_max_seq_len(void) {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return 0;
+    int per_block = 0;
+    if (cudaDeviceGetAttribute(&per_block, cudaDevAttrMaxSharedMemoryPerBlock, device) !=
+        cudaSuccess) {
+        per_block = kMlaSharedMemoryCeiling;
+    }
+    int limit = per_block < kMlaSharedMemoryCeiling ? per_block : kMlaSharedMemoryCeiling;
+    /* Newer architectures reserve part of the block's budget for the driver. */
+    int reserved = 0;
+    if (cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, device) ==
+        cudaSuccess) {
+        limit -= reserved;
+    }
+    const int available = limit - kMlaReduceSlots * (int)sizeof(float);
+    return available > 0 ? available / (int)sizeof(float) : 0;
+}
+
 size_t kernel_mla_scratch_size(int max_seq, const ModelDims *dims) {
     if (max_seq < 1) throw std::invalid_argument("MLA scratch needs a positive max_seq");
     const size_t decompressed =
@@ -160,6 +188,16 @@ int forward_mla_layer(cublasHandle_t cublas, cudaStream_t stream,
             throw std::invalid_argument("MLA sequence length is outside the cache");
         if (!positions || !latent_cache || !scratch)
             throw std::invalid_argument("MLA positions/cache/scratch are required");
+        /* The attention kernel holds one float score per cached key in shared
+         * memory, so the sequence length is bounded by what the device allows
+         * without the opt-in carve-out. Rejecting here keeps the failure at the
+         * call that asked for too much instead of at an opaque launch error. */
+        const int max_cached = kernel_mla_max_seq_len();
+        if (seq_len > max_cached)
+            throw std::invalid_argument(
+                "MLA sequence length " + std::to_string(seq_len) +
+                " exceeds the attention kernel's shared-memory limit of " +
+                std::to_string(max_cached) + " tokens");
         const int hidden = dims->hidden_size;
         const int heads = dims->num_heads;
         const int nope = dims->mla_qk_nope_head_dim;

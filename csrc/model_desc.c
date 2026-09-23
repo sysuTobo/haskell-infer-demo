@@ -631,6 +631,52 @@ static int require_role(const struct ModelDesc *d, int role, const char *why,
     return 0;
 }
 
+/* The rule a role carries, or -1 when the descriptor does not use the role. */
+static int role_rule(const struct ModelDesc *d, int role) {
+    const int slot = model_desc_role_index(d, role);
+    return slot >= 0 && slot < d->role_shard_count ? d->role_shards[slot] : -1;
+}
+
+static int require_role_rule(const struct ModelDesc *d, int role, int rule,
+                             char *err, size_t err_len) {
+    const int found = role_rule(d, role);
+    if (found < 0 || found == rule) return 0;
+    fail(err, err_len, "tp_size %d: role %s must carry the '%s' shard rule (it carries '%s')",
+         d->tp_size, kRoleNames[role], kShardNames[rule], kShardNames[found]);
+    return -1;
+}
+
+/* With tp_size > 1 every rank works with the *divided* dimensions (attention
+ * heads, KV heads, the dense MLP), so the roles whose shapes those dimensions
+ * describe have to carry the matching shard rule. A role left at 'none' under
+ * divided dimensions makes the forward read the wrong rows of the tensor -- and
+ * for an output projection it reads past the end of the destination buffer --
+ * with no error anywhere. GDN roles are not divided, so they stay free. */
+static int validate_tp_roles(const struct ModelDesc *d, char *err, size_t err_len) {
+    if (d->tp_size <= 1) return 0;
+    for (int i = 0; i < d->num_layers; ++i) {
+        if (d->layer_mixers[i] == ENGINE_MIXER_FULL_ATTN) {
+            if (require_role_rule(d, ROLE_ATTN_Q, ENGINE_SHARD_OUT_HEADS, err, err_len) != 0 ||
+                require_role_rule(d, ROLE_ATTN_K, ENGINE_SHARD_OUT_HEADS, err, err_len) != 0 ||
+                require_role_rule(d, ROLE_ATTN_V, ENGINE_SHARD_OUT_HEADS, err, err_len) != 0 ||
+                require_role_rule(d, ROLE_ATTN_O, ENGINE_SHARD_IN_DIM, err, err_len) != 0)
+                return -1;
+        } else if (d->layer_mixers[i] == ENGINE_MIXER_MLA) {
+            if (require_role_rule(d, ROLE_MLA_Q, ENGINE_SHARD_OUT_HEADS, err, err_len) != 0 ||
+                require_role_rule(d, ROLE_MLA_KV_B, ENGINE_SHARD_OUT_HEADS, err, err_len) != 0 ||
+                require_role_rule(d, ROLE_MLA_O, ENGINE_SHARD_IN_DIM, err, err_len) != 0)
+                return -1;
+        }
+        if (d->layer_ffns[i] == ENGINE_FFN_DENSE) {
+            if (require_role_rule(d, ROLE_MLP_GATE, ENGINE_SHARD_OUT_DIM, err, err_len) != 0 ||
+                require_role_rule(d, ROLE_MLP_UP, ENGINE_SHARD_OUT_DIM, err, err_len) != 0 ||
+                require_role_rule(d, ROLE_MLP_DOWN, ENGINE_SHARD_IN_DIM, err, err_len) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
     if (d->num_layers <= 0 || d->num_layers > ENGINE_MAX_LAYERS) {
         fail(err, err_len, "num_layers %d out of range", d->num_layers);
@@ -695,6 +741,8 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
             return -1;
         }
     }
+    /* The shard rules have to cover the dimensions tensor parallelism divides. */
+    if (validate_tp_roles(d, err, err_len) != 0) return -1;
     if (strcmp(d->norm_style, "gemma") != 0 && strcmp(d->norm_style, "plain") != 0) {
         fail(err, err_len, "norm_style must be gemma or plain");
         return -1;

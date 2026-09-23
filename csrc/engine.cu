@@ -52,6 +52,29 @@ static void check_forward(int status, const char *operation) {
     check_cuda(cudaGetLastError(), operation);
 }
 
+/* Allocate a device buffer and hand it to its owner *immediately*.
+ *
+ * engine_destroy frees exactly what a layer registered, and everything a loader
+ * does after the allocation (the upload, the next allocation, growing the list)
+ * can throw; allocating first and registering later would leave every failure
+ * path holding an unreachable buffer. The registration itself is the one step
+ * that is not a CUDA call, so its failure frees the buffer on its own device and
+ * rethrows. */
+static void *alloc_owned(std::vector<void *> &owned, size_t bytes, int device,
+                         const char *what) {
+    check_cuda(cudaSetDevice(device), "Select weight device");
+    void *pointer = nullptr;
+    check_cuda(cudaMalloc(&pointer, bytes), what);
+    try {
+        owned.push_back(pointer);
+    } catch (...) {
+        cudaSetDevice(device);
+        cudaFree(pointer);
+        throw;
+    }
+    return pointer;
+}
+
 #define CUDA_OK(call) do { cudaError_t e = (call); if (e != cudaSuccess) { \
     set_error("CUDA %s:%d: %s", __FILE__, __LINE__, cudaGetErrorString(e)); \
     return ENGINE_ERR_CUDA; } } while(0)
@@ -194,6 +217,7 @@ struct DeviceCtx {
     cublasHandle_t cublas = nullptr;
     cudaStream_t stream = nullptr;
     cudaEvent_t copy_event = nullptr;   // orders cross-device copies
+    cudaEvent_t read_done_event = nullptr;  // this rank finished reading the leader's buffer
     __nv_bfloat16 *residual = nullptr;   // [max_chunk, hidden]
     __nv_bfloat16 *layer_out = nullptr;  // Never aliases layer/MLP scratch.
     __nv_bfloat16 *workspace = nullptr;
@@ -283,19 +307,29 @@ static const TensorInfo &find_role(const std::map<std::string, TensorInfo> &inde
     return ti;
 }
 
+/* `owned` is the layer's ownership list when the buffer belongs to a layer, and
+ * null for a device-context buffer (the engine frees those through their own
+ * ctx fields). */
 static void load_role(const std::map<std::string, TensorInfo> &index,
                       const struct ModelDesc &desc, int role, int layer,
-                      int device, __nv_bfloat16 **dst) {
+                      int device, __nv_bfloat16 **dst,
+                      std::vector<void *> *owned = nullptr) {
     const TensorInfo &ti = find_role(index, desc, role, layer);
     long long elements = 1;
     for (int i = 0; i < ti.ndim; ++i) elements *= ti.shape[i];
     const size_t bytes = (size_t)elements * sizeof(__nv_bfloat16);
-    check_cuda(cudaSetDevice(device), "Set weight device");
-    check_cuda(cudaMalloc(dst, bytes), "Allocate weight");
-    int status = safetensors_load_tensor(ti, *dst, device);
+    if (owned != nullptr) {
+        *dst = (__nv_bfloat16 *)alloc_owned(*owned, bytes, device, "Allocate weight");
+    } else {
+        check_cuda(cudaSetDevice(device), "Set weight device");
+        check_cuda(cudaMalloc(dst, bytes), "Allocate weight");
+    }
+    int status = safetensors_load_tensor(ti, *dst, (int64_t)bytes, device);
     check_cuda(cudaGetLastError(), "Upload weight");
     if (status != 0)
-        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + ti.name);
+        throw EngineError(ENGINE_ERR_WEIGHTS,
+                          std::string("Cannot load tensor: ") + ti.name + ": " +
+                              safetensors_last_error());
     // The loader uploads on the default stream; compute streams are nonblocking.
     check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
 }
@@ -305,13 +339,14 @@ static void load_role(const std::map<std::string, TensorInfo> &index,
  * split the tensor -- the sublayer then all-reduces its output across ranks. */
 static void load_role_view(const std::map<std::string, TensorInfo> &index,
                            const struct ModelDesc &desc, int role, int layer,
-                           int device, int rank, __nv_bfloat16 **dst, bool *sharded) {
+                           int device, int rank, __nv_bfloat16 **dst, bool *sharded,
+                           std::vector<void *> *owned) {
     *sharded = false;
     const int slot = model_desc_role_index(&desc, role);
     const int rule = slot >= 0 && slot < desc.role_shard_count
                          ? desc.role_shards[slot] : ENGINE_SHARD_NONE;
     if (desc.tp_size <= 1 || rule == ENGINE_SHARD_NONE) {
-        load_role(index, desc, role, layer, device, dst);
+        load_role(index, desc, role, layer, device, dst, owned);
         return;
     }
     const TensorInfo &ti = find_role(index, desc, role, layer);
@@ -323,15 +358,16 @@ static void load_role_view(const std::map<std::string, TensorInfo> &index,
     if (model_desc_shard_view(&desc, role, ti.shape[0], ti.shape[1], rank, &view, err,
                               sizeof(err)) != 0)
         throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Shard view: ") + err);
-    check_cuda(cudaSetDevice(device), "Set weight device");
-    check_cuda(cudaMalloc(dst, (size_t)(view.rows * view.cols) * sizeof(__nv_bfloat16)),
-               "Allocate weight shard");
-    int status = safetensors_load_tensor_slice(ti, *dst, device, view.row_off, view.rows,
+    const size_t shard_bytes = (size_t)(view.rows * view.cols) * sizeof(__nv_bfloat16);
+    *dst = (__nv_bfloat16 *)alloc_owned(*owned, shard_bytes, device, "Allocate weight shard");
+    int status = safetensors_load_tensor_slice(ti, *dst, (int64_t)shard_bytes,
+                                               device, view.row_off, view.rows,
                                                view.col_off, view.cols);
     check_cuda(cudaGetLastError(), "Upload weight shard");
     if (status != 0)
         throw EngineError(ENGINE_ERR_WEIGHTS,
-                          std::string("Cannot load tensor slice: ") + ti.name);
+                          std::string("Cannot load tensor slice: ") + ti.name + ": " +
+                              safetensors_last_error());
     check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
     *sharded = true;
 }
@@ -340,16 +376,20 @@ static void load_role_view(const std::map<std::string, TensorInfo> &index,
  * layout below). The destination holds exactly order.size() rows. */
 static void load_role_rows(const std::map<std::string, TensorInfo> &index,
                            const struct ModelDesc &desc, int role, int layer, int device,
-                           const std::vector<int> &order, __nv_bfloat16 **dst) {
+                           const std::vector<int> &order, __nv_bfloat16 **dst,
+                           std::vector<void *> &owned) {
     const TensorInfo &ti = find_role(index, desc, role, layer);
     const long long row_bytes = (long long)ti.shape[ti.ndim - 1] * sizeof(__nv_bfloat16);
     const long long rows = (long long)order.size();
-    check_cuda(cudaSetDevice(device), "Set weight device");
-    check_cuda(cudaMalloc(dst, (size_t)(rows * row_bytes)), "Allocate weight");
-    int status = safetensors_load_tensor_rows(ti, *dst, device, order.data(), rows, row_bytes);
+    *dst = (__nv_bfloat16 *)alloc_owned(owned, (size_t)(rows * row_bytes), device,
+                                        "Allocate weight");
+    int status = safetensors_load_tensor_rows(ti, *dst, (int64_t)(rows * row_bytes), device,
+                                              order.data(), rows, row_bytes);
     check_cuda(cudaGetLastError(), "Upload weight");
     if (status != 0)
-        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + ti.name);
+        throw EngineError(ENGINE_ERR_WEIGHTS,
+                          std::string("Cannot load tensor: ") + ti.name + ": " +
+                              safetensors_last_error());
     check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
 }
 
@@ -393,6 +433,8 @@ static void fused_gdn_row_orders(const ModelDims &dims, std::vector<int> &qkv_or
 static void load_expert_role(const std::map<std::string, TensorInfo> &index,
                              const struct ModelDesc &desc, int role, int layer,
                              int expert, int device, __nv_bfloat16 *dst) {
+    /* The slot already belongs to a registered fused buffer, so nothing is
+     * allocated (or registered) here. */
     int slot = model_desc_role_index(&desc, role);
     if (slot < 0)
         throw EngineError(ENGINE_ERR_WEIGHTS,
@@ -414,10 +456,16 @@ static void load_expert_role(const std::map<std::string, TensorInfo> &index,
     long long elements = 1;
     for (int i = 0; i < ti.ndim; ++i) elements *= ti.shape[i];
     check_cuda(cudaSetDevice(device), "Set expert weight device");
-    int status = safetensors_load_tensor(ti, dst, device);
+    /* The slot is the caller's slice of the fused expert buffer; its capacity is
+     * exactly this tensor's byte count. */
+    int status = safetensors_load_tensor(ti, dst,
+                                        (int64_t)elements * (int64_t)sizeof(__nv_bfloat16),
+                                        device);
     check_cuda(cudaGetLastError(), "Upload expert weight");
     if (status != 0)
-        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + name);
+        throw EngineError(ENGINE_ERR_WEIGHTS,
+                          std::string("Cannot load tensor: ") + name + ": " +
+                              safetensors_last_error());
 }
 
 /* MoE weights of one layer on one device. Under expert parallelism the rank
@@ -438,12 +486,14 @@ static void load_moe_weights(const std::map<std::string, TensorInfo> &index,
                               eng->desc.moe_shared_gate_scalar,
                               expert_offset, local_experts};
     __nv_bfloat16 *router = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
-    load_role(index, eng->desc, ROLE_MOE_ROUTER, layer, device, &router);
+    load_role(index, eng->desc, ROLE_MOE_ROUTER, layer, device, &router, &lw.owned);
     const size_t gate_bytes = (size_t)local_experts * inner * hidden * sizeof(__nv_bfloat16);
     const size_t down_bytes = (size_t)local_experts * hidden * inner * sizeof(__nv_bfloat16);
-    check_cuda(cudaMalloc(&gate, gate_bytes), "Allocate expert gate weights");
-    check_cuda(cudaMalloc(&up, gate_bytes), "Allocate expert up weights");
-    check_cuda(cudaMalloc(&down, down_bytes), "Allocate expert down weights");
+    /* Registered as they are allocated: the expert loop below loads hundreds of
+     * tensors and any of them can fail. */
+    gate = (__nv_bfloat16 *)alloc_owned(lw.owned, gate_bytes, device, "Allocate expert gate weights");
+    up = (__nv_bfloat16 *)alloc_owned(lw.owned, gate_bytes, device, "Allocate expert up weights");
+    down = (__nv_bfloat16 *)alloc_owned(lw.owned, down_bytes, device, "Allocate expert down weights");
     for (int e = 0; e < local_experts; ++e) {
         load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_GATE, layer, expert_offset + e,
                          device, gate + (size_t)e * inner * hidden);
@@ -459,10 +509,12 @@ static void load_moe_weights(const std::map<std::string, TensorInfo> &index,
             (size_t)shared * shared_inner * hidden * sizeof(__nv_bfloat16);
         const size_t shared_down_bytes =
             (size_t)shared * hidden * shared_inner * sizeof(__nv_bfloat16);
-        __nv_bfloat16 *sgate = nullptr, *sup = nullptr, *sdown = nullptr;
-        check_cuda(cudaMalloc(&sgate, shared_gate_bytes), "Allocate shared gate");
-        check_cuda(cudaMalloc(&sup, shared_gate_bytes), "Allocate shared up");
-        check_cuda(cudaMalloc(&sdown, shared_down_bytes), "Allocate shared down");
+        __nv_bfloat16 *sgate = (__nv_bfloat16 *)alloc_owned(lw.owned, shared_gate_bytes,
+                                                            device, "Allocate shared gate");
+        __nv_bfloat16 *sup = (__nv_bfloat16 *)alloc_owned(lw.owned, shared_gate_bytes,
+                                                          device, "Allocate shared up");
+        __nv_bfloat16 *sdown = (__nv_bfloat16 *)alloc_owned(lw.owned, shared_down_bytes,
+                                                            device, "Allocate shared down");
         for (int e = 0; e < shared; ++e) {
             load_expert_role(index, eng->desc, ROLE_MOE_SHARED_GATE, layer, e, device,
                              sgate + (size_t)e * shared_inner * hidden);
@@ -474,14 +526,11 @@ static void load_moe_weights(const std::map<std::string, TensorInfo> &index,
         lw.moe.shared_gate = sgate;
         lw.moe.shared_up = sup;
         lw.moe.shared_down = sdown;
-        lw.owned.push_back(sgate);
-        lw.owned.push_back(sup);
-        lw.owned.push_back(sdown);
         if (eng->desc.moe_shared_gate_scalar) {
             __nv_bfloat16 *scalar_w = nullptr;
-            load_role(index, eng->desc, ROLE_MOE_SHARED_GATE_SCALAR, layer, device, &scalar_w);
+            load_role(index, eng->desc, ROLE_MOE_SHARED_GATE_SCALAR, layer, device, &scalar_w,
+                      &lw.owned);
             lw.moe.shared_gate_scalar_w = scalar_w;
-            lw.owned.push_back(scalar_w);
         }
     }
     lw.moe.post_norm_w = lw.post_norm_w;
@@ -489,10 +538,6 @@ static void load_moe_weights(const std::map<std::string, TensorInfo> &index,
     lw.moe.experts_gate = gate;
     lw.moe.experts_up = up;
     lw.moe.experts_down = down;
-    lw.owned.push_back(router);
-    lw.owned.push_back(gate);
-    lw.owned.push_back(up);
-    lw.owned.push_back(down);
 }
 
 /* Field that receives a role's tensor for the given layer kind. */
@@ -669,10 +714,11 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
         peer_probe_all(eng->devices.data(), eng->num_devices, 1);
 
         std::map<std::string, TensorInfo> index;
-        int nt = safetensors_scan_dir(model_dir, index);
-        if (nt <= 0)
-            throw EngineError(ENGINE_ERR_WEIGHTS, std::string("No safetensors found in ") + model_dir);
-        fprintf(stderr, "[engine] Scanned %d tensors from %s\n", nt, model_dir);
+        if (safetensors_scan_dir(model_dir, index) != 0)
+            throw EngineError(ENGINE_ERR_WEIGHTS,
+                              std::string("Cannot read weights from ") + model_dir + ": " +
+                                  safetensors_last_error());
+        fprintf(stderr, "[engine] Scanned %zu tensors from %s\n", index.size(), model_dir);
 
         const int hidden = eng->dims.hidden_size;
         eng->ctx = new DeviceCtx[eng->num_devices]();
@@ -684,6 +730,23 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             has_gdn = has_gdn || eng->desc.layer_mixers[i] == ENGINE_MIXER_GDN;
             has_mla = has_mla || eng->desc.layer_mixers[i] == ENGINE_MIXER_MLA;
         }
+        /* Refuse an MLA cache the attention kernel could never decode, before
+         * the per-layer caches are allocated. The kernel's shared-memory budget,
+         * not the model's position limit, is what bounds this. */
+        if (has_mla) {
+            for (int d = 0; d < eng->num_devices; ++d) {
+                check_cuda(cudaSetDevice(eng->devices[d]), "Select device for the MLA limit");
+                const int limit = kernel_mla_max_seq_len();
+                if (eng->dims.max_seq_len > limit)
+                    throw EngineError(ENGINE_ERR_CONFIG,
+                                      "max_seq_len " + std::to_string(eng->dims.max_seq_len) +
+                                          " exceeds the MLA attention kernel's "
+                                          "shared-memory limit of " +
+                                          std::to_string(limit) + " tokens on device " +
+                                          std::to_string(eng->devices[d]));
+            }
+            check_cuda(cudaSetDevice(eng->devices[0]), "Restore the first device");
+        }
         const size_t activation_bytes = (size_t)max_chunk * hidden * sizeof(__nv_bfloat16);
         for (int d = 0; d < eng->num_devices; ++d) {
             DeviceCtx &ctx = eng->ctx[d];
@@ -692,6 +755,8 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             check_cuda(cudaStreamCreateWithFlags(&ctx.stream, cudaStreamNonBlocking), "Create stream");
             check_cuda(cudaEventCreateWithFlags(&ctx.copy_event, cudaEventDisableTiming),
                        "Create copy event");
+            check_cuda(cudaEventCreateWithFlags(&ctx.read_done_event, cudaEventDisableTiming),
+                       "Create read-completion event");
             check_cublas(cublasCreate(&ctx.cublas), "Create cuBLAS");
             check_cublas(cublasSetStream(ctx.cublas, ctx.stream), "Set cuBLAS stream");
             check_cuda(cudaMalloc(&ctx.residual, activation_bytes), "Allocate residual");
@@ -755,8 +820,10 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                     __nv_bfloat16 **target = role_target(lw, role);
                     if (target == nullptr) continue;
                     bool sharded = false;
+                    /* The buffer is registered with the layer by the loader
+                     * itself, as soon as it is allocated. */
                     load_role_view(index, eng->desc, role, i, ctx.device_id, r, target,
-                                   &sharded);
+                                   &sharded, &lw.owned);
                     if (sharded) {
                         if (role == ROLE_ATTN_Q || role == ROLE_ATTN_K ||
                             role == ROLE_ATTN_V || role == ROLE_ATTN_O)
@@ -765,7 +832,6 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                                  role == ROLE_MLP_DOWN)
                             ffn_sharded = true;
                     }
-                    lw.owned.push_back(*target);
                 }
                 lw.mixer_sharded = mixer_sharded;
                 lw.ffn_sharded = ffn_sharded;
@@ -790,50 +856,48 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                     std::vector<int> qkv_order, z_order, b_order, a_order;
                     fused_gdn_row_orders(eng->dims, qkv_order, z_order, b_order, a_order);
                     load_role_rows(index, eng->desc, ROLE_GDN_QKVZ, i, ctx.device_id, qkv_order,
-                                   &lw.in_proj_qkv_w);
+                                   &lw.in_proj_qkv_w, lw.owned);
                     load_role_rows(index, eng->desc, ROLE_GDN_QKVZ, i, ctx.device_id, z_order,
-                                   &lw.in_proj_z_w);
+                                   &lw.in_proj_z_w, lw.owned);
                     load_role_rows(index, eng->desc, ROLE_GDN_BA, i, ctx.device_id, b_order,
-                                   &lw.in_proj_b_w);
+                                   &lw.in_proj_b_w, lw.owned);
                     load_role_rows(index, eng->desc, ROLE_GDN_BA, i, ctx.device_id, a_order,
-                                   &lw.in_proj_a_w);
-                    lw.owned.push_back(lw.in_proj_qkv_w);
-                    lw.owned.push_back(lw.in_proj_z_w);
-                    lw.owned.push_back(lw.in_proj_b_w);
-                    lw.owned.push_back(lw.in_proj_a_w);
+                                   &lw.in_proj_a_w, lw.owned);
                 }
                 if (lw.plan.mixer == ENGINE_MIXER_FULL_ATTN) {
-                    check_cuda(cudaMalloc(&lw.kv_cache, kv_cache_bytes(eng->local_dims)),
-                               "Allocate KV cache");
-                    check_cuda(cudaMemsetAsync(lw.kv_cache, 0, kv_cache_bytes(eng->local_dims),
-                                               ctx.stream), "Zero KV cache");
-                    lw.owned.push_back(lw.kv_cache);
-                    lw.reset_zero.emplace_back(lw.kv_cache, kv_cache_bytes(eng->local_dims));
+                    const size_t kv_bytes = kv_cache_bytes(eng->local_dims);
+                    lw.kv_cache = (__nv_bfloat16 *)alloc_owned(lw.owned, kv_bytes,
+                                                               ctx.device_id, "Allocate KV cache");
+                    check_cuda(cudaMemsetAsync(lw.kv_cache, 0, kv_bytes, ctx.stream),
+                               "Zero KV cache");
+                    lw.reset_zero.emplace_back(lw.kv_cache, kv_bytes);
                 } else if (lw.plan.mixer == ENGINE_MIXER_MLA) {
                     const size_t mla_bytes = (size_t)eng->dims.max_seq_len *
                         (eng->dims.mla_kv_lora_rank + eng->dims.mla_qk_rope_head_dim) *
                         sizeof(__nv_bfloat16);
-                    check_cuda(cudaMalloc(&lw.mla_cache, mla_bytes), "Allocate MLA cache");
+                    lw.mla_cache = (__nv_bfloat16 *)alloc_owned(lw.owned, mla_bytes,
+                                                                ctx.device_id, "Allocate MLA cache");
                     check_cuda(cudaMemsetAsync(lw.mla_cache, 0, mla_bytes, ctx.stream),
                                "Zero MLA cache");
-                    lw.owned.push_back(lw.mla_cache);
                     lw.reset_zero.emplace_back(lw.mla_cache, mla_bytes);
                 } else if (lw.plan.mixer == ENGINE_MIXER_GDN) {
-                    check_cuda(cudaMalloc(&lw.gdn_norm_f32, eng->dims.gdn_head_dim * sizeof(float)),
-                               "Allocate GDN norm");
+                    const size_t norm_bytes = eng->dims.gdn_head_dim * sizeof(float);
+                    lw.gdn_norm_f32 = (float *)alloc_owned(lw.owned, norm_bytes, ctx.device_id,
+                                                           "Allocate GDN norm");
                     kernel_cast_bf16_f32(lw.gdn_norm_f32, lw.gdn_norm_w, eng->dims.gdn_head_dim, ctx.stream);
                     check_cuda(cudaGetLastError(), "Convert GDN norm");
-                    lw.owned.push_back(lw.gdn_norm_f32);
-                    check_cuda(cudaMalloc(&lw.conv_state, conv_state_bytes(eng)), "Allocate conv state");
-                    check_cuda(cudaMemsetAsync(lw.conv_state, 0, conv_state_bytes(eng), ctx.stream),
+                    const size_t conv_bytes = conv_state_bytes(eng);
+                    lw.conv_state = (__nv_bfloat16 *)alloc_owned(lw.owned, conv_bytes,
+                                                                 ctx.device_id, "Allocate conv state");
+                    check_cuda(cudaMemsetAsync(lw.conv_state, 0, conv_bytes, ctx.stream),
                                "Zero conv state");
-                    check_cuda(cudaMalloc(&lw.ssm_state, ssm_state_bytes(eng)), "Allocate SSM state");
-                    check_cuda(cudaMemsetAsync(lw.ssm_state, 0, ssm_state_bytes(eng), ctx.stream),
+                    const size_t ssm_bytes = ssm_state_bytes(eng);
+                    lw.ssm_state = (float *)alloc_owned(lw.owned, ssm_bytes, ctx.device_id,
+                                                        "Allocate SSM state");
+                    check_cuda(cudaMemsetAsync(lw.ssm_state, 0, ssm_bytes, ctx.stream),
                                "Zero SSM state");
-                    lw.owned.push_back(lw.conv_state);
-                    lw.owned.push_back(lw.ssm_state);
-                    lw.reset_zero.emplace_back(lw.conv_state, conv_state_bytes(eng));
-                    lw.reset_zero.emplace_back(lw.ssm_state, ssm_state_bytes(eng));
+                    lw.reset_zero.emplace_back(lw.conv_state, conv_bytes);
+                    lw.reset_zero.emplace_back(lw.ssm_state, ssm_bytes);
                 } else {
                     throw EngineError(ENGINE_ERR_CONFIG,
                                       "Layer kind is not implemented in this build");
@@ -919,14 +983,16 @@ static int allreduce_layer_out(EngineHandle *eng, size_t elements) {
     std::vector<__nv_bfloat16 *> buffers(eng->num_devices);
     std::vector<cudaStream_t> streams(eng->num_devices);
     std::vector<cudaEvent_t> events(eng->num_devices);
+    std::vector<cudaEvent_t> done_events(eng->num_devices);
     for (int d = 0; d < eng->num_devices; ++d) {
         buffers[d] = eng->ctx[d].layer_out;
         streams[d] = eng->ctx[d].stream;
         events[d] = eng->ctx[d].copy_event;
+        done_events[d] = eng->ctx[d].read_done_event;
     }
     return allreduce_sum_bf16(eng->devices.data(), streams.data(), events.data(),
-                              eng->num_devices, buffers.data(), eng->ctx[0].reduce_staging,
-                              elements);
+                              done_events.data(), eng->num_devices, buffers.data(),
+                              eng->ctx[0].reduce_staging, elements);
 }
 
 /* LayerContext hook for sublayers whose parts live on different ranks (expert
@@ -1222,6 +1288,7 @@ void engine_destroy(EngineHandle *eng) {
                     set_error("engine_destroy: cuBLAS status %d", (int)status);
             }
             if (ctx.copy_event) cleanup_cuda(cudaEventDestroy(ctx.copy_event));
+            if (ctx.read_done_event) cleanup_cuda(cudaEventDestroy(ctx.read_done_event));
             if (ctx.stream) cleanup_cuda(cudaStreamDestroy(ctx.stream));
         }
     }

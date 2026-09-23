@@ -82,6 +82,47 @@ bool run_case(const Case &c, const ModelDims &dims, const MlaWeights &w,
     return test::compare(name, split, aligned, 2e-3, 5e-2);
 }
 
+/* One call at a chosen sequence length. Used to pin the shared-memory boundary:
+ * a length the kernel can hold must run, and the next one must be refused with a
+ * status rather than an opaque launch failure. */
+bool run_length_case(int seq_len, bool expect_accepted, const ModelDims &base_dims,
+                     const MlaWeights &w, cublasHandle_t cublas, test::Stream &stream) {
+    ModelDims dims = base_dims;
+    dims.max_seq_len = seq_len;
+    const int tokens = seq_len < ENGINE_MAX_CHUNK ? seq_len : ENGINE_MAX_CHUNK;
+    const int hidden = dims.hidden_size;
+    const int latent_width = dims.mla_kv_lora_rank + dims.mla_qk_rope_head_dim;
+
+    std::vector<Bf16> residual((size_t)tokens * hidden);
+    for (size_t i = 0; i < residual.size(); ++i) residual[i] = test::bf16(test::sample(i, 29));
+    DeviceBuffer<Bf16> d_residual(residual.size());
+    d_residual.upload(residual, stream.get());
+
+    const size_t ws_bytes = layer_workspace_size(ENGINE_MAX_CHUNK, &dims);
+    DeviceBuffer<Bf16> d_ws(ws_bytes / sizeof(Bf16));
+    DeviceBuffer<Bf16> d_out((size_t)ENGINE_MAX_CHUNK * hidden);
+    DeviceBuffer<Bf16> d_cache((size_t)seq_len * latent_width);
+    std::vector<Bf16> zeros((size_t)seq_len * latent_width, test::bf16(0.0f));
+    d_cache.upload(zeros, stream.get());
+    DeviceBuffer<int64_t> d_pos(ENGINE_MAX_CHUNK);
+    std::vector<int64_t> positions(ENGINE_MAX_CHUNK, 0);
+    for (int t = 0; t < tokens; ++t) positions[t] = seq_len - tokens + t;
+    d_pos.upload(positions, stream.get());
+
+    void *scratch = nullptr;
+    CUDA_CHECK(cudaMalloc(&scratch, kernel_mla_scratch_size(seq_len, &dims)));
+    const int status = forward_mla_layer(cublas, stream.get(), d_residual.get(), d_ws.get(),
+                                         d_out.get(), &w, d_cache.get(), scratch, d_pos.get(),
+                                         tokens, seq_len, &dims);
+    CUDA_CHECK(cudaFree(scratch));
+
+    const bool accepted = status == 0;
+    const bool pass = accepted == expect_accepted;
+    std::printf("mla seq_len %d: %s (%s)\n", seq_len, pass ? "PASS" : "FAIL",
+                accepted ? "accepted" : "refused");
+    return pass;
+}
+
 }  // namespace
 
 int main() {
@@ -142,6 +183,24 @@ int main() {
     for (const Case &c : {Case{65, {65}, {64, 1}}, Case{72, {72}, {64, 8}},
                           Case{140, {128, 12}, {64, 76}}}) {
         ok &= run_case(c, dims, weights, cublas, stream);
+    }
+
+    /* The attention kernel's shared-memory budget is what caps the sequence
+     * length. The supported limit must run; one token more must be refused with
+     * a status, and 16K must not silently appear to work. */
+    const int limit = kernel_mla_max_seq_len();
+    std::printf("test_mla: shared-memory limit is %d tokens\n", limit);
+    if (limit <= 0) {
+        std::fprintf(stderr, "test_mla: the device reports no usable shared-memory limit\n");
+        ok = false;
+    } else {
+        ok &= run_length_case(limit, true, dims, weights, cublas, stream);
+        ok &= run_length_case(limit + 1, false, dims, weights, cublas, stream);
+        if (limit < 16384) {
+            ok &= run_length_case(16384, false, dims, weights, cublas, stream);
+        } else {
+            std::printf("test_mla: SKIP the 16K case (limit %d already covers it)\n", limit);
+        }
     }
     cublasDestroy(cublas);
     return test::finish("test_mla", ok);

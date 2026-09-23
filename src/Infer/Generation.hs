@@ -2,12 +2,17 @@
 --
 -- Manages the prefill → decode cycle, EOS detection, and token-by-token
 -- text output via the tokenizer.
+--
+-- Failure policy: a zero or negative token budget generates nothing and never
+-- touches the engine; any engine error is thrown to the caller instead of being
+-- turned into a short (or empty) result, so the entry point can report failure.
 module Infer.Generation
   ( generate
   , generateStreaming
   , argmax
   ) where
 
+import Control.Exception (throwIO)
 import Data.Int (Int64)
 import Data.List (foldl')
 import Data.Ord (comparing)
@@ -27,69 +32,86 @@ argmax xs = fromIntegral (fst (maximumBy' (comparing snd) (zip [0..] xs)))
 
 -- | Generate tokens greedily (non-streaming, returns all tokens at once).
 -- The vocabulary size comes from 'Infer.FFI.Engine.engineVocabSize'.
+--
+-- At most @maxNew@ tokens are produced, counting the first token decoded from
+-- the prefill logits; the budget stop and the EOS stop apply to both the first
+-- and the later tokens.
 generate :: Ptr EngineHandle -> Int -> [Int] -> [Int64] -> Int -> IO [Int64]
-generate engine vocab eosTokens prompt maxNew = do
-  engineReset engine
-  -- Prefill
-  result <- enginePrefill engine prompt vocab
-  case result of
-    Left err -> do
-      putStrLn $ "Prefill error: " ++ err
-      return []
-    Right logits -> do
+generate engine vocab eosTokens prompt maxNew
+  | maxNew <= 0 = return []
+  | otherwise = do
+      engineReset engine
+      logits <- prefillLogits engine prompt vocab
       let firstToken = argmax logits
-      go [firstToken] firstToken (maxNew - 1)
+      if isEos firstToken
+        then return [firstToken]
+        else go [firstToken] firstToken (maxNew - 1)
   where
-    go acc _ 0 = return (reverse acc)
-    go acc lastTok n = do
-      result <- engineDecode engine lastTok vocab
-      case result of
-        Left err -> do
-          putStrLn $ "Decode error: " ++ err
-          return (reverse acc)
-        Right logits -> do
-          let nextTok = argmax logits
-          if fromIntegral nextTok `elem` eosTokens
-            then return (reverse (nextTok : acc))
-            else go (nextTok : acc) nextTok (n - 1)
+    isEos token = fromIntegral token `elem` eosTokens
+    go acc _ remaining | remaining <= 0 = return (reverse acc)
+    go acc lastTok remaining = do
+      logits <- decodeLogits engine lastTok vocab
+      let nextTok = argmax logits
+      if isEos nextTok
+        then return (reverse (nextTok : acc))
+        else go (nextTok : acc) nextTok (remaining - 1)
 
 -- | Generate tokens with streaming output (prints each token as it's decoded).
-generateStreaming :: Ptr EngineHandle -> Int -> [Int] -> Tokenizer -> [Int64] -> Int -> IO [Int64]
-generateStreaming engine vocab eosTokens tok prompt maxNew = do
-  engineReset engine
-  -- Prefill
-  result <- enginePrefill engine prompt vocab
-  case result of
-    Left err -> do
-      putStrLn $ "Prefill error: " ++ err
-      return []
-    Right logits -> do
+--
+-- The text of a token is produced by the incremental decoder, so a character
+-- whose UTF-8 bytes span several tokens is only printed once complete. The
+-- caller owns the stream handle (create it with 'newDecodeStream').
+generateStreaming :: Ptr EngineHandle -> Int -> [Int] -> DecodeStream -> [Int64] -> Int -> IO [Int64]
+generateStreaming engine vocab eosTokens stream prompt maxNew
+  | maxNew <= 0 = return []
+  | otherwise = do
+      engineReset engine
+      logits <- prefillLogits engine prompt vocab
       let firstToken = argmax logits
-      emitToken tok firstToken
-      go [firstToken] firstToken (maxNew - 1)
+      emitToken stream firstToken
+      if isEos firstToken
+        then finish [firstToken]
+        else go [firstToken] firstToken (maxNew - 1)
   where
-    go acc _ 0 = do
+    isEos token = fromIntegral token `elem` eosTokens
+    finish acc = do
+      -- Flush a trailing partial character before closing the line, so the
+      -- last token is never silently dropped.
+      tailText <- finishStream stream
+      putStr tailText
       putStrLn ""  -- newline after streaming
       return (reverse acc)
-    go acc lastTok n = do
-      result <- engineDecode engine lastTok vocab
-      case result of
-        Left err -> do
-          putStrLn $ "\nDecode error: " ++ err
-          return (reverse acc)
-        Right logits -> do
-          let nextTok = argmax logits
-          if fromIntegral nextTok `elem` eosTokens
-            then do
-              putStrLn ""
-              return (reverse (nextTok : acc))
-            else do
-              emitToken tok nextTok
-              go (nextTok : acc) nextTok (n - 1)
+    go acc _ remaining | remaining <= 0 = finish acc
+    go acc lastTok remaining = do
+      logits <- decodeLogits engine lastTok vocab
+      let nextTok = argmax logits
+      if isEos nextTok
+        then finish (nextTok : acc)
+        else do
+          emitToken stream nextTok
+          go (nextTok : acc) nextTok (remaining - 1)
 
--- | Decode and print a single token.
-emitToken :: Tokenizer -> Int64 -> IO ()
-emitToken tok tid = do
-  text <- decodeSingle tok tid
+-- | Prefill, propagating the engine's error instead of returning no logits.
+prefillLogits :: Ptr EngineHandle -> [Int64] -> Int -> IO [Float]
+prefillLogits engine prompt vocab = do
+  result <- enginePrefill engine prompt vocab
+  case result of
+    Left err -> throwIO (userError ("prefill failed: " ++ err))
+    Right logits -> return logits
+
+-- | Decode one token, propagating the engine's error.
+decodeLogits :: Ptr EngineHandle -> Int64 -> Int -> IO [Float]
+decodeLogits engine token vocab = do
+  result <- engineDecode engine token vocab
+  case result of
+    Left err -> throwIO (userError ("decode failed: " ++ err))
+    Right logits -> return logits
+
+-- | Feed one token to the incremental decoder and print whatever text became
+-- available (nothing, while a multi-byte character is still incomplete).
+emitToken :: DecodeStream -> Int64 -> IO ()
+emitToken stream tid = do
+  feedToken stream tid
+  text <- drainStream stream
   putStr text
   hFlush stdout

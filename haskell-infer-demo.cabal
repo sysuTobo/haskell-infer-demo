@@ -60,6 +60,42 @@ executable haskell-infer-demo
   if os(linux)
     extra-libraries:  m, dl, pthread
 
+-- CPU regression for the generation loop: the real Generation/Runtime/Tokenizer
+-- stack driven by the C stub in tests/generation_engine_stub.c, so no engine or
+-- tokenizer shared library is linked and no GPU is needed.
+test-suite infer-generation-tests
+  import:             common-opts
+  type:               exitcode-stdio-1.0
+  main-is:            GenerationSpec.hs
+  hs-source-dirs:     tests, src
+  c-sources:          tests/generation_engine_stub.c
+  include-dirs:       csrc/include
+  other-modules:
+                      Infer.Config
+                      Infer.Descriptor
+                      Infer.Descriptor.Adapter
+                      Infer.Descriptor.Adapter.Json
+                      Infer.Descriptor.Adapter.Mixtral
+                      Infer.Descriptor.Adapter.Qwen35
+                      Infer.Descriptor.Adapter.DeepseekV2
+                      Infer.Descriptor.Adapter.Qwen3Next
+                      Infer.Model
+                      Infer.Placement
+                      Infer.Runtime
+                      Infer.Generation
+                      Infer.Tokenizer
+                      Infer.FFI.Engine
+  build-depends:
+                      base
+                    , aeson
+                    , bytestring
+                    , containers
+                    , directory
+                    , scientific >=0.3
+                    , text
+                    , vector
+                    , hspec >=2.10
+
 test-suite infer-tests
   import:             common-opts
   type:               exitcode-stdio-1.0

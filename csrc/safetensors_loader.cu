@@ -1,286 +1,184 @@
 /**
- * safetensors_loader.cu - Load weights from safetensors files.
+ * safetensors_loader.cu - Upload tensors from safetensors files to the GPU.
  *
- * Safetensors format: [8B header_size LE][JSON header][raw tensor data]
- * JSON header: {"name": {"dtype":"BF16","shape":[N,M],"data_offsets":[s,e]}, ...}
- *
- * Strategy: read header JSON, parse with minimal string matching,
- * then mmap the file and cudaMemcpy tensors to the correct device.
+ * Header parsing and all request validation live in safetensors.cpp, which is
+ * CUDA-free and covered by tests/safetensors_test.cpp. This file only moves
+ * bytes: it re-checks the byte range against the real file size, re-checks what
+ * it read, and reports file and CUDA failures instead of letting a short read
+ * or a failed copy pass as success.
  */
+#include "safetensors.h"
 
-#include "engine.h"
-#include "kernels.h"
 #include <cuda_runtime.h>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <cstdint>
-#include <fcntl.h>
-#include <sys/mman.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <string>
+#include <memory>
 #include <vector>
-#include <map>
-#include <algorithm>
 
-struct TensorInfo {
-    std::string name;
-    int dtype;          // 0=BF16, 1=F32, 2=F16
-    int shape[4];
-    int ndim;
-    long long data_start;  // byte offset within data section
-    long long data_end;
-    std::string file_path;
-    long long file_data_offset;  // where data section starts in the file
+namespace {
+
+struct FileCloser {
+    void operator()(FILE *file) const {
+        if (file != nullptr) fclose(file);
+    }
 };
 
-// Minimal JSON value extractor for safetensors headers
-static const char *find_key(const char *json, const char *key) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    return strstr(json, pattern);
-}
+using FilePtr = std::unique_ptr<FILE, FileCloser>;
 
-static long long parse_int_after(const char *p, const char *label) {
-    const char *q = find_key(p, label);
-    if (!q) return -1;
-    q = strchr(q + strlen(label) + 2, ':');
-    if (!q) return -1;
-    q++;
-    while (*q == ' ' || *q == '[') q++;
-    return strtoll(q, nullptr, 10);
-}
-
-static int parse_shape(const char *entry, int *shape) {
-    const char *p = strstr(entry, "\"shape\"");
-    if (!p) return 0;
-    p = strchr(p, '[');
-    if (!p) return 0;
-    int n = 0;
-    p++;
-    while (*p && *p != ']' && n < 4) {
-        while (*p == ' ' || *p == ',') p++;
-        if (*p == ']') break;
-        shape[n++] = (int)strtol(p, (char **)&p, 10);
+/* Open the file and confirm [offset, offset+bytes) really lies inside it before
+ * a single byte is read. */
+int open_range(const std::string &path, int64_t offset, int64_t bytes, FilePtr *file) {
+    FILE *raw = fopen(path.c_str(), "rb");
+    if (raw == nullptr) {
+        safetensors_set_error("cannot open " + path + ": " + strerror(errno));
+        return -1;
     }
-    return n;
-}
-
-static int parse_offsets(const char *entry, long long *start, long long *end) {
-    const char *p = strstr(entry, "\"data_offsets\"");
-    if (!p) return -1;
-    p = strchr(p, '[');
-    if (!p) return -1;
-    p++;
-    *start = strtoll(p, (char **)&p, 10);
-    while (*p && *p != ',' && *p != ']') p++;
-    if (*p == ',') p++;
-    *end = strtoll(p, nullptr, 10);
+    file->reset(raw);
+    struct stat info;
+    if (fstat(fileno(raw), &info) != 0 || !S_ISREG(info.st_mode)) {
+        safetensors_set_error("cannot stat " + path);
+        return -1;
+    }
+    const int64_t file_size = (int64_t)info.st_size;
+    if (offset > file_size || bytes > file_size - offset) {
+        safetensors_set_error("reading " + std::to_string(bytes) + " bytes at " +
+                              std::to_string(offset) + " runs past the end of " + path);
+        return -1;
+    }
+    if (fseek(raw, (long)offset, SEEK_SET) != 0) {
+        safetensors_set_error("cannot seek in " + path);
+        return -1;
+    }
     return 0;
 }
 
-/**
- * Parse a safetensors file header and return tensor metadata.
- */
-int safetensors_parse_header(const char *path, std::vector<TensorInfo> &tensors) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-
-    uint64_t hdr_size = 0;
-    fread(&hdr_size, 8, 1, f);
-
-    std::vector<char> hdr_buf(hdr_size + 1);
-    fread(hdr_buf.data(), 1, hdr_size, f);
-    hdr_buf[hdr_size] = '\0';
-    long long data_offset = 8 + (long long)hdr_size;
-    fclose(f);
-
-    const char *json = hdr_buf.data();
-    // Parse each top-level key-value pair
-    // Format: {"name": {...}, "name2": {...}, ...}
-    const char *p = json;
-    while ((p = strchr(p, '"')) != nullptr) {
-        // Check if this is a tensor name (followed by ": {")
-        const char *name_start = p + 1;
-        const char *name_end = strchr(name_start, '"');
-        if (!name_end) break;
-
-        std::string name(name_start, name_end - name_start);
-        p = name_end + 1;
-
-        // Skip metadata key
-        if (name == "__metadata__") {
-            // Skip to next entry
-            const char *next = strchr(p, '}');
-            if (next) p = next + 1;
-            continue;
+int upload(const void *host, void *dst, int64_t bytes, int device) {
+    cudaError_t error = cudaSetDevice(device);
+    if (error != cudaSuccess) {
+        safetensors_set_error(cudaGetErrorString(error));
+        return -1;
+    }
+    if (bytes > 0) {
+        error = cudaMemcpy(dst, host, (size_t)bytes, cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) {
+            safetensors_set_error(cudaGetErrorString(error));
+            return -1;
         }
-
-        // Find the opening brace of this entry
-        const char *entry_start = strchr(p, '{');
-        if (!entry_start) break;
-
-        // Find matching closing brace (no nested objects in safetensors)
-        const char *entry_end = strchr(entry_start, '}');
-        if (!entry_end) break;
-
-        // Extract fields from this entry
-        std::string entry(entry_start, entry_end - entry_start + 1);
-
-        TensorInfo ti;
-        ti.name = name;
-        ti.file_path = path;
-        ti.file_data_offset = data_offset;
-
-        // dtype
-        if (entry.find("\"BF16\"") != std::string::npos) ti.dtype = 0;
-        else if (entry.find("\"F32\"") != std::string::npos) ti.dtype = 1;
-        else if (entry.find("\"F16\"") != std::string::npos) ti.dtype = 2;
-        else ti.dtype = 0;
-
-        ti.ndim = parse_shape(entry.c_str(), ti.shape);
-        parse_offsets(entry.c_str(), &ti.data_start, &ti.data_end);
-
-        tensors.push_back(ti);
-        p = entry_end + 1;
     }
     return 0;
 }
 
-/**
- * Load a tensor from a safetensors file to GPU memory.
- */
-int safetensors_load_tensor(const TensorInfo &ti, void *dst, int device) {
-    long long size = ti.data_end - ti.data_start;
-    long long file_offset = ti.file_data_offset + ti.data_start;
-
-    // Read from file to host, then copy to device
-    std::vector<char> host_buf(size);
-    FILE *f = fopen(ti.file_path.c_str(), "rb");
-    if (!f) return -1;
-    fseek(f, file_offset, SEEK_SET);
-    size_t read = fread(host_buf.data(), 1, size, f);
-    fclose(f);
-    if ((long long)read != size) return -2;
-
-    cudaSetDevice(device);
-    cudaMemcpy(dst, host_buf.data(), size, cudaMemcpyHostToDevice);
-    return 0;
-}
-
-/**
- * Load a tensor whose rows the caller wants in a different order: row i of [dst]
- * comes from row order[i] of the file. Fused checkpoints store their rows in the
- * reference implementation's own grouping (see the fused qkvz/ba roles in
- * engine.cu), and this keeps the gather off the forward path.
- */
-int safetensors_load_tensor_rows(const TensorInfo &ti, void *dst, int device,
-                                 const int *order, long long rows, long long row_bytes) {
-    long long size = ti.data_end - ti.data_start;
-    long long file_offset = ti.file_data_offset + ti.data_start;
-    // [rows] is how many rows the caller keeps, which may be a subset of the
-    // tensor's own row count (e.g. qkv out of a fused qkvz).
-    if (rows <= 0 || row_bytes <= 0 || rows * row_bytes > size) return -3;
-    const long long source_rows = size / row_bytes;
-
-    std::vector<char> host_buf(size);
-    FILE *f = fopen(ti.file_path.c_str(), "rb");
-    if (!f) return -1;
-    fseek(f, file_offset, SEEK_SET);
-    size_t read = fread(host_buf.data(), 1, size, f);
-    fclose(f);
-    if ((long long)read != size) return -2;
-
-    std::vector<char> gathered(rows * row_bytes);
-    for (long long row = 0; row < rows; ++row) {
-        long long source = order[row];
-        if (source < 0 || source >= source_rows) return -4;
-        memcpy(gathered.data() + row * row_bytes, host_buf.data() + source * row_bytes,
-               (size_t)row_bytes);
+int read_exactly(const std::string &path, FILE *file, char *buffer, int64_t bytes) {
+    if (bytes > 0 && fread(buffer, 1, (size_t)bytes, file) != (size_t)bytes) {
+        safetensors_set_error("short read from " + path);
+        return -2;
     }
-
-    cudaSetDevice(device);
-    cudaMemcpy(dst, gathered.data(), rows * row_bytes, cudaMemcpyHostToDevice);
     return 0;
 }
 
-/**
- * Load a rectangular slice of a 2-D tensor to GPU memory: rows
- * [row_off, row_off+rows) and, within each row, elements [col_off, col_off+cols).
- * The destination holds `rows` contiguous rows of `cols` elements. Whole-row
- * slices are one contiguous read; column slices stage a bounded number of rows
- * through a host buffer.
- */
-int safetensors_load_tensor_slice(const TensorInfo &ti, void *dst, int device,
-                                  long long row_off, long long rows,
-                                  long long col_off, long long cols) {
-    if (ti.ndim != 2 || rows <= 0 || cols <= 0) return -3;
-    const long long src_rows = ti.shape[0];
-    const long long src_cols = ti.shape[1];
-    if (row_off < 0 || col_off < 0 || row_off + rows > src_rows || col_off + cols > src_cols)
+}  // namespace
+
+int safetensors_load_tensor(const TensorInfo &ti, void *dst, int64_t dst_capacity, int device) {
+    if (dst == nullptr) {
+        safetensors_set_error("tensor " + ti.name + ": no destination");
         return -3;
-    const long long element = (long long)sizeof(__nv_bfloat16);
-    const long long src_row_bytes = src_cols * element;
-    const long long dst_row_bytes = cols * element;
-    const long long file_offset = ti.file_data_offset + ti.data_start;
-    FILE *f = fopen(ti.file_path.c_str(), "rb");
-    if (!f) return -1;
-    cudaSetDevice(device);
-    if (col_off == 0 && cols == src_cols) {
-        std::vector<char> host_buf((size_t)(rows * src_row_bytes));
-        fseek(f, file_offset + row_off * src_row_bytes, SEEK_SET);
-        size_t read = fread(host_buf.data(), 1, host_buf.size(), f);
-        fclose(f);
-        if ((long long)read != rows * src_row_bytes) return -2;
-        cudaMemcpy(dst, host_buf.data(), host_buf.size(), cudaMemcpyHostToDevice);
-        return 0;
     }
-    const long long chunk_rows = std::min<long long>(rows, 64);
-    std::vector<char> host_buf((size_t)(chunk_rows * dst_row_bytes));
-    for (long long done = 0; done < rows; done += chunk_rows) {
-        const long long take = std::min(chunk_rows, rows - done);
-        for (long long r = 0; r < take; ++r) {
-            const long long offset = file_offset + (row_off + done + r) * src_row_bytes
-                                     + col_off * element;
-            fseek(f, offset, SEEK_SET);
-            size_t read = fread(host_buf.data() + (size_t)(r * dst_row_bytes), 1,
-                                (size_t)dst_row_bytes, f);
-            if ((long long)read != dst_row_bytes) { fclose(f); return -2; }
-        }
-        cudaMemcpy((char *)dst + done * dst_row_bytes, host_buf.data(),
-                   (size_t)(take * dst_row_bytes), cudaMemcpyHostToDevice);
-    }
-    fclose(f);
-    return 0;
+    SafetensorsPlan plan;
+    int status = safetensors_plan_whole(ti, dst_capacity, &plan);
+    if (status != 0) return status;
+
+    FilePtr file;
+    status = open_range(ti.file_path, plan.file_offset, plan.file_bytes, &file);
+    if (status != 0) return status;
+
+    std::vector<char> host((size_t)plan.file_bytes);
+    status = read_exactly(ti.file_path, file.get(), host.data(), plan.file_bytes);
+    if (status != 0) return status;
+    return upload(host.data(), dst, plan.dst_bytes, device);
 }
 
-/**
- * Scan model directory for all safetensors files and build a tensor index.
- */
-int safetensors_scan_dir(const char *model_dir, std::map<std::string, TensorInfo> &index) {
-    std::vector<TensorInfo> all_tensors;
-    DIR *dir = opendir(model_dir);
-    if (!dir) return -1;
+int safetensors_load_tensor_rows(const TensorInfo &ti, void *dst, int64_t dst_capacity,
+                                 int device, const int *order, int64_t rows, int64_t row_bytes) {
+    if (dst == nullptr) {
+        safetensors_set_error("tensor " + ti.name + ": no destination");
+        return -3;
+    }
+    SafetensorsPlan plan;
+    int status = safetensors_plan_rows(ti, dst_capacity, order, rows, row_bytes, &plan);
+    if (status != 0) return status;
 
-    std::vector<std::string> files;
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        std::string name = ent->d_name;
-        if (name.size() > 12 && name.substr(name.size() - 12) == ".safetensors") {
-            files.push_back(std::string(model_dir) + "/" + name);
+    FilePtr file;
+    status = open_range(ti.file_path, plan.file_offset, plan.file_bytes, &file);
+    if (status != 0) return status;
+
+    std::vector<char> host((size_t)plan.file_bytes);
+    status = read_exactly(ti.file_path, file.get(), host.data(), plan.file_bytes);
+    if (status != 0) return status;
+
+    std::vector<char> gathered((size_t)plan.dst_bytes);
+    for (int64_t row = 0; row < rows; ++row) {
+        const int64_t source = order[row];
+        memcpy(gathered.data() + (size_t)(row * row_bytes),
+               host.data() + (size_t)(source * row_bytes), (size_t)row_bytes);
+    }
+    return upload(gathered.data(), dst, plan.dst_bytes, device);
+}
+
+int safetensors_load_tensor_slice(const TensorInfo &ti, void *dst, int64_t dst_capacity,
+                                  int device, int64_t row_off, int64_t rows,
+                                  int64_t col_off, int64_t cols) {
+    if (dst == nullptr) {
+        safetensors_set_error("tensor " + ti.name + ": no destination");
+        return -3;
+    }
+    SafetensorsPlan plan;
+    int status = safetensors_plan_slice(ti, dst_capacity, row_off, rows, col_off, cols, &plan);
+    if (status != 0) return status;
+
+    FilePtr file;
+    status = open_range(ti.file_path, plan.file_offset, plan.file_bytes, &file);
+    if (status != 0) return status;
+
+    const int64_t src_row_bytes = ti.shape[1] * ti.element_bytes();
+    const int64_t dst_row_bytes = plan.dst_row_bytes;
+
+    /* Whole rows are one contiguous read; a column window stages a bounded
+     * number of rows through the host. */
+    if (col_off == 0 && cols == ti.shape[1]) {
+        const int64_t start = plan.file_offset + row_off * src_row_bytes;
+        if (fseek(file.get(), (long)start, SEEK_SET) != 0) {
+            safetensors_set_error("tensor " + ti.name + ": cannot seek to the row window");
+            return -2;
         }
-    }
-    closedir(dir);
-    std::sort(files.begin(), files.end());
-
-    for (const auto &f : files) {
-        safetensors_parse_header(f.c_str(), all_tensors);
+        std::vector<char> host((size_t)plan.dst_bytes);
+        status = read_exactly(ti.file_path, file.get(), host.data(), plan.dst_bytes);
+        if (status != 0) return status;
+        return upload(host.data(), dst, plan.dst_bytes, device);
     }
 
-    for (const auto &ti : all_tensors) {
-        index[ti.name] = ti;
+    const int64_t chunk_rows = rows < 64 ? rows : 64;
+    const int64_t element = ti.element_bytes();
+    std::vector<char> host((size_t)(chunk_rows * dst_row_bytes));
+    for (int64_t done = 0; done < rows; done += chunk_rows) {
+        const int64_t take = (chunk_rows < rows - done) ? chunk_rows : rows - done;
+        for (int64_t r = 0; r < take; ++r) {
+            /* Every position stays inside [file_offset, file_offset + file_bytes),
+             * which open_range already checked against the real file size. */
+            const int64_t position = plan.file_offset + (row_off + done + r) * src_row_bytes +
+                                     col_off * element;
+            if (fseek(file.get(), (long)position, SEEK_SET) != 0) {
+                safetensors_set_error("tensor " + ti.name + ": cannot seek inside the row");
+                return -2;
+            }
+            status = read_exactly(ti.file_path, file.get(),
+                                  host.data() + (size_t)(r * dst_row_bytes), dst_row_bytes);
+            if (status != 0) return status;
+        }
+        status = upload(host.data(), (char *)dst + (size_t)(done * dst_row_bytes),
+                        take * dst_row_bytes, device);
+        if (status != 0) return status;
     }
-    return (int)all_tensors.size();
+    return 0;
 }

@@ -66,6 +66,12 @@ qwen38 = Descriptor
   , dMoeSharedIntermediateSize = 0
   , dMoeRoutedScalingFactor = 1.0
   , dMoeSharedGateScalar = False
+  -- No MLA layers: the four MLA dimensions are still mandatory descriptor
+  -- fields, and a non-MLA model carries zeros.
+  , dMlaKvLoraRank = 0
+  , dMlaQkNopeHeadDim = 0
+  , dMlaQkRopeHeadDim = 0
+  , dMlaVHeadDim = 0
   , dEosTokens = [248046, 248044]
   , dLayerMixers =
       [ if (i + 1) `mod` 4 == 0 then MFullAttention else MGatedDeltaNet

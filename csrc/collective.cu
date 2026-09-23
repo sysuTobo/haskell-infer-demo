@@ -76,26 +76,49 @@ int copy_across_devices(int from_device, cudaStream_t from_stream, cudaEvent_t *
 }
 
 int allreduce_sum_bf16(const int *devices, cudaStream_t *streams, cudaEvent_t *events,
-                       int count, __nv_bfloat16 **buffers, __nv_bfloat16 *leader_staging,
-                       size_t elements) {
+                       cudaEvent_t *done_events, int count, __nv_bfloat16 **buffers,
+                       __nv_bfloat16 *leader_staging, size_t elements) {
     if (count < 2) return 0;
     const size_t bytes = elements * sizeof(__nv_bfloat16);
+
+    /* Reduce: each rank's buffer is read on the leader stream, ordered by the
+     * event its own stream recorded when it produced the data. */
     for (int i = 1; i < count; ++i) {
         int status = copy_across_devices(devices[i], streams[i], &events[i],
                                          devices[0], streams[0],
                                          leader_staging, buffers[i], bytes);
         if (status != 0) return status;
         /* Runs on the leader stream, ordered after the copy by the event above. */
-        cudaSetDevice(devices[0]);
+        cudaError_t error = cudaSetDevice(devices[0]);
+        if (error != cudaSuccess) return (int)error;
         kernel_residual_add(buffers[0], leader_staging, (int)elements, streams[0]);
-        cudaError_t error = cudaGetLastError();
+        error = cudaGetLastError();
         if (error != cudaSuccess) return (int)error;
     }
+
+    /* Broadcast: every rank copies the leader's buffer. The copy is enqueued on
+     * the receiver's stream but *reads* devices[0]'s memory, so the leader stream
+     * has no ordering with it. Each receiver therefore records a completion
+     * event, and the leader waits on all of them afterwards: a later write to
+     * buffers[0] (the next sublayer's partial sum, or the next round's reduce)
+     * is then ordered after every receiver finished reading. */
     for (int i = 1; i < count; ++i) {
         int status = copy_across_devices(devices[0], streams[0], &events[0],
                                          devices[i], streams[i],
                                          buffers[i], buffers[0], bytes);
         if (status != 0) return status;
+        cudaError_t error = cudaSetDevice(devices[i]);
+        if (error != cudaSuccess) return (int)error;
+        error = cudaEventRecord(done_events[i], streams[i]);
+        if (error != cudaSuccess) return (int)error;
+    }
+    cudaError_t error = cudaSetDevice(devices[0]);
+    if (error != cudaSuccess) return (int)error;
+    for (int i = 1; i < count; ++i) {
+        /* Recording and waiting happen in host order, so a wait always refers to
+         * the copy it follows and cannot form a wait cycle across rounds. */
+        error = cudaStreamWaitEvent(streams[0], done_events[i], 0);
+        if (error != cudaSuccess) return (int)error;
     }
     return 0;
 }

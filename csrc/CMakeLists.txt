@@ -36,7 +36,7 @@ add_custom_command(
 )
 
 add_library(engine SHARED
-    engine.cu memory.cu safetensors_loader.cu model_desc.c layer_dispatch.cu collective.cu moe.cu tap.cu
+    engine.cu memory.cu safetensors_loader.cu safetensors.cpp model_desc.c layer_dispatch.cu collective.cu moe.cu tap.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu kernels/mla.cu
@@ -57,6 +57,13 @@ enable_testing()
 add_executable(test_model_desc ../tests/model_desc_test.c model_desc.c)
 target_include_directories(test_model_desc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 add_test(NAME test_model_desc COMMAND test_model_desc)
+
+# CPU-only: safetensors header parsing and transfer validation, no GPU required.
+# safetensors.cpp is CUDA-free, so a malformed checkpoint is rejected by a test
+# that runs anywhere.
+add_executable(test_safetensors ../tests/safetensors_test.cpp safetensors.cpp)
+target_include_directories(test_safetensors PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME test_safetensors COMMAND test_safetensors)
 
 option(BUILD_TESTS "Build GPU numerical tests" OFF)
 if(BUILD_TESTS)
@@ -81,6 +88,12 @@ if(BUILD_TESTS)
     add_executable(test_mla ../tests/kernels/test_mla.cu)
     target_link_libraries(test_mla PRIVATE engine)
     add_test(NAME test_mla COMMAND test_mla)
+    # Initialization resource safety: a checkpoint that cannot be loaded must
+    # leave no handle and no device memory behind. Skips itself when no GPU is
+    # visible.
+    add_test(NAME test_engine_resources COMMAND ${Python3_EXECUTABLE}
+             "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_engine_resources.py"
+             --library $<TARGET_FILE:engine>)
     add_library(kernel_test_bridge SHARED ../tests/kernels/kernel_bridge.cu)
     target_link_libraries(kernel_test_bridge PRIVATE engine)
     add_test(NAME test_library_ops COMMAND ${Python3_EXECUTABLE}

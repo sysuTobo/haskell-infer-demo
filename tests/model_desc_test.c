@@ -243,6 +243,47 @@ static void test_tp(void) {
     test_rejects(buf, "cannot carry", "out_heads on a GDN projection is rejected");
 }
 
+/* Tensor parallelism divides the head counts and the dense MLP, and only the
+ * shard rules describe those dimensions. A role left replicated under divided
+ * dimensions makes the forward read the wrong rows of the tensor -- and, for an
+ * output projection, past the end of the destination buffer -- with no error.
+ * (The MLA branch of the same rule covers DeepSeek-style mixers; no descriptor in
+ * the tree reaches it because those models are also MoE, and MoE under tp is
+ * rejected on its own.) */
+static void test_tp_requires_sharded_roles(void) {
+    char buf[8192];
+    struct ModelDesc desc;
+    char err[256] = {0};
+
+    /* The fixture's own table exercises the accepted combination. */
+    build_tp2(buf, sizeof(buf));
+    check(model_desc_parse(buf, &desc, err, sizeof(err)) == 0,
+          err[0] ? err : "the fully sharded tp2 table is accepted");
+
+    /* attnQ/attnK/attnV split rows by heads: replicated is refused, and so is a
+     * rule that describes a different dimension. */
+    build_tp2(buf, sizeof(buf));
+    set_literal(buf, "\"out_heads\",\"out_heads\",\"out_heads\"",
+                    "\"none\",\"out_heads\",\"out_heads\"");
+    test_rejects(buf, "attnQ", "a replicated attnQ is rejected under tp");
+
+    build_tp2(buf, sizeof(buf));
+    set_literal(buf, "\"out_heads\",\"out_heads\",\"out_heads\"",
+                    "\"out_dim\",\"out_heads\",\"out_heads\"");
+    test_rejects(buf, "attnQ", "attnQ with a non-head rule is rejected under tp");
+
+    /* attnO consumes the head output, so it is split by its input dimension. */
+    build_tp2(buf, sizeof(buf));
+    set_literal(buf, "\"in_dim\",\"none\",\"none\"", "\"none\",\"none\",\"none\"");
+    test_rejects(buf, "attnO", "a replicated attnO is rejected under tp");
+
+    /* The dense MLP is divided, so its three roles must be split too. */
+    build_tp2(buf, sizeof(buf));
+    set_literal(buf, "\"in_dim\",\"out_heads\",\"out_heads\"",
+                    "\"none\",\"out_heads\",\"out_heads\"");
+    test_rejects(buf, "mlpDown", "a replicated mlpDown is rejected under tp");
+}
+
 /* The rank's slice of a tensor, as the loader computes it. With tp_size 2:
  * q rows = num_heads * head_dim * 2 (fused gate) = 16 -> 8 rows per rank;
  * gate/up [16,8] -> 8 rows per rank; down [8,16] -> 8 columns per rank; every
@@ -536,6 +577,7 @@ static void test_ep(void) {
 int main(void) {
     test_good();
     test_tp();
+    test_tp_requires_sharded_roles();
     test_shard_view();
     test_moe();
     test_ep();

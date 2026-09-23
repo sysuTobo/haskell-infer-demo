@@ -7,10 +7,12 @@
 --   haskell-infer-demo hello-gpu -d 0 -v 42
 module Main (main) where
 
+import Control.Exception (bracket)
 import qualified Data.ByteString as BS
 import Data.List (intercalate)
 import Options.Applicative
 import System.Exit (exitFailure, exitSuccess)
+import System.IO.Error (ioeGetErrorString, tryIOError)
 import Text.Read (readMaybe)
 
 import Infer.Config
@@ -101,12 +103,12 @@ generateCmd = Generate <$> (GenOptions
      <> showDefault
      <> help "Maximum context length"
       )
-  <*> option auto
+  <*> option nonNegativeInt
       ( long "max-tokens"
      <> metavar "N"
      <> value 256
      <> showDefault
-     <> help "Maximum new tokens to generate"
+     <> help "Maximum new tokens to generate (>= 0; 0 generates nothing)"
       )
   <*> strOption
       ( long "prompt"
@@ -176,6 +178,15 @@ configSource =
        <> metavar "DIR"
        <> help "Derive the descriptor from DIR/config.json"
         ))
+
+-- | A token budget: the CLI rejects a negative count instead of handing it to
+-- the generation loop (which treats <= 0 as "generate nothing").
+nonNegativeInt :: ReadM Int
+nonNegativeInt = eitherReader $ \s -> case readMaybe s :: Maybe Int of
+  Nothing -> Left ("Invalid token budget: " ++ s)
+  Just n
+    | n < 0 -> Left ("max-tokens must be non-negative, got " ++ show n)
+    | otherwise -> Right n
 
 parseGpuList :: ReadM [Int]
 parseGpuList = eitherReader $ \s ->
@@ -275,61 +286,66 @@ runGenerate opts = do
         , rcPrompt    = genPrompt opts
         }
 
-  rt <- initRuntime cfg
-  let engine = runtimeEngine rt
-      tok = rtTokenizer rt
-      vocab = rtVocabSize rt
-      desc = runtimeDescriptor rt
+  -- bracket: the tokenizer and the engine are released on every exit path,
+  -- including a generation failure or an output error.
+  bracket (initRuntime cfg) shutdownRuntime $ \rt -> do
+    let engine = runtimeEngine rt
+        tok = rtTokenizer rt
+        vocab = rtVocabSize rt
+        desc = runtimeDescriptor rt
 
-  if genCheckDesc opts
-    then do
-      echoed <- engineDescribe engine
-      case echoed of
-        Left err -> do
-          putStrLn $ "ERROR: engine_describe failed: " ++ err
-          shutdownRuntime rt
-          exitFailure
-        Right text -> case decodeDescriptor text of
+    if genCheckDesc opts
+      then do
+        echoed <- engineDescribe engine
+        case echoed of
           Left err -> do
-            putStrLn $ "ERROR: engine descriptor echo is not decodable: " ++ err
-            shutdownRuntime rt
+            putStrLn $ "ERROR: engine_describe failed: " ++ err
             exitFailure
-          Right echoedDesc ->
-            if echoedDesc == desc
-              then putStrLn "Descriptor round-trip: OK"
-              else do
-                putStrLn "Descriptor round-trip: MISMATCH"
-                putStrLn $ "  sent: " ++ show desc
-                putStrLn $ "  echo: " ++ show echoedDesc
-                shutdownRuntime rt
-                exitFailure
-    else return ()
+          Right text -> case decodeDescriptor text of
+            Left err -> do
+              putStrLn $ "ERROR: engine descriptor echo is not decodable: " ++ err
+              exitFailure
+            Right echoedDesc ->
+              if echoedDesc == desc
+                then putStrLn "Descriptor round-trip: OK"
+                else do
+                  putStrLn "Descriptor round-trip: MISMATCH"
+                  putStrLn $ "  sent: " ++ show desc
+                  putStrLn $ "  echo: " ++ show echoedDesc
+                  exitFailure
+      else return ()
 
-  putStrLn "Tokenizing prompt..."
-  promptTokens <- encode tok (genPrompt opts)
-  putStrLn $ "  " ++ show (length promptTokens) ++ " tokens"
+    putStrLn "Tokenizing prompt..."
+    promptTokens <- encode tok (genPrompt opts)
+    putStrLn $ "  " ++ show (length promptTokens) ++ " tokens"
 
-  if length promptTokens > genMaxSeqLen opts
-    then do
-      putStrLn "ERROR: prompt exceeds max-seq-len"
-      shutdownRuntime rt
-      exitFailure
-    else return ()
+    if length promptTokens > genMaxSeqLen opts
+      then do
+        putStrLn "ERROR: prompt exceeds max-seq-len"
+        exitFailure
+      else return ()
 
-  putStrLn $ "Generating (max " ++ show (genMaxTokens opts) ++ " tokens)..."
-  putStrLn "---"
-  outputTokens <- if genStreaming opts
-    then generateStreaming engine vocab (dEosTokens desc) tok promptTokens (genMaxTokens opts)
-    else do
-      toks <- generate engine vocab (dEosTokens desc) promptTokens (genMaxTokens opts)
-      text <- decode tok toks
-      putStrLn text
-      return toks
+    putStrLn $ "Generating (max " ++ show (genMaxTokens opts) ++ " tokens)..."
+    putStrLn "---"
+    -- An engine failure is reported as a failed run, never as a short output
+    -- that exits 0.
+    outcome <- tryIOError $ if genStreaming opts
+      then bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
+        generateStreaming engine vocab (dEosTokens desc) stream promptTokens (genMaxTokens opts)
+      else do
+        toks <- generate engine vocab (dEosTokens desc) promptTokens (genMaxTokens opts)
+        text <- decode tok toks
+        putStrLn text
+        return toks
 
-  putStrLn "---"
-  putStrLn $ "Generated " ++ show (length outputTokens) ++ " tokens"
+    outputTokens <- case outcome of
+      Left err -> do
+        putStrLn $ "ERROR: generation failed: " ++ ioeGetErrorString err
+        exitFailure
+      Right toks -> return toks
 
-  shutdownRuntime rt
+    putStrLn "---"
+    putStrLn $ "Generated " ++ show (length outputTokens) ++ " tokens"
 
 -- -----------------------------------------------------------------------
 -- Main

@@ -42,6 +42,14 @@ cd "$ROOT/tokenizer-ffi"
 cargo build --release
 echo "  -> tokenizer-ffi/target/release/libtokenizer_ffi.so"
 
+# The crate's own tests are CPU-only (in-memory fixtures, no model download); run
+# them from the locked, offline resolution so a network hiccup cannot change what
+# gets tested.
+if [ "$BUILD_TESTS" = "ON" ]; then
+  echo "=== Testing tokenizer-ffi (Rust) ==="
+  cargo test --locked --offline
+fi
+
 # ---------------------------------------------------------------------------
 # 2. C/CUDA engine
 # ---------------------------------------------------------------------------
@@ -55,7 +63,7 @@ cmake --build . -j"${BUILD_JOBS:-2}"
 echo "  -> csrc/build-libs/libengine.so"
 
 if [ "$BUILD_TESTS" = "ON" ]; then
-  echo "=== Running CUDA kernel tests ==="
+  echo "=== Running the C/CUDA tests (ctest) ==="
   ctest --output-on-failure
 fi
 
@@ -74,6 +82,13 @@ fi
 cabal build exe:haskell-infer-demo --extra-lib-dirs="$CUDA_HOME/lib64" \
   --ghc-options="-optl-Wl,-rpath,$ROOT/csrc/build-libs -optl-Wl,-rpath,$ROOT/tokenizer-ffi/target/release"
 echo "  -> dist-newstyle/.../haskell-infer-demo"
+
+# Every suite in the package: the descriptor/placement spec and the CPU
+# generation regression that links the engine stub.
+if [ "$BUILD_TESTS" = "ON" ]; then
+  echo "=== Running the Haskell test suites ==="
+  cabal test all --enable-tests --test-show-details=direct
+fi
 
 echo ""
 echo "=== Build complete ==="

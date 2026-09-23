@@ -445,6 +445,33 @@ main = hspec $ do
         (Replicated 1 2) [0, 1]
         `shouldSatisfy` mentions "out_experts"
 
+  describe "Topology resolution (CLI tp/ep vs descriptor)" $ do
+    it "runs single-rank when neither tp nor ep is requested, even for a TP2 descriptor" $ do
+      let captured = qwen38 { dTpSize = 2, dTpRank = 1, dEpSize = 2, dEpRank = 1 }
+      resolveTopology 1 1 captured `shouldBe`
+        Right (Pipelined, qwen38 { dTpSize = 1, dTpRank = 0, dEpSize = 1, dEpRank = 0 })
+
+    it "leaves an already single-rank descriptor untouched" $ do
+      resolveTopology 1 1 qwen38 `shouldBe` Right (Pipelined, qwen38)
+
+    it "overrides the descriptor's ranks with the requested tensor parallelism" $ do
+      case resolveTopology 2 1 (qwen38 { dTpSize = 1, dTpRank = 0 }) of
+        Right (Replicated 2 1, desc) -> do
+          dTpSize desc `shouldBe` 2
+          dTpRank desc `shouldBe` 0
+          dEpSize desc `shouldBe` 1
+        other -> expectationFailure ("unexpected topology: " ++ show other)
+
+    it "selects expert parallelism from --ep" $ do
+      case resolveTopology 1 2 qwen38Moe of
+        Right (Replicated 1 2, desc) -> dEpSize desc `shouldBe` 2
+        other -> expectationFailure ("unexpected topology: " ++ show other)
+
+    it "rejects a non-positive tp or ep before an engine is built" $ do
+      resolveTopology 0 1 qwen38 `shouldSatisfy` mentions "--tp"
+      resolveTopology (-1) 1 qwen38 `shouldSatisfy` mentions "--tp"
+      resolveTopology 1 0 qwen38 `shouldSatisfy` mentions "--ep"
+
   describe "MLA descriptor" $ do
     it "validates and round-trips the DeepSeek-V2-Lite shape" $ do
       validateDescriptor deepseekMla `shouldBe` Right ()

@@ -2,6 +2,7 @@
 module Infer.Runtime
   ( Runtime(..)
   , initRuntime
+  , withRuntimeResources
   , shutdownRuntime
   , loadDescriptor
   , runtimeDescriptor
@@ -10,6 +11,7 @@ module Infer.Runtime
   ) where
 
 import qualified Data.ByteString as BS
+import Control.Exception (onException)
 import Foreign.Ptr
 import System.Exit (exitFailure)
 
@@ -60,12 +62,11 @@ loadDescriptor cfg = case rcDescriptor cfg of
 initRuntime :: RuntimeConfig -> IO Runtime
 initRuntime cfg = do
   base <- loadDescriptor cfg
-  let policy
-        | rcTp cfg > 1 || rcEp cfg > 1 = Replicated (rcTp cfg) (rcEp cfg)
-        | otherwise = Pipelined
-      desc = case policy of
-        Replicated tp ep -> base { dTpSize = tp, dEpSize = ep }
-        Pipelined -> base
+  (policy, desc) <- case resolveTopology (rcTp cfg) (rcEp cfg) base of
+    Left err -> do
+      putStrLn $ "ERROR: " ++ err
+      exitFailure
+    Right resolved -> return resolved
   putStrLn $ "Descriptor: " ++ dFamily desc ++ " (" ++ dModelType desc ++ "), "
     ++ show (dNumLayers desc) ++ " layers, hidden " ++ show (dHiddenSize desc)
     ++ ", vocab " ++ show (dVocabSize desc)
@@ -98,16 +99,28 @@ initRuntime cfg = do
       freeTokenizer tok
       exitFailure
     Just e -> return e
-  vocab <- engineVocabSize engine
+  -- Past this point the tokenizer and the engine are both live but the Runtime
+  -- does not exist yet: if anything throws before it is returned, the caller's
+  -- bracket never sees an acquisition, so release them here rather than leaking.
+  withRuntimeResources engine tok $ do
+    vocab <- engineVocabSize engine
+    putStrLn "Engine initialized successfully."
+    return Runtime
+      { rtEngine = engine
+      , rtTokenizer = tok
+      , rtModel = model
+      , rtConfig = cfg
+      , rtVocabSize = vocab
+      }
 
-  putStrLn "Engine initialized successfully."
-  return Runtime
-    { rtEngine = engine
-    , rtTokenizer = tok
-    , rtModel = model
-    , rtConfig = cfg
-    , rtVocabSize = vocab
-    }
+-- | Run the last step of initialization, releasing the engine and its tokenizer
+-- if it throws instead of returning. The caller's 'bracket' only releases after a
+-- /successful/ acquisition, so the window between \"engine created\" and
+-- \"Runtime returned\" needs its own cleanup. Exported so the CPU suite can pin
+-- that boundary with the stub engine.
+withRuntimeResources :: Ptr EngineHandle -> Tokenizer -> IO a -> IO a
+withRuntimeResources engine tok action =
+  action `onException` (engineDestroy engine >> freeTokenizer tok)
 
 -- | Shut down the runtime: destroy engine, free tokenizer.
 shutdownRuntime :: Runtime -> IO ()

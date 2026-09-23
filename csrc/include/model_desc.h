@@ -183,6 +183,12 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
 /* Structural validation (lengths, ranges, required roles per layer kind). */
 int model_desc_validate(const struct ModelDesc *desc, char *err, size_t err_len);
 
+/* Runtime capability validation: rejects combinations the AOT kernels were not
+ * built for (currently the GDN head layout). Structural validation does not
+ * cover this because such a descriptor is still a faithful checkpoint
+ * description. Returns 0 on success, -1 with a message in err. */
+int model_desc_check_runtime_support(const struct ModelDesc *desc, char *err, size_t err_len);
+
 /* Index of a role in the descriptor's role table, or -1 if absent. */
 int model_desc_role_index(const struct ModelDesc *desc, int role);
 

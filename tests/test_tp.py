@@ -127,7 +127,10 @@ def main():
     assert not failures, failures
     print(f"placement equivalence passed ({label} vs layer split: rms <= {args.rms_gate}, "
           "greedy tokens identical)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    # The usage errors above return 1; without sys.exit that code is discarded and
+    # a mis-invoked run would look like a pass to any caller.
+    sys.exit(main())

@@ -935,6 +935,38 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
     return 0;
 }
 
+/* Engine-runtime capability checks: a descriptor can be structurally valid yet
+ * describe a model the AOT kernels cannot execute. engine_create calls this right
+ * after model_desc_validate so an unsupported layout is rejected before any GPU
+ * memory is allocated, instead of silently indexing out of bounds in a kernel. */
+int model_desc_check_runtime_support(const struct ModelDesc *d, char *err, size_t err_len) {
+    int has_gdn = 0;
+    for (int i = 0; i < d->num_layers; ++i)
+        if (d->layer_mixers[i] == ENGINE_MIXER_GDN) has_gdn = 1;
+    if (has_gdn) {
+        /* The FLA kernels are AOT-compiled for a fixed 128-wide head and 16 key
+         * heads, and recurrent (decode) kernels only exist for 32 and 48 value
+         * heads; see csrc/triton/build_aot.py and csrc/kernels/fla_gdn.cu. A
+         * different layout would have the kernels read past their buffers. */
+        if (d->gdn_head_dim != 128) {
+            fail(err, err_len, "gdn_head_dim %d is not supported: the AOT FLA kernels are built for 128",
+                 d->gdn_head_dim);
+            return -1;
+        }
+        if (d->gdn_num_k_heads != 16) {
+            fail(err, err_len, "gdn_num_k_heads %d is not supported: the AOT FLA kernels are built for 16",
+                 d->gdn_num_k_heads);
+            return -1;
+        }
+        if (d->gdn_num_v_heads != 32 && d->gdn_num_v_heads != 48) {
+            fail(err, err_len, "gdn_num_v_heads %d is not supported: the AOT recurrent kernels cover 32 and 48",
+                 d->gdn_num_v_heads);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Canonical echo                                                     */
 /* ------------------------------------------------------------------ */

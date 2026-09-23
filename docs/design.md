@@ -156,6 +156,15 @@ the C ABI.
 
 KV cache and GDN state are device-local — no cross-device state sharing.
 
+The CLI resolves the topology once, in `resolveTopology`: `--tp`/`--ep` on the
+command line (both must be ≥ 1) decide the policy, and the descriptor handed to
+the engine is rewritten to match — a pipelined run is single-rank (`tp_size =
+ep_size = 1`) even when the snapshot was captured with `tp_size > 1`, and a
+replicated run overwrites both counts and the rank indices. Without that, a
+descriptor carrying `tp_size: 2` run with `--tp 1` would have Haskell report a
+layer-wise split while the engine, which selects its execution mode from the
+descriptor, ran a replicated TP forward.
+
 ### Tensor-parallel placement (replicated)
 
 `--tp N` divides the rank's dimensions (attention heads, KV heads, the dense
@@ -377,6 +386,18 @@ limit) sets the prefill batch size: activation buffers, position buffers and the
 chunking loop all follow it, so a model that wants smaller batches only changes
 data. Kernel-side limits stay where they belong -- FLA's chunk pipeline rejects
 more than 128 tokens per call regardless of the descriptor.
+
+### Engine-capability validation
+
+Structural validation accepts any self-consistent descriptor, so a checkpoint
+with a GDN head layout the AOT cubins were not built for would otherwise reach
+the first forward pass and index past its buffers. `engine_create` therefore runs
+`model_desc_check_runtime_support` after `model_desc_validate`: a model with GDN
+layers must have `gdn_head_dim` 128, `gdn_num_k_heads` 16 and `gdn_num_v_heads`
+32 or 48 (the recurrent decode kernels exist only for those two counts), matching
+`csrc/triton/build_aot.py`. It is a separate function from validation because
+such a descriptor still describes its checkpoint faithfully — it is the engine,
+not the descriptor, that cannot run it.
 
 ### Layer kinds
 

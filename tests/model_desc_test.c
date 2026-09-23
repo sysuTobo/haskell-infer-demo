@@ -573,6 +573,67 @@ static void test_ep(void) {
     test_rejects(buf, "cannot carry", "out_heads on a routed-expert role is rejected");
 }
 
+/* The runtime gate rejects GDN layouts the AOT kernels were not built for. The
+ * tiny fixture is deliberately structurally consistent but 4-wide, which is
+ * exactly the gap the gate closes: validation must not be what stops it. */
+static void test_runtime_support(void) {
+    struct ModelDesc desc;
+    char err[256] = {0};
+    char buf[4096];
+
+    check(model_desc_parse(kGoodDesc, &desc, err, sizeof(err)) == 0, "tiny GDN fixture parses");
+    check(model_desc_validate(&desc, err, sizeof(err)) == 0,
+          "the 4-wide GDN fixture is structurally valid");
+    check(model_desc_check_runtime_support(&desc, err, sizeof(err)) != 0,
+          "a 4-wide GDN head is rejected by the runtime gate");
+    check(strstr(err, "gdn_head_dim") != NULL, "the runtime gate names gdn_head_dim");
+
+    /* Qwen3.5-27B's real layout: 128-wide heads, 16 key heads, 48 value heads. */
+    copy_desc(buf, sizeof(buf));
+    set_literal(buf, "\"gdn_conv_dim\":12", "\"gdn_conv_dim\":10240");
+    set_literal(buf, "\"gdn_value_dim\":4", "\"gdn_value_dim\":6144");
+    set_literal(buf, "\"gdn_num_v_heads\":1", "\"gdn_num_v_heads\":48");
+    set_literal(buf, "\"gdn_num_k_heads\":1", "\"gdn_num_k_heads\":16");
+    set_literal(buf, "\"gdn_head_dim\":4", "\"gdn_head_dim\":128");
+    check(model_desc_parse(buf, &desc, err, sizeof(err)) == 0, "27B-like GDN descriptor parses");
+    check(model_desc_check_runtime_support(&desc, err, sizeof(err)) == 0,
+          err[0] ? err : "the 27B GDN layout passes the runtime gate");
+
+    /* A value-head count with no AOT recurrent kernel: structurally consistent,
+     * so only the runtime gate can catch it. */
+    copy_desc(buf, sizeof(buf));
+    set_literal(buf, "\"gdn_conv_dim\":12", "\"gdn_conv_dim\":6144");
+    set_literal(buf, "\"gdn_value_dim\":4", "\"gdn_value_dim\":2048");
+    set_literal(buf, "\"gdn_num_v_heads\":1", "\"gdn_num_v_heads\":16");
+    set_literal(buf, "\"gdn_num_k_heads\":1", "\"gdn_num_k_heads\":16");
+    set_literal(buf, "\"gdn_head_dim\":4", "\"gdn_head_dim\":128");
+    check(model_desc_parse(buf, &desc, err, sizeof(err)) == 0, "16-value-head GDN descriptor parses");
+    check(model_desc_validate(&desc, err, sizeof(err)) == 0,
+          "the 16-value-head GDN descriptor is structurally valid");
+    check(model_desc_check_runtime_support(&desc, err, sizeof(err)) != 0,
+          "16 value heads are rejected by the runtime gate");
+    check(strstr(err, "gdn_num_v_heads") != NULL, "the runtime gate names gdn_num_v_heads");
+
+    /* A key-head count the prepare kernel does not expand. */
+    copy_desc(buf, sizeof(buf));
+    set_literal(buf, "\"gdn_conv_dim\":12", "\"gdn_conv_dim\":4096");
+    set_literal(buf, "\"gdn_value_dim\":4", "\"gdn_value_dim\":2048");
+    set_literal(buf, "\"gdn_num_v_heads\":1", "\"gdn_num_v_heads\":16");
+    set_literal(buf, "\"gdn_num_k_heads\":1", "\"gdn_num_k_heads\":8");
+    set_literal(buf, "\"gdn_head_dim\":4", "\"gdn_head_dim\":128");
+    check(model_desc_parse(buf, &desc, err, sizeof(err)) == 0, "8-key-head GDN descriptor parses");
+    check(model_desc_check_runtime_support(&desc, err, sizeof(err)) != 0,
+          "8 key heads are rejected by the runtime gate");
+    check(strstr(err, "gdn_num_k_heads") != NULL, "the runtime gate names gdn_num_k_heads");
+
+    /* The GDN layout is only constrained when a GDN layer actually exists. */
+    copy_desc(buf, sizeof(buf));
+    set_literal(buf, "\"layer_mixers\":[\"full_attn\",\"gdn\"]",
+                     "\"layer_mixers\":[\"full_attn\",\"full_attn\"]");
+    check(model_desc_parse(buf, &desc, err, sizeof(err)) == 0, "attention-only descriptor parses");
+    check(model_desc_check_runtime_support(&desc, err, sizeof(err)) == 0,
+          err[0] ? err : "a model without GDN layers ignores the GDN dimensions");
+}
 
 int main(void) {
     test_good();
@@ -581,6 +642,7 @@ int main(void) {
     test_shard_view();
     test_moe();
     test_ep();
+    test_runtime_support();
     test_errors();
     if (failures == 0) {
         printf("model_desc tests passed\n");

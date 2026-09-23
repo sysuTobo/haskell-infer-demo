@@ -82,13 +82,30 @@ def compare(args):
         print(f"key mismatch: only-left={sorted(left_keys - right_keys)} "
               f"only-right={sorted(right_keys - left_keys)}")
         return 1
+    failed = False
+    # Two captures are only comparable when they were taken the same way: a
+    # different prompt, descriptor or device set means the logits differ for
+    # reasons that have nothing to do with the change under test.
+    if "meta" in left_keys:
+        if left["meta"].item() != right["meta"].item():
+            print(f"meta mismatch:\n  old: {left['meta'].item()}\n  new: {right['meta'].item()}")
+            failed = True
     worst_key, worst_abs, worst_rms, differing = None, 0.0, 0.0, 0
     for key in sorted(left_keys):
+        if key == "meta":
+            continue
         a, b = left[key], right[key]
         if a.shape != b.shape:
             print(f"{key}: shape {a.shape} vs {b.shape}")
-            return 1
-        if key == "meta":
+            failed = True
+            continue
+        # A NaN or infinity is never a match and would otherwise slip through the
+        # max() below (NaN compares false, leaving the array out of worst_key),
+        # so a capture with non-finite values fails instead of reporting success.
+        if not (np.isfinite(a).all() and np.isfinite(b).all()):
+            bad = int(np.count_nonzero(~np.isfinite(a))) + int(np.count_nonzero(~np.isfinite(b)))
+            print(f"{key}: {bad} non-finite value(s); a capture must be finite")
+            failed = True
             continue
         if not np.array_equal(a, b):
             diff = np.abs(a.astype(np.float64) - b.astype(np.float64))
@@ -98,11 +115,12 @@ def compare(args):
             print(f"{key}: differing={count} max_abs={diff.max():.6g} rms={rms:.6g}")
             if diff.max() > worst_abs:
                 worst_key, worst_abs, worst_rms = key, float(diff.max()), rms
-    if worst_key is None:
+    if worst_key is None and not failed:
         print("bitwise identical (max_abs == 0 on every array)")
         return 0
-    print(f"NOT bitwise identical: worst={worst_key} max_abs={worst_abs:.6g} rms={worst_rms:.6g} "
-          f"differing_elements={differing}")
+    if worst_key is not None:
+        print(f"NOT bitwise identical: worst={worst_key} max_abs={worst_abs:.6g} "
+              f"rms={worst_rms:.6g} differing_elements={differing}")
     return 1
 
 

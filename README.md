@@ -159,19 +159,21 @@ equal highest BF16 reference logits are treated as ties.
 
 ## Tests
 
-- `ctest --test-dir csrc/build-libs` — three CPU suites that need no GPU
-  (`test_model_desc`: descriptor parsing, validation, canonical echo and the
-  tp-role coverage rule; `test_safetensors`: malformed headers, offsets, shapes
-  and dtypes, higher-rank tensors, row/slice capacity arithmetic;
-  `test_engine_resources`: repeated failing initializations leave no handle and
-  no device memory), `test_collective` (event-ordered copies and the cross-device
-  all-reduce on 2 GPUs — once per element type — skipped with fewer devices) plus
-  the operator-level GPU regressions:
-  `test_attention` (causal GQA, KV write, output gate), `test_gdn` (FLA recurrent
-  decode, causal-conv1d, gated norm), `test_moe` (router, permute, expert GEMMs,
-  combine, EP shards), `test_mla` (MLA chunking self-consistency and the
-  attention block-size boundary), `test_library_ops` (FLA chunk pipeline
-  T=1..128 vs PyTorch recurrent on both GPUs, GemmaRMSNorm, partial RoPE).
+- `ctest --test-dir csrc/build-libs` runs two suites that need no GPU at all:
+  `test_model_desc` (descriptor parsing, structural validation, the
+  engine-capability gate for the AOT GDN layout, canonical echo and the tp-role
+  coverage rule) and `test_safetensors` (malformed headers, offsets, shapes and
+  dtypes, higher-rank tensors, row/slice capacity arithmetic). The rest of ctest
+  needs a GPU: `test_engine_resources` (repeated failing initializations leave no
+  handle and no device memory; skips itself when no device is visible),
+  `test_collective` (event-ordered copies and the cross-device all-reduce on 2
+  GPUs — once per element type — skipped with fewer devices) and the
+  operator-level regressions `test_attention` (causal GQA, KV write, output
+  gate), `test_gdn` (FLA recurrent decode, causal-conv1d, gated norm), `test_moe`
+  (router, permute, expert GEMMs, combine, EP shards), `test_mla` (MLA chunking
+  self-consistency and the attention block-size boundary) and `test_library_ops`
+  (FLA chunk pipeline T=1..128 vs PyTorch recurrent on both GPUs, GemmaRMSNorm,
+  partial RoPE; skips itself when no device is visible).
 - `tests/test_engine.py` — full 27B vs independently generated reference logits
   (20/20 argmax), state reset, invalid-input/capacity checks, chunk-split
   self-consistency.
@@ -182,7 +184,9 @@ equal highest BF16 reference logits are treated as ties.
   with `--desc` and the MoE model), requiring identical greedy tokens and a
   per-step logit RMS within `--rms-gate` (default 0.05).
 - `tests/capture_logits.py` — records greedy logits for fixed prompts and compares
-  two captures bitwise; the gate for refactors that must not change numerics.
+  two captures bitwise; the gate for refactors that must not change numerics. The
+  comparison also fails on non-finite captures and on a metadata mismatch
+  (prompt, descriptor, devices), since those make the two runs incomparable.
 - `cabal test all --enable-tests` — two suites, neither needing a GPU:
   `infer-tests` (descriptor round-trip, layer plan and placement; with
   `INFER_MODEL_DIR` set it also checks the adapter still reproduces

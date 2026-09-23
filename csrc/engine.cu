@@ -639,6 +639,9 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
         tap_parse_env(&eng->taps);
         if (model_desc_parse(descriptor_json, &eng->desc, desc_error, sizeof(desc_error)) != 0)
             throw EngineError(ENGINE_ERR_CONFIG, std::string("Bad descriptor: ") + desc_error);
+        if (model_desc_check_runtime_support(&eng->desc, desc_error, sizeof(desc_error)) != 0)
+            throw EngineError(ENGINE_ERR_CONFIG,
+                              std::string("Unsupported descriptor: ") + desc_error);
         fill_dims(eng->dims, eng->desc);
         eng->num_layers = eng->desc.num_layers;
 

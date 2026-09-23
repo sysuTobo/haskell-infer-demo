@@ -1,4 +1,5 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -- | CPU regression for the generation loop: token budget, EOS stopping and
 -- error propagation, for both the streaming and the non-streaming entry point.
@@ -9,7 +10,7 @@
 -- "Infer.Tokenizer" stack.
 module Main (main) where
 
-import Control.Exception (SomeException, bracket, try)
+import Control.Exception (SomeException, bracket, throwIO, try)
 import Data.Int (Int64)
 import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Array (withArray)
@@ -60,6 +61,9 @@ foreign import ccall unsafe "stub_tokenizer_loads"
 
 foreign import ccall unsafe "stub_tokenizer_frees"
   stubTokenizerFrees :: IO CInt
+
+foreign import ccall unsafe "stub_destroy_calls"
+  stubDestroyCalls :: IO CInt
 
 foreign import ccall unsafe "stub_stream_free_calls"
   stubStreamFreeCalls :: IO CInt
@@ -207,6 +211,23 @@ main = hspec $ do
       stubTokenizerLoads `shouldReturn` 1
       stubTokenizerFrees `shouldReturn` 1
 
+    it "releases the engine and tokenizer when initialization throws after the engine is live" $ do
+      -- A throw between "engine created" and "Runtime returned" is exactly the
+      -- window the caller's bracket cannot cover: its acquire action never
+      -- completed, so the resources must be released here.
+      stubReset
+      Just tok <- loadTokenizer (rcModelDir defaultRuntimeConfig ++ "/tokenizer.json")
+      Just engine <- engineCreate (rcModelDir defaultRuntimeConfig) "{}" [0] [0]
+      result <- try (withRuntimeResources engine tok (throwIO (userError "init failed")))
+        :: IO (Either SomeException ())
+      isLeftError result `shouldBe` True
+      stubDestroyCalls `shouldReturn` 1
+      stubTokenizerFrees `shouldReturn` 1
+
 isExitFailure :: Either ExitCode a -> Bool
 isExitFailure (Left (ExitFailure _)) = True
 isExitFailure _ = False
+
+isLeftError :: Either SomeException a -> Bool
+isLeftError (Left _) = True
+isLeftError (Right _) = False

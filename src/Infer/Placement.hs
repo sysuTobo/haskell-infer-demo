@@ -7,6 +7,7 @@ module Infer.Placement
   ( Policy(..)
   , Placement(..)
   , placement
+  , resolveTopology
   , validatePlacement
   , layerDevice
   ) where
@@ -34,6 +35,22 @@ data Placement = Placement
                                   -- layer (the engine ignores this array then)
   , plLayersPerDevice :: [[Int]]  -- ^ layer indices per device, in device order
   } deriving (Eq, Show)
+
+-- | Resolve the requested tp/ep ranks into a policy plus the descriptor the
+-- engine receives. The descriptor always reflects the resolved topology, so
+-- Haskell's placement and the engine's own execution mode agree: a pipelined run
+-- is single-rank even when the descriptor file was captured with tp_size > 1, and
+-- a replicated run overrides both counts. The rank indices become 0 because this
+-- process owns every rank.
+resolveTopology :: Int -> Int -> Descriptor -> Either String (Policy, Descriptor)
+resolveTopology tp ep desc
+  | tp < 1 = Left ("--tp must be at least 1, got " ++ show tp)
+  | ep < 1 = Left ("--ep must be at least 1, got " ++ show ep)
+  | tp == 1 && ep == 1 = Right (Pipelined, singleRank)
+  | otherwise = Right (Replicated tp ep, replicatedRank)
+  where
+    singleRank = desc { dTpSize = 1, dEpSize = 1, dTpRank = 0, dEpRank = 0 }
+    replicatedRank = desc { dTpSize = tp, dEpSize = ep, dTpRank = 0, dEpRank = 0 }
 
 -- | Build a placement for the given policy.
 placement :: Descriptor -> Policy -> [Int] -> Either String Placement

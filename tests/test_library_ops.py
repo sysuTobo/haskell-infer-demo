@@ -1,5 +1,6 @@
 import argparse
 import ctypes
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -85,13 +86,20 @@ def main():
     library.test_norm.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 2
     library.test_rope.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int]
     torch.manual_seed(7)
-    for index in range(min(2, torch.cuda.device_count())):
+    device_count = torch.cuda.device_count()
+    if device_count < 1:
+        # Without this the loop body never runs and the suite would report success
+        # for tests it never executed.
+        print("test_library_ops: SKIP (no CUDA device visible)", flush=True)
+        return 0
+    for index in range(min(2, device_count)):
         with torch.cuda.device(index):
             device = torch.device("cuda", index)
             test_norm_and_rope(library, device)
             test_fla(library, device)
-    print("Library operator tests passed", flush=True)
+    print(f"Library operator tests passed on {min(2, device_count)} device(s)", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

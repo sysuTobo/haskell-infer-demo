@@ -7,19 +7,24 @@ targeting **Qwen3.8-27B** (hybrid Full-Attention + GatedDeltaNet architecture).
 
 - **Haskell orchestration**: model definition, GPU partitioning and generation loop;
   a C ABI connects to the native weight loader and GPU operators.
-- **Multi-GPU placement, two policies**: layer-wise partitioning (each device owns a
-  contiguous block of layers) and replicated tensor parallel (`--tp N`: every rank runs
-  the whole model with its weight shards). Tested on 2× A40 46 GB.
+- **Multi-GPU placement, three policies**: layer-wise partitioning (each device owns a
+  contiguous block of layers), replicated tensor parallel (`--tp N`: every rank runs
+  the whole model with its weight shards) and expert parallel (`--ep N`: whole MoE
+  experts split across ranks, partials merged in FP32). Tested on 2× A40 46 GB.
 - **Hybrid architecture support**: 16 full-attention layers (GQA, partial RoPE,
   output gate) + 48 GatedDeltaNet layers (causal conv1d, gated delta rule,
   gated RMSNorm).
 - **Model families**: the descriptor + layer-kind design covers dense hybrid
   models (Qwen3.8-27B, verified), dense attention with or without sparse MoE
   (Qwen3-4B and Qwen3-30B-A3B, both verified against independent PyTorch
-  references; Mixtral shares their adapter and snapshot layout), and leaves room
-  for MLA mixers. `descriptors/` carries a snapshot per family.
-- **Single-request greedy decoding**: CLI with streaming token output.
-- **Three-language build**: Haskell (Cabal) + C/CUDA (CMake) + Rust (Cargo).
+  references; Mixtral shares their adapter and snapshot layout) and multi-head
+  latent attention (DeepSeek-V2-Lite, verified). `descriptors/` carries a
+  snapshot per family.
+- **Single-request greedy decoding**: CLI with streaming token output decoded
+  incrementally, so a character whose bytes span several tokens is emitted once
+  complete.
+- **Three-language build**: Haskell (Cabal) + C/CUDA (CMake) + Rust (Cargo), with
+  one command running every layer's test suite.
 
 ## Architecture
 
@@ -27,34 +32,42 @@ targeting **Qwen3.8-27B** (hybrid Full-Attention + GatedDeltaNet architecture).
 Haskell (GHC 9.6)
 ├── Descriptor.hs        Model descriptor: typed record + flat JSON codec
 ├── Descriptor/Adapter/  Family adapters (HF config.json → descriptor)
-├── Placement.hs         Placement policies (layer-wise today)
+├── Placement.hs         Placement policies (layer-wise, replicated TP, EP)
 ├── Model.hs             Per-layer plan: (mixer, ffn, device)
 ├── Runtime.hs           Engine lifecycle, weight loading
 ├── Generation.hs        Greedy decode loop, streaming output
-├── Tokenizer.hs         FFI → Rust tokenizer
+├── Tokenizer.hs         FFI → Rust tokenizer (capacity protocol + stream)
 └── FFI/Engine.hs        FFI → C engine API
          │
          │ foreign import ccall
          ▼
 C/CUDA (sm_86, CUDA 12.9)
-├── model_desc.c     Strict parser for the descriptor (no family knowledge)
-├── layer_dispatch.cu  Per-layer norm -> mixer -> ffn sequence, kind dispatch
-├── engine.cu        Multi-GPU forward, bounded chunked prefill
-├── triton/          FLA-derived chunk kernels and upstream FLA decode AOT
+├── model_desc.c            Strict parser for the descriptor (no family knowledge)
+├── safetensors.cpp         Checkpoint parsing and bounds validation (no CUDA)
+├── safetensors_loader.cu   Capacity-checked uploads to the owning device
+├── layer_dispatch.cu       Per-layer norm -> mixer -> ffn sequence, kind dispatch
+├── engine.cu               Multi-GPU forward, weight ownership, chunked prefill
+├── collective.cu           Cross-device copies and the leader all-reduce
+├── moe.cu                  Router, expert permutation, GEMMs, combine (BF16/FP32)
+├── tap.cu                  Layer/sub-layer activation taps for debugging
+├── triton/                 FLA-derived chunk kernels and upstream FLA decode AOT
 └── kernels/
     ├── gemm.cu             cuBLAS BF16 matrix multiplication
+    ├── layers.cu           Per-layer norm/mixer/ffn orchestration on-device
     ├── flashinfer_norm.cu  FlashInfer GemmaRMSNorm and partial RoPE
     ├── attention.cu        FlashInfer causal attention, KV cache and output gate
     ├── gdn_conv.cu         Native causal-conv1d adapter (width 4)
     ├── fla_gdn.cu          FLA chunked prefill and recurrent decode
-    ├── gdn_norm.cu         Model-specific gated norm and residual operations
+    ├── gdn_norm.cu         Model-specific gated norm, casts and residual operations
+    ├── mla.cu              MLA decoder and its shared-memory bound
     ├── silu.cu             FlashInfer SiLU × mul
     └── embedding.cu        Token embedding lookup
          │
          │ C ABI
          ▼
 Rust (tokenizer-ffi)
-└── lib.rs           HuggingFace tokenizers wrapper
+└── lib.rs           HuggingFace tokenizers wrapper: length-query protocol and an
+                     owned incremental decode handle
 ```
 
 ## Prerequisites
@@ -86,6 +99,10 @@ source /path/on/local-ssd/kernel-deps/env.sh
 The native engine is `csrc/build-libs/libengine.so`; Haskell links to this shared
 library so rebuilding CUDA does not leave a stale statically linked engine.
 Runtime requires neither Python nor PyTorch.
+
+`--tests` adds every layer's suite, in order, stopping at the first failure:
+`cargo test --locked --offline`, the CTest suite (CPU and GPU), then
+`cabal test all --enable-tests`.
 
 Architectures: one `libengine.so` carries SASS for `86;89;90a` plus PTX, so the
 same build runs on A40 (sm_86), L20 (sm_89) and H200 (sm_90a); the PTX is the
@@ -142,10 +159,14 @@ equal highest BF16 reference logits are treated as ties.
 
 ## Tests
 
-- `ctest --test-dir csrc/build-libs` — `test_model_desc` (CPU: descriptor parsing,
-  validation, canonical echo), `test_collective` (event-ordered copies and the
-  cross-device all-reduce on 2 GPUs, skipped with fewer devices) plus the
-  operator-level GPU regressions:
+- `ctest --test-dir csrc/build-libs` — three CPU suites that need no GPU
+  (`test_model_desc`: descriptor parsing, validation, canonical echo and the
+  tp-role coverage rule; `test_safetensors`: malformed headers, offsets, shapes
+  and dtypes, higher-rank tensors, row/slice capacity arithmetic;
+  `test_engine_resources`: repeated failing initializations leave no handle and
+  no device memory), `test_collective` (event-ordered copies and the cross-device
+  all-reduce on 2 GPUs — once per element type — skipped with fewer devices) plus
+  the operator-level GPU regressions:
   `test_attention` (causal GQA, KV write, output gate), `test_gdn` (FLA recurrent
   decode, causal-conv1d, gated norm), `test_moe` (router, permute, expert GEMMs,
   combine, EP shards), `test_mla` (MLA chunking self-consistency and the
@@ -156,11 +177,19 @@ equal highest BF16 reference logits are treated as ties.
   self-consistency.
 - `tests/test_longseq.py` — 433-token prompt chunk-split consistency plus
   128-token generation coherence (repetition-rate and tail-degradation checks).
+- `tests/test_tp.py` — placement equivalence on 2 GPUs: the layer-wise split
+  against replicated tensor parallel (`--tp 2`) or expert parallel (`--ep 2`,
+  with `--desc` and the MoE model), requiring identical greedy tokens and a
+  per-step logit RMS within `--rms-gate` (default 0.05).
 - `tests/capture_logits.py` — records greedy logits for fixed prompts and compares
   two captures bitwise; the gate for refactors that must not change numerics.
-- `cabal test infer-tests` — descriptor round-trip, layer plan and placement
-  (no GPU); with `INFER_MODEL_DIR` set it also checks the adapter still
-  reproduces `descriptors/*.json`.
+- `cabal test all --enable-tests` — two suites, neither needing a GPU:
+  `infer-tests` (descriptor round-trip, layer plan and placement; with
+  `INFER_MODEL_DIR` set it also checks the adapter still reproduces
+  `descriptors/*.json`) and `infer-generation-tests`, which drives the real
+  generation loop and tokenizer wrapper against a scriptable C stub of the engine
+  — token budgets, first/later EOS, prefill/decode failures and the cleanup that
+  follows them.
 - `ctest` also runs `test_norm` (both RMSNorm variants) and `test_rope` (partial
   and full rotation), each against a CPU reference.
 - `tests/test_engine.py --rms-tolerance` defaults to 0.1 and is raised per family
@@ -211,18 +240,37 @@ migrated from handwritten CUDA to FlashInfer + FLA + causal-conv1d.
 | 7 | Tokenizer + CLI + greedy generation + streaming | ✅ coherent text |
 | 8 | End-to-end validation (27B logits, 433-token long sequence) | ✅ 20/20 argmax |
 | 9 | Descriptor-driven families (dense + MoE + Qwen3-Next + DeepSeek-V2 MLA), multi-arch SASS/PTX, placement policies (layer split, TP, EP) | ✅ verified on sm_86 (A40); sm_89 operator suite on L20 |
+| 10 | Resource safety and regression gates: buffer ownership at allocation, cross-device read-completion ordering, bounded safetensors parsing, tokenizer capacity/streaming protocol, generation budget/EOS/error semantics, MLA shared-memory bound, TP shard-coverage rule, FP32 expert-parallel merge | ✅ verified on sm_86 (A40): ctest 11/11, cargo 11/11, hspec 41 + 14, Qwen3.8 golden bitwise identical, TP2 rms ≤ 0.05 with identical tokens |
+
+Known gaps, stated rather than implied:
+
+- The expert-parallel equivalence re-run after the FP32 merge landed was stopped
+  before it finished, so that verdict is pending. The gate itself is unchanged
+  (`test_tp.py --ep 2`: identical greedy tokens, logit RMS ≤ 0.05).
+- sm_90a is compile- and artifact-verified only; there is no H200 hardware here.
+- Long context is not supported: the MLA attention kernel's shared-memory budget
+  caps the cached sequence length (a 16K context does not fit) and both
+  `engine_create` and the kernel entry reject anything longer.
 
 ## Design Decisions
 
 See [docs/design.md](docs/design.md) for the full architecture rationale.
 
 Key choices:
-- **Two placement policies** from one descriptor: layer-wise partitioning and
-  replicated tensor parallel whose weight splits come from the descriptor's per-role
-  shard rules (no family knowledge in the engine)
+- **Three placement policies** from one descriptor: layer-wise partitioning,
+  replicated tensor parallel and expert parallel, whose weight splits come from
+  the descriptor's per-role shard rules (no family knowledge in the engine)
 - **Library-backed operators** with a small native C ABI, not a wrapper around a serving engine
 - **Chunked prefill and recurrent decode** with reusable per-device scratch and state
-- **BF16** throughout (no quantization)
+- **BF16** storage throughout (no quantization), with FP32 accumulation where it
+  matters: norms, the MoE expert sum, and now the cross-rank merge, which keeps a
+  partial in FP32 until one rounding turns it into the activation
+- **The element type belongs to the data**: the cross-device primitives take the
+  buffers' type (F32, F16, BF16, either FP8 flavour) and size every copy from it
+  rather than assuming one
+- **Ownership from the moment of allocation**: a layer buffer is registered with
+  its layer before anything that can fail, so a failed initialization releases
+  everything it had allocated
 - **Greedy decoding** only (no sampling)
 
 ## License

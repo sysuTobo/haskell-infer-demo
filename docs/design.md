@@ -119,6 +119,34 @@ void engine_destroy(engine);
 Haskell never touches CUDA pointers directly. It passes configuration and
 receives logits. This keeps the FFI surface small and auditable.
 
+### Tokenizer (Rust FFI)
+
+The tokenizer bridge is capacity-explicit rather than fixed-buffer: every
+conversion has a length query, text lengths count the terminating NUL, a buffer
+that is too small writes *nothing* and reports a distinct code, and an empty
+result is legal rather than an error. The Haskell side allocates from that
+query, so a long prompt or a long generation is never silently truncated (the
+old fixed 4096-byte buffer was), and text crosses the boundary as explicit
+UTF-8 instead of whatever the locale happens to be. Failures raise, they are not
+flattened into `[]` or `""`.
+
+Streaming output goes through a stream handle that owns a tokenizer clone plus
+its decode state, so it borrows nothing from the tokenizer and outlives any
+single call. Feeding advances the state exactly once and only buffers text;
+reading is a separate `pending`/`drain` pair, so a length query and a retry can
+never double-advance or lose a chunk. `finish` flushes an incomplete trailing
+byte sequence (decoding it the way whole-sequence decode would, replacement
+character and all) and is idempotent; `reset` clears everything for reuse.
+Streaming and whole-sequence decode use the same special-token policy.
+
+The pinned `tokenizers` 0.20.4 has a defect in `step_decode_stream`: it drains
+its retained ids from a `read_index` that lags one generation behind
+`prefix_index`, which mis-emits once chunks arrive back to back and eventually
+underflows `ids.len() - prefix_index`. Seeding `read_index` from `prefix_index`
+before each step reproduces what upstream changed in 0.22, and the call is
+isolated from unwinding so a dependency panic cannot abort the process across
+the C ABI.
+
 ### Multi-GPU layer partitioning
 
 64 layers split contiguously across N devices:
@@ -129,6 +157,16 @@ receives logits. This keeps the FFI surface small and auditable.
 KV cache and GDN state are device-local — no cross-device state sharing.
 
 ### Tensor-parallel placement (replicated)
+
+`--tp N` divides the rank's dimensions (attention heads, KV heads, the dense
+MLP), so the roles that describe those dimensions have to be split. The
+descriptor parser enforces that before anything is allocated: a `tp_size > 1`
+document whose q/k/v, o, gate/up/down, or MLA q/kv_b/o roles do not carry the
+rule their layout needs (`out_heads`, `in_dim`, `out_dim`) is rejected, because
+an unsplit tensor under divided dimensions makes the forward read the wrong rows
+and, for an output projection, past the end of its destination buffer. GDN roles
+are not divided, so they stay unconstrained.
+
 
 `--tp N` keeps the whole model on every rank and splits only the weights the
 descriptor marks as shardable (the per-role rules a family adapter derives):
@@ -161,9 +199,20 @@ the MoE (`forward_moe_routed` / `forward_moe_shared`). Entries routed to another
 rank are localized away (`kernel_moe_localize_ids` -> -1 slots the combine
 skips), so the packed expert work stays proportional to the local experts.
 
+The routed partial stays in FP32 all the way through the merge: each rank writes
+it unrounded (`forward_moe_routed_f32`), the collective merges FP32 buffers with
+the type it is told the data has, and a single cast turns the merged value into
+this rank's activation. Storing the partial in the BF16 activation first and
+merging it as BF16 rounds twice, where the single-rank path — which sums every
+expert in FP32 and rounds once when it stores the activation — rounds once; that
+extra rounding is exactly what a placement-equivalence run measures. With the
+partial kept in FP32, what remains between the two placements is FP32
+reassociation, not a precision step this path alone pays.
+
 Combined TP+EP placement needs subgroup collectives and is rejected for now;
-MoE layers under `--tp` point at `--ep`. Verified with `tests/test_tp.py --ep 2`
-on Qwen3-30B-A3B (see the README gate list).
+MoE layers under `--tp` point at `--ep`. `tests/test_tp.py --ep 2` on
+Qwen3-30B-A3B is the gate: identical greedy tokens and logit RMS under the same
+0.05 the TP case uses (see the README gate list).
 
 ### Model architecture (Qwen3.8-27B)
 
@@ -248,6 +297,11 @@ The expert's per-slice layout is `[gate; up]` because the activation kernel
 consumes that adjacency, which in turn requires the expert width to be a multiple
 of 8; unsupported widths are rejected with an explicit error.
 
+The combine writes the activation rounded to BF16. Under expert parallelism it
+instead writes an unrounded FP32 partial, which the ranks then merge (see
+Expert-parallel placement): that is the only arithmetic difference between the
+two placements.
+
 ### MLA (multi-head latent attention) layer
 
 A layer whose mixer is `mla` follows DeepSeek-V2. The KV cache holds the
@@ -278,6 +332,15 @@ than from the reference source:
   threads — a defect that only fires past 64 cached tokens and is therefore
   invisible to short-prompt gates; `test_mla` covers it by re-cutting the same
   token sequence so the two runs land in different block-size bands.
+- The scores live in dynamic shared memory, so one key per cached token, on top
+  of a fixed 256-float reduction array. That budget — the device's per-block
+  limit, minus what the driver reserves, minus the reduction — is the *only*
+  thing bounding the cache length, since the kernel does not opt into the larger
+  carve-out. `kernel_mla_max_seq_len()` derives it, `engine_create` refuses a
+  `max_seq_len` above it before allocating any cache, and `forward_mla_layer`
+  refuses a call above it, so a too-long request fails where it was asked for
+  instead of at an opaque launch error. 16K contexts do not fit and are rejected;
+  this is not long-context support.
 
 ### What differs between families
 
@@ -332,10 +395,34 @@ have survived per-expert weights.
 
 ### Weight loading
 
-Safetensors format: 8-byte LE header length → JSON header → raw BF16 data.
-The C loader (`safetensors_loader.cu`) scans the shards, expands the descriptor's
-role templates, validates each tensor's shape against the role's expectation in
-terms of the model dimensions, and uploads it to the owning device.
+Safetensors format: 8-byte LE header length → JSON header → raw BF16 data. The
+loader is split so the risky half is testable without a GPU: `safetensors.cpp`
+holds the parsing and validation (no CUDA, covered by `test_safetensors` on CPU)
+and `safetensors_loader.cu` only moves bytes.
+
+Parsing is bounded and strict rather than string-matched: a cursor over the
+header the file itself declares (header size checked against the real file size
+and a sanity bound before anything is allocated), duplicate or unknown fields
+rejected, unknown dtype tags rejected instead of defaulting to BF16, checked
+arithmetic on every shape product, and each tensor's data offsets checked both
+against the data section and against the exact byte count its shape and dtype
+imply. A directory scan fails as a whole — no partially populated index — and a
+tensor the text model never loads is still indexed: Qwen3.8-27B ships a rank-5
+Conv3D vision patch embedding next to its 1198 text tensors, so the parser's rank
+bound exists to keep the metadata struct fixed-size, not to describe the roles.
+The upload helpers each take the destination capacity and re-check the byte
+range against the file before a copy, so a short read or a failed copy is
+reported rather than passed along.
+
+Once parsed, the loader expands the descriptor's role templates, validates each
+tensor's shape against the role's expectation in terms of the model dimensions,
+and uploads it to the owning device. Every buffer a layer owns is registered with
+that layer *at the moment it is allocated* (`alloc_owned`), before the upload or
+any later allocation can fail: `engine_destroy` frees exactly what was
+registered, so a failed initialization cannot strand device memory, and a
+registration that itself fails frees on the owning device. Context-owned buffers
+keep their single owner (the per-device fields the teardown walks) so nothing is
+registered twice.
 
 Weight placement is a role property, not a family property:
 - embedding → first configured device
@@ -371,10 +458,17 @@ separate per-device, per-phase calculation in `plan-numeric-contract.md`.
 
 ## Testing strategy
 
+`scripts/build.sh --tests` runs every layer in order — `cargo test --locked
+--offline`, the whole CTest suite, then `cabal test all --enable-tests` — and
+stops at the first failure, so one command answers "is the tree green".
+
 | Level | Test | Pass criteria |
 |-------|------|---------------|
-| Descriptor | `ctest -R test_model_desc` (CPU) + Haskell spec | strict parsing/structural checks; conditional Qwen3.8 model-directory snapshot round-trip |
-| Kernel | `ctest`: test_attention, test_gdn, test_collective, test_moe, test_norm, test_rope, test_mla, test_library_ops | vs CPU/PyTorch reference, BF16 tolerances; test_mla additionally re-cuts one sequence to catch block-shape-dependent defects |
+| Descriptor | `ctest -R test_model_desc` (CPU) + Haskell spec | strict parsing/structural checks, the tp-role coverage rule; conditional Qwen3.8 model-directory snapshot round-trip |
+| Checkpoint | `ctest -R test_safetensors` (CPU) | malformed headers, offsets, shapes and dtypes rejected without allocating; higher-rank tensors indexed; row-gather and slice capacity arithmetic |
+| Kernel | `ctest`: test_attention, test_gdn, test_collective, test_moe, test_norm, test_rope, test_mla, test_library_ops | vs CPU/PyTorch reference, BF16 tolerances; test_mla additionally re-cuts one sequence to catch block-shape-dependent defects; test_collective runs the same all-reduce once per element type |
+| Generation (CPU) | `cabal test infer-generation-tests` | budget/EOS/error semantics of the real generation loop, with a scriptable engine stub instead of a GPU |
+| Resource safety | `ctest -R test_engine_resources` | repeated failing creations return no handle, explain the error and move no device memory; a valid checkpoint still builds afterwards |
 | Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set; configured `--rms-tolerance` (default 0.1, family-specific overrides) |
 | Chunking | same prompt, different prefill splits | top-1 equal, rms ≤ 5 (state-loss guard) |
 | Refactor | `tests/capture_logits.py --compare` | numeric arrays identical; caller must currently establish same-build/input provenance because metadata is skipped |

@@ -62,7 +62,12 @@ size_t layer_workspace_size(int tokens, const ModelDims *dims) {
     const size_t gdn = H + 2 * (size_t)dims->gdn_conv_dim + 3 * V +
                        2 * (size_t)dims->gdn_num_v_heads;
     const size_t mlp = H + 3 * (size_t)dims->intermediate_size;
-    return (size_t)tokens * std::max({attention, gdn, mlp}) * sizeof(__nv_bfloat16);
+    /* MLA: normed, q, kv_a (latent + rope key) and the attention output. */
+    const size_t mla = H + (size_t)dims->num_heads *
+                              (dims->mla_qk_nope_head_dim + dims->mla_qk_rope_head_dim) +
+                       (size_t)(dims->mla_kv_lora_rank + dims->mla_qk_rope_head_dim) +
+                       (size_t)dims->num_heads * dims->mla_v_head_dim;
+    return (size_t)tokens * std::max({attention, gdn, mlp, mla}) * sizeof(__nv_bfloat16);
 }
 
 // Flattening (token, head) preserves the per-head Q/gate interleave.

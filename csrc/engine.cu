@@ -140,6 +140,18 @@ static ExpectedShape expected_shape(int role, const struct ModelDesc &d) {
         return {2, {hidden, d.moe_shared_intermediate_size, 0}};
     case ROLE_MOE_SHARED_GATE_SCALAR:
         return {2, {1, hidden, 0}};
+    case ROLE_MLA_Q:
+        return {2, {(long long)d.num_heads *
+                        (d.mla_qk_nope_head_dim + d.mla_qk_rope_head_dim), hidden, 0}};
+    case ROLE_MLA_KV_A:
+        return {2, {d.mla_kv_lora_rank + d.mla_qk_rope_head_dim, hidden, 0}};
+    case ROLE_MLA_KV_A_NORM:
+        return {1, {d.mla_kv_lora_rank, 0, 0}};
+    case ROLE_MLA_KV_B:
+        return {2, {(long long)d.num_heads * (d.mla_qk_nope_head_dim + d.mla_v_head_dim),
+                    d.mla_kv_lora_rank, 0}};
+    case ROLE_MLA_O:
+        return {2, {hidden, (long long)d.num_heads * d.mla_v_head_dim, 0}};
     default:
         return {0, {0, 0, 0}};
     }
@@ -171,6 +183,9 @@ static bool role_used_by_layer(int role, int mixer, int ffn) {
         return role == ROLE_GDN_QKV || role == ROLE_GDN_Z || role == ROLE_GDN_A ||
                role == ROLE_GDN_B || role == ROLE_GDN_CONV1D || role == ROLE_GDN_DT_BIAS ||
                role == ROLE_GDN_A_LOG || role == ROLE_GDN_OUT || role == ROLE_GDN_NORM;
+    if (mixer == ENGINE_MIXER_MLA)
+        return role == ROLE_MLA_Q || role == ROLE_MLA_KV_A || role == ROLE_MLA_KV_A_NORM ||
+               role == ROLE_MLA_KV_B || role == ROLE_MLA_O;
     return false;
 }
 
@@ -191,10 +206,12 @@ struct DeviceCtx {
     int64_t *positions = nullptr;
     void *fla_scratch = nullptr;
     void *moe_scratch = nullptr;
+    void *mla_scratch = nullptr;
     __nv_bfloat16 *reduce_staging = nullptr;  // rank-0 all-reduce scratch
     size_t ws_size = 0;
     size_t fla_size = 0;
     size_t moe_ws_size = 0;
+    size_t mla_size = 0;
 };
 
 struct EngineHandle {
@@ -204,8 +221,10 @@ struct EngineHandle {
     struct ModelDesc desc{};
     int num_layers = 0;      // layers actually allocated (0 before parsing succeeds)
     int num_devices = 0;
-    bool replicated = false; // tp_size > 1: every rank holds and runs every layer
+    bool replicated = false; // tp_size > 1 || ep_size > 1: every rank holds every layer
     int tp_size = 1;
+    int ep_size = 1;         // > 1: experts are split across the ranks
+    bool expert_parallel = false;
     std::vector<int> devices;
     std::vector<int> layer_device;      // Internal indices, not CUDA ordinals.
     DeviceCtx *ctx = nullptr;
@@ -401,10 +420,12 @@ static void load_expert_role(const std::map<std::string, TensorInfo> &index,
         throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Cannot load tensor: ") + name);
 }
 
-/* MoE weights of one layer on one device. Tensor parallelism rejects MoE
- * layers (expert parallelism lands separately), so these are always whole. */
+/* MoE weights of one layer on one device. Under expert parallelism the rank
+ * loads only its slice of the expert tensors ([expert_offset, expert_offset +
+ * local_experts)); the router and the shared experts stay whole. */
 static void load_moe_weights(const std::map<std::string, TensorInfo> &index,
-                             EngineHandle *eng, LayerWeights &lw, int layer, int device) {
+                             EngineHandle *eng, LayerWeights &lw, int layer, int device,
+                             int expert_offset, int local_experts) {
     const int hidden = eng->dims.hidden_size;
     const int experts = eng->desc.moe_num_experts;
     const int inner = eng->desc.moe_intermediate_size;
@@ -414,21 +435,22 @@ static void load_moe_weights(const std::map<std::string, TensorInfo> &index,
                               strcmp(eng->desc.moe_router_scoring, "sigmoid") == 0,
                               (float)eng->desc.moe_routed_scaling_factor,
                               shared, eng->desc.moe_shared_intermediate_size,
-                              eng->desc.moe_shared_gate_scalar};
+                              eng->desc.moe_shared_gate_scalar,
+                              expert_offset, local_experts};
     __nv_bfloat16 *router = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
     load_role(index, eng->desc, ROLE_MOE_ROUTER, layer, device, &router);
-    const size_t gate_bytes = (size_t)experts * inner * hidden * sizeof(__nv_bfloat16);
-    const size_t down_bytes = (size_t)experts * hidden * inner * sizeof(__nv_bfloat16);
+    const size_t gate_bytes = (size_t)local_experts * inner * hidden * sizeof(__nv_bfloat16);
+    const size_t down_bytes = (size_t)local_experts * hidden * inner * sizeof(__nv_bfloat16);
     check_cuda(cudaMalloc(&gate, gate_bytes), "Allocate expert gate weights");
     check_cuda(cudaMalloc(&up, gate_bytes), "Allocate expert up weights");
     check_cuda(cudaMalloc(&down, down_bytes), "Allocate expert down weights");
-    for (int e = 0; e < experts; ++e) {
-        load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_GATE, layer, e, device,
-                         gate + (size_t)e * inner * hidden);
-        load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_UP, layer, e, device,
-                         up + (size_t)e * inner * hidden);
-        load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_DOWN, layer, e, device,
-                         down + (size_t)e * hidden * inner);
+    for (int e = 0; e < local_experts; ++e) {
+        load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_GATE, layer, expert_offset + e,
+                         device, gate + (size_t)e * inner * hidden);
+        load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_UP, layer, expert_offset + e,
+                         device, up + (size_t)e * inner * hidden);
+        load_expert_role(index, eng->desc, ROLE_MOE_EXPERT_DOWN, layer, expert_offset + e,
+                         device, down + (size_t)e * hidden * inner);
     }
     check_cuda(cudaStreamSynchronize(nullptr), "Finish expert weight upload");
     if (shared > 0) {
@@ -496,6 +518,11 @@ static __nv_bfloat16 **role_target(LayerWeights &lw, int role) {
     case ROLE_GDN_A_LOG: return &lw.A_log;
     case ROLE_GDN_OUT: return &lw.gdn_out_proj_w;
     case ROLE_GDN_NORM: return &lw.gdn_norm_w;
+    case ROLE_MLA_Q: return &lw.mla_q_proj_w;
+    case ROLE_MLA_KV_A: return &lw.mla_kv_a_proj_w;
+    case ROLE_MLA_KV_A_NORM: return &lw.mla_kv_a_norm_w;
+    case ROLE_MLA_KV_B: return &lw.mla_kv_b_proj_w;
+    case ROLE_MLA_O: return &lw.mla_o_proj_w;
     /* The fused layout has no single destination field; it is expanded below. */
     case ROLE_GDN_QKVZ: case ROLE_GDN_BA: return nullptr;
     default: return nullptr;
@@ -531,6 +558,10 @@ static void fill_dims(ModelDims &dims, const struct ModelDesc &desc) {
     dims.gdn_num_k_heads = desc.gdn_num_k_heads;
     dims.gdn_head_dim = desc.gdn_head_dim;
     dims.gdn_conv_kernel = desc.gdn_conv_kernel;
+    dims.mla_kv_lora_rank = desc.mla_kv_lora_rank;
+    dims.mla_qk_nope_head_dim = desc.mla_qk_nope_head_dim;
+    dims.mla_qk_rope_head_dim = desc.mla_qk_rope_head_dim;
+    dims.mla_v_head_dim = desc.mla_v_head_dim;
 }
 
 /* Rank dimensions: the sharded roles divide the attention heads and the dense
@@ -576,32 +607,47 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                 throw EngineError(ENGINE_ERR_CONFIG, "Invalid or duplicate CUDA device ordinal");
         }
         const int num_layers = eng->desc.num_layers;
-        for (int i = 0; i < num_layers; ++i) {
-            if (eng->desc.layer_mixers[i] == ENGINE_MIXER_MLA)
-                throw EngineError(ENGINE_ERR_CONFIG,
-                                  "mla mixer layers are not implemented in this build");
-        }
-        /* tp_size > 1 selects the replicated policy: every rank holds every
-         * layer with its shard of the weight, all activations are replicated and
-         * a sublayer whose weights were split all-reduces its output. */
+        /* tp_size > 1 (tensor parallel) or ep_size > 1 (expert parallel) select
+         * the replicated policy: every rank holds every layer with its shard of
+         * the weights, all activations are replicated and a sublayer whose
+         * weights were split all-reduces its output. */
         eng->tp_size = eng->desc.tp_size > 1 ? eng->desc.tp_size : 1;
-        eng->replicated = eng->desc.tp_size > 1;
+        eng->ep_size = eng->desc.ep_size > 1 ? eng->desc.ep_size : 1;
+        eng->expert_parallel = eng->ep_size > 1;
+        eng->replicated = eng->desc.tp_size > 1 || eng->desc.ep_size > 1;
         if (eng->replicated) {
-            if (eng->desc.tp_rank != 0)
+            if (eng->desc.tp_rank != 0 || eng->desc.ep_rank != 0)
                 throw EngineError(ENGINE_ERR_CONFIG,
-                                  "this engine process holds every rank; tp_rank must be 0");
-            if (num_devices != eng->tp_size)
+                                  "this engine process holds every rank; tp_rank and ep_rank must be 0");
+            if (num_devices != eng->tp_size * eng->ep_size)
                 throw EngineError(ENGINE_ERR_CONFIG,
-                                  "replicated placement needs exactly tp_size devices");
+                                  "replicated placement needs exactly tp_size * ep_size devices");
+            if (eng->tp_size > 1 && eng->expert_parallel)
+                throw EngineError(ENGINE_ERR_CONFIG,
+                                  "combined tensor and expert parallelism is not implemented");
             if (eng->dims.num_heads % eng->tp_size != 0 ||
                 eng->dims.num_kv_heads % eng->tp_size != 0)
                 throw EngineError(ENGINE_ERR_CONFIG, "tp_size does not divide the attention heads");
             if (eng->dims.intermediate_size % eng->tp_size != 0)
                 throw EngineError(ENGINE_ERR_CONFIG, "tp_size does not divide intermediate_size");
             for (int i = 0; i < num_layers; ++i) {
-                if (eng->desc.layer_ffns[i] == ENGINE_FFN_MOE)
+                if (eng->desc.layer_ffns[i] == ENGINE_FFN_MOE && eng->tp_size > 1)
                     throw EngineError(ENGINE_ERR_CONFIG,
-                                      "MoE layers under tensor parallel are not implemented");
+                                      "MoE layers under tensor parallel are not implemented (use ep_size)");
+            }
+            if (eng->expert_parallel) {
+                if (eng->desc.moe_num_experts <= 0)
+                    throw EngineError(ENGINE_ERR_CONFIG, "ep_size > 1 needs MoE layers");
+                if (eng->desc.moe_num_experts % eng->ep_size != 0)
+                    throw EngineError(ENGINE_ERR_CONFIG, "ep_size does not divide the expert count");
+                const int expert_roles[] = {ROLE_MOE_EXPERT_GATE, ROLE_MOE_EXPERT_UP,
+                                            ROLE_MOE_EXPERT_DOWN};
+                for (size_t r = 0; r < sizeof(expert_roles) / sizeof(expert_roles[0]); ++r) {
+                    const int slot = model_desc_role_index(&eng->desc, expert_roles[r]);
+                    if (slot >= 0 && eng->desc.role_shards[slot] != ENGINE_SHARD_OUT_EXPERTS)
+                        throw EngineError(ENGINE_ERR_CONFIG,
+                                          "expert roles must carry the out_experts rule when ep_size > 1");
+                }
             }
             fill_local_dims(eng->local_dims, eng->dims, eng->tp_size);
         } else {
@@ -633,9 +679,11 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
         const int layer_slots = eng->replicated ? num_layers * eng->num_devices : num_layers;
         eng->layers = new LayerWeights[layer_slots]();
         const int max_chunk = eng->dims.max_chunk;
-        bool has_gdn = false;
-        for (int i = 0; i < num_layers; ++i)
+        bool has_gdn = false, has_mla = false;
+        for (int i = 0; i < num_layers; ++i) {
             has_gdn = has_gdn || eng->desc.layer_mixers[i] == ENGINE_MIXER_GDN;
+            has_mla = has_mla || eng->desc.layer_mixers[i] == ENGINE_MIXER_MLA;
+        }
         const size_t activation_bytes = (size_t)max_chunk * hidden * sizeof(__nv_bfloat16);
         for (int d = 0; d < eng->num_devices; ++d) {
             DeviceCtx &ctx = eng->ctx[d];
@@ -660,6 +708,10 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             if (has_gdn) {
                 ctx.fla_size = kernel_fla_workspace_size(max_chunk, eng->dims.gdn_num_v_heads);
                 check_cuda(cudaMalloc(&ctx.fla_scratch, ctx.fla_size), "Allocate FLA scratch");
+            }
+            if (has_mla) {
+                ctx.mla_size = kernel_mla_scratch_size(eng->dims.max_seq_len, &eng->dims);
+                check_cuda(cudaMalloc(&ctx.mla_scratch, ctx.mla_size), "Allocate MLA scratch");
             }
             check_cuda(cudaMalloc(&ctx.positions, max_chunk * sizeof(int64_t)), "Allocate positions");
             if (eng->dims.gdn_conv_dim > 0) {
@@ -718,7 +770,12 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                 lw.mixer_sharded = mixer_sharded;
                 lw.ffn_sharded = ffn_sharded;
                 if (lw.plan.ffn == ENGINE_FFN_MOE) {
-                    load_moe_weights(index, eng, lw, i, ctx.device_id);
+                    const int local_experts = eng->expert_parallel
+                        ? eng->desc.moe_num_experts / eng->ep_size
+                        : eng->desc.moe_num_experts;
+                    const int expert_offset = eng->expert_parallel ? r * local_experts : 0;
+                    load_moe_weights(index, eng, lw, i, ctx.device_id, expert_offset,
+                                     local_experts);
                     if (ctx.moe_scratch == nullptr) {
                         const size_t bytes = moe_workspace_size(max_chunk, &eng->local_dims,
                                                                 &lw.moe_config);
@@ -752,6 +809,15 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                                                ctx.stream), "Zero KV cache");
                     lw.owned.push_back(lw.kv_cache);
                     lw.reset_zero.emplace_back(lw.kv_cache, kv_cache_bytes(eng->local_dims));
+                } else if (lw.plan.mixer == ENGINE_MIXER_MLA) {
+                    const size_t mla_bytes = (size_t)eng->dims.max_seq_len *
+                        (eng->dims.mla_kv_lora_rank + eng->dims.mla_qk_rope_head_dim) *
+                        sizeof(__nv_bfloat16);
+                    check_cuda(cudaMalloc(&lw.mla_cache, mla_bytes), "Allocate MLA cache");
+                    check_cuda(cudaMemsetAsync(lw.mla_cache, 0, mla_bytes, ctx.stream),
+                               "Zero MLA cache");
+                    lw.owned.push_back(lw.mla_cache);
+                    lw.reset_zero.emplace_back(lw.mla_cache, mla_bytes);
                 } else if (lw.plan.mixer == ENGINE_MIXER_GDN) {
                     check_cuda(cudaMalloc(&lw.gdn_norm_f32, eng->dims.gdn_head_dim * sizeof(float)),
                                "Allocate GDN norm");
@@ -828,12 +894,16 @@ static LayerContext make_layer_context(EngineHandle *eng, int layer, int dev_idx
     lctx.positions = ctx.positions;
     lctx.fla_scratch = ctx.fla_scratch;
     lctx.moe_scratch = ctx.moe_scratch;
+    lctx.mla_scratch = ctx.mla_scratch;
     lctx.tokens = tokens;
     lctx.seq_len = eng->seq_len + tokens;
     lctx.layer_index = layer;
     lctx.device = ctx.device_id;
     lctx.dims = eng->replicated ? &eng->local_dims : &eng->dims;
     lctx.taps = with_taps ? &eng->taps : nullptr;
+    lctx.reduce = nullptr;
+    lctx.reduce_opaque = nullptr;
+    lctx.split_phase = 0;
     return lctx;
 }
 
@@ -845,8 +915,7 @@ static void residual_add_device(EngineHandle *eng, int dev_idx, size_t elements)
 }
 
 /* Sum every rank's layer_out in place (leader reduce + broadcast). */
-static int allreduce_activation(EngineHandle *eng, int tokens) {
-    const size_t elements = (size_t)tokens * eng->dims.hidden_size;
+static int allreduce_layer_out(EngineHandle *eng, size_t elements) {
     std::vector<__nv_bfloat16 *> buffers(eng->num_devices);
     std::vector<cudaStream_t> streams(eng->num_devices);
     std::vector<cudaEvent_t> events(eng->num_devices);
@@ -858,6 +927,12 @@ static int allreduce_activation(EngineHandle *eng, int tokens) {
     return allreduce_sum_bf16(eng->devices.data(), streams.data(), events.data(),
                               eng->num_devices, buffers.data(), eng->ctx[0].reduce_staging,
                               elements);
+}
+
+/* LayerContext hook for sublayers whose parts live on different ranks (expert
+ * parallelism: the routed experts). Reduces the per-rank layer_out buffers. */
+static int engine_reduce_activation(void *opaque, size_t elements) {
+    return allreduce_layer_out((EngineHandle *)opaque, elements);
 }
 
 /* Final norm + LM head for the last row of `act`, downloaded to h_logits. */
@@ -938,18 +1013,36 @@ static void forward_replicated(EngineHandle *eng, const int64_t *token_ids, int 
         const bool reduce_ffn = wa.ffn_sharded;
         for (int phase = 0; phase < 2; ++phase) {
             const bool is_mixer = phase == 0;
-            for (int d = 0; d < eng->num_devices; ++d) {
-                DeviceCtx &ctx = eng->ctx[d];
-                check_cuda(cudaSetDevice(ctx.device_id), "Select layer device");
-                LayerContext lctx = make_layer_context(eng, i, d, tokens, d == 0);
-                const LayerWeights &w = layer_weights(eng, i, d);
-                int status = is_mixer
-                    ? forward_mixer(&lctx, &w, ctx.residual, ctx.layer_out)
-                    : forward_ffn(&lctx, &w, ctx.residual, ctx.layer_out);
-                check_forward(status, is_mixer ? "Layer mixer" : "Layer feed-forward");
+            /* Expert parallelism splits the MoE feed-forward into the routed
+             * partial (every rank) and the shared experts (replicated): the
+             * reduce belongs between them, and it must run after *every* rank
+             * has queued its partial, so the caller drives two passes. */
+            const bool ep_moe = !is_mixer && eng->expert_parallel &&
+                                layer_weights(eng, i, 0).plan.ffn == ENGINE_FFN_MOE;
+            for (int pass = 0; pass < (ep_moe ? 2 : 1); ++pass) {
+                for (int d = 0; d < eng->num_devices; ++d) {
+                    DeviceCtx &ctx = eng->ctx[d];
+                    check_cuda(cudaSetDevice(ctx.device_id), "Select layer device");
+                    LayerContext lctx = make_layer_context(eng, i, d, tokens, d == 0);
+                    lctx.split_phase = pass;
+                    const LayerWeights &w = layer_weights(eng, i, d);
+                    if (ep_moe) {
+                        lctx.reduce = engine_reduce_activation;
+                        lctx.reduce_opaque = eng;
+                    }
+                    int status = is_mixer
+                        ? forward_mixer(&lctx, &w, ctx.residual, ctx.layer_out)
+                        : forward_ffn(&lctx, &w, ctx.residual, ctx.layer_out);
+                    check_forward(status, is_mixer ? "Layer mixer" : "Layer feed-forward");
+                }
+                if (ep_moe && pass == 0 && eng->num_devices > 1) {
+                    int status = allreduce_layer_out(eng, elements);
+                    if (status != 0)
+                        throw EngineError(ENGINE_ERR_CUDA, "Expert all-reduce failed");
+                }
             }
             if ((is_mixer ? reduce_mixer : reduce_ffn) && eng->num_devices > 1) {
-                int status = allreduce_activation(eng, tokens);
+                int status = allreduce_layer_out(eng, elements);
                 if (status != 0)
                     throw EngineError(ENGINE_ERR_CUDA, "All-reduce failed");
             }
@@ -1119,7 +1212,7 @@ void engine_destroy(EngineHandle *eng) {
             if (ctx.device_id < 0) continue;
             cleanup_cuda(cudaSetDevice(ctx.device_id));
             void *buffers[] = {ctx.residual, ctx.layer_out, ctx.workspace, ctx.conv_bias_zero,
-                               ctx.positions, ctx.fla_scratch, ctx.moe_scratch,
+                               ctx.positions, ctx.fla_scratch, ctx.moe_scratch, ctx.mla_scratch,
                                ctx.token_ids, ctx.embed_w, ctx.lm_head_w, ctx.final_norm_w,
                                ctx.d_logits, ctx.reduce_staging};
             for (void *ptr : buffers) if (ptr) cleanup_cuda(cudaFree(ptr));

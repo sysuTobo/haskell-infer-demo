@@ -15,6 +15,7 @@ import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
 
 import Infer.Descriptor
+import Infer.Descriptor.Adapter.DeepseekV2
 import Infer.Descriptor.Adapter.Json
 import Infer.Descriptor.Adapter.Mixtral
 import Infer.Descriptor.Adapter.Qwen35
@@ -34,6 +35,8 @@ descriptorFromModelDir dir = do
         let tok = tokenizer
         if modelType == "qwen3_next"
           then qwen3NextDescriptorFromConfig cfg tok
+          else if modelType == "deepseek_v2"
+          then deepseekV2DescriptorFromConfig value tok
           else if modelType `elem` ["mixtral", "qwen3_moe", "qwen3"]
           then moeDenseDescriptorFromConfig cfg tok
           else if "qwen3_5" `prefixOf` modelType || "qwen3_5_text" == modelType
@@ -52,6 +55,8 @@ descriptorFromConfigFile path = do
       cfg <- textConfig value
       if modelType == "qwen3_next"
         then qwen3NextDescriptorFromConfig cfg Nothing
+        else if modelType == "deepseek_v2"
+        then deepseekV2DescriptorFromConfig value Nothing
         else if modelType `elem` ["mixtral", "qwen3_moe", "qwen3"]
         then moeDenseDescriptorFromConfig cfg Nothing
         else qwen35DescriptorFromConfig cfg Nothing

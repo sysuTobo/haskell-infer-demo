@@ -34,6 +34,13 @@ typedef struct {
     int num_shared_experts;     /* always-on experts, 0 when the family has none */
     int shared_intermediate_size;
     int shared_gate_scalar;     /* scale the shared output by sigmoid(x @ w) */
+    /* Expert parallelism: this rank holds experts [expert_offset,
+     * expert_offset + num_local_experts) and its routed output is a partial sum
+     * the caller all-reduces. num_local_experts <= 0 means "all experts"
+     * (offset 0), i.e. the historical single-rank behaviour. The router and the
+     * shared experts stay whole on every rank. */
+    int expert_offset;
+    int num_local_experts;
 } MoeConfig;
 
 /* Per-layer routed-expert weights, fused per expert (owned by the layer). */
@@ -61,11 +68,28 @@ typedef struct {
 size_t moe_workspace_size(int tokens, const struct ModelDims *dims, const MoeConfig *moe);
 
 /* MoE feed-forward: out[T, H] = combine(top_k experts of post_norm(residual)).
- * The post-attention RMSNorm is applied here, using the model's norm style. */
+ * The post-attention RMSNorm is applied here, using the model's norm style.
+ * Equivalent to forward_moe_routed + forward_moe_shared with no reduce in
+ * between, i.e. the single-rank (or non-EP) path. */
 int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
                     const __nv_bfloat16 *normed, __nv_bfloat16 *out,
                     const MoeWeights *w, const MoeConfig *moe,
                     MoeScratch scratch, int tokens, const struct ModelDims *dims);
+
+/* Routed experts only: out[T, H] = combine(top_k of post_norm(residual)) over
+ * this rank's experts. Under expert parallelism the result is a partial sum, so
+ * the caller all-reduces it across the ranks before adding the shared experts
+ * -- that keeps the replicated shared contribution from being counted per rank. */
+int forward_moe_routed(cublasHandle_t cublas, cudaStream_t stream,
+                       const __nv_bfloat16 *normed, __nv_bfloat16 *out,
+                       const MoeWeights *w, const MoeConfig *moe,
+                       MoeScratch scratch, int tokens, const struct ModelDims *dims);
+
+/* Shared experts: out += scaled dense MLP(s) on the same normed input. */
+int forward_moe_shared(cublasHandle_t cublas, cudaStream_t stream,
+                       const __nv_bfloat16 *normed, __nv_bfloat16 *out,
+                       const MoeWeights *w, const MoeConfig *moe,
+                       MoeScratch scratch, int tokens, const struct ModelDims *dims);
 
 /* ----------------------------------------------------------------------- */
 /* Kernels (exposed for the differential tests)                            */
@@ -95,10 +119,16 @@ void kernel_moe_gather(const __nv_bfloat16 *input, const int *token_of_slot,
                        __nv_bfloat16 *packed, int rows, int width,
                        cudaStream_t stream);
 
-/* Combine: out[t, :] = sum_k weights[t, k] * expert_out[slot_of[t, k], :]. */
+/* Combine: out[t, :] = sum_k weights[t, k] * expert_out[slot_of[t, k], :].
+ * Slots below zero (an entry routed to another rank's experts) are skipped. */
 void kernel_moe_combine(const __nv_bfloat16 *expert_out, const int *slot_of,
                         const float *weights, int tokens, int top_k, int width,
                         __nv_bfloat16 *out, cudaStream_t stream);
+
+/* Map global expert ids to local ones: ids outside [offset, offset + local) are
+ * replaced by -1, which the count/permute kernels skip. */
+void kernel_moe_localize_ids(int *ids, int entries, int offset, int local,
+                             cudaStream_t stream);
 
 /* out[t, :] += scale(t) * extra[t, :] with scale(t) = sigmoid(gate[t]) when a
  * gate is present, else 1. Used to fold the shared expert into the routed sum. */

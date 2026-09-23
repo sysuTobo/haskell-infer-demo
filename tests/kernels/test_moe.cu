@@ -269,6 +269,65 @@ int main() {
     const auto want = cpu_moe(normed_input, ids, route_weights, gate, up, down);
     ok &= test::compare("moe forward", d_out.download(stream.get()), want, 5e-2, 5e-2);
 
+    /* --- 2b) Expert parallelism: two ranks holding half the experts each must
+     *         sum to the full routed output (the engine all-reduces the routed
+     *         partials across ranks; the reduction is done here on the host). */
+    {
+        const int half = kExperts / 2;
+        std::vector<float> partial_sum((size_t)kTokens * kHidden, 0.0f);
+        for (int rank = 0; rank < 2; ++rank) {
+            const int offset = rank * half;
+            std::vector<Bf16> local_gate((size_t)half * kInner * kHidden);
+            std::vector<Bf16> local_up(local_gate.size());
+            std::vector<Bf16> local_down((size_t)half * kHidden * kInner);
+            for (int e = 0; e < half; ++e) {
+                std::memcpy(&local_gate[(size_t)e * kInner * kHidden],
+                            &gate[(size_t)(offset + e) * kInner * kHidden],
+                            (size_t)kInner * kHidden * sizeof(Bf16));
+                std::memcpy(&local_up[(size_t)e * kInner * kHidden],
+                            &up[(size_t)(offset + e) * kInner * kHidden],
+                            (size_t)kInner * kHidden * sizeof(Bf16));
+                std::memcpy(&local_down[(size_t)e * kHidden * kInner],
+                            &down[(size_t)(offset + e) * kHidden * kInner],
+                            (size_t)kHidden * kInner * sizeof(Bf16));
+            }
+            DeviceBuffer<Bf16> d_local_gate(local_gate.size());
+            DeviceBuffer<Bf16> d_local_up(local_up.size());
+            DeviceBuffer<Bf16> d_local_down(local_down.size());
+            d_local_gate.upload(local_gate, stream.get());
+            d_local_up.upload(local_up, stream.get());
+            d_local_down.upload(local_down, stream.get());
+
+            MoeConfig local_moe = moe;
+            local_moe.expert_offset = offset;
+            local_moe.num_local_experts = half;
+            MoeWeights local_weights{d_post_norm.get(), d_router.get(), d_local_gate.get(),
+                                     d_local_up.get(), d_local_down.get()};
+            const size_t local_bytes = moe_workspace_size(kTokens, &dims, &local_moe);
+            void *local_scratch = nullptr;
+            CUDA_CHECK(cudaMalloc(&local_scratch, local_bytes));
+            MoeScratch local_workspace{local_scratch, local_bytes};
+            DeviceBuffer<Bf16> d_partial(kTokens * kHidden);
+            const int local_status = forward_moe_routed(cublas, stream.get(), d_input.get(),
+                                                        d_partial.get(), &local_weights,
+                                                        &local_moe, local_workspace, kTokens,
+                                                        &dims);
+            if (local_status != 0) {
+                std::fprintf(stderr, "forward_moe_routed (rank %d) failed: %d\n",
+                             rank, local_status);
+                return EXIT_FAILURE;
+            }
+            const auto partial = d_partial.download(stream.get());
+            for (size_t i = 0; i < partial_sum.size(); ++i)
+                partial_sum[i] += (float)test::value(partial[i]);
+            CUDA_CHECK(cudaFree(local_scratch));
+        }
+        ok &= test::compare("moe ep2 partial sum vs full forward", partial_sum,
+                            d_out.download(stream.get()), 5e-2, 5e-2);
+        ok &= test::compare("moe ep2 partial sum vs cpu reference", partial_sum, want,
+                            5e-2, 5e-2);
+    }
+
     /* --- 3) Concentrated routing: one expert takes every token, the rest get
      *        none, so the expert loop must skip empty slices correctly. */
     std::vector<Bf16> skewed = router;

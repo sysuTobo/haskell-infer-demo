@@ -37,10 +37,11 @@ enum {
     K_MOE_INTERMEDIATE_SIZE, K_MOE_ROUTER_SCORING, K_MOE_NORM_TOPK_PROB,
     K_MOE_NUM_SHARED_EXPERTS, K_MOE_SHARED_INTERMEDIATE_SIZE, K_MOE_ROUTED_SCALING_FACTOR,
     K_MOE_SHARED_GATE_SCALAR,
+    K_MLA_KV_LORA_RANK, K_MLA_QK_NOPE_HEAD_DIM, K_MLA_QK_ROPE_HEAD_DIM, K_MLA_V_HEAD_DIM,
     K_EOS_TOKENS, K_LAYER_MIXERS,
     K_LAYER_FFNS, K_ROLE_NAMES, K_ROLE_TEMPLATES,
     /* Optional keys: absent means the historical single-rank behaviour. */
-    K_TP_SIZE, K_TP_RANK, K_ROLE_SHARDS,
+    K_TP_SIZE, K_TP_RANK, K_EP_SIZE, K_EP_RANK, K_ROLE_SHARDS,
     K_COUNT
 };
 
@@ -85,6 +86,10 @@ static const struct {
     {"moe_shared_intermediate_size", KV_INT, 0},
     {"moe_routed_scaling_factor", KV_DOUBLE, 0},
     {"moe_shared_gate_scalar", KV_BOOL, 0},
+    {"mla_kv_lora_rank", KV_INT, 1},
+    {"mla_qk_nope_head_dim", KV_INT, 1},
+    {"mla_qk_rope_head_dim", KV_INT, 1},
+    {"mla_v_head_dim", KV_INT, 1},
     {"eos_tokens", KV_INT_ARRAY, 0},
     {"layer_mixers", KV_TEXT_ARRAY, 0},
     {"layer_ffns", KV_TEXT_ARRAY, 0},
@@ -92,6 +97,8 @@ static const struct {
     {"role_templates", KV_TEXT_ARRAY, 0},
     {"tp_size", KV_INT, 1},
     {"tp_rank", KV_INT, 1},
+    {"ep_size", KV_INT, 1},
+    {"ep_rank", KV_INT, 1},
     {"role_shards", KV_TEXT_ARRAY, 1},
 };
 
@@ -102,7 +109,7 @@ static int key_id(const char *name) {
 }
 
 /* Shard rules, in the same order as the Haskell ShardKind enum. */
-static const char *kShardNames[] = {"none", "out_heads", "out_dim", "in_dim"};
+static const char *kShardNames[] = {"none", "out_heads", "out_dim", "in_dim", "out_experts"};
 #define SHARD_KIND_COUNT ((int)(sizeof(kShardNames) / sizeof(kShardNames[0])))
 
 /* Role names, in the same order as the Haskell Role enum. */
@@ -115,6 +122,7 @@ static const char *kRoleNames[ROLE_COUNT] = {
     "moeRouter", "moeRouterBias",
     "moeExpertGate", "moeExpertUp", "moeExpertDown",
     "moeSharedGate", "moeSharedUp", "moeSharedDown", "moeSharedGateScalar",
+    "mlaQ", "mlaKvA", "mlaKvANorm", "mlaKvB", "mlaO",
 };
 
 /* ------------------------------------------------------------------ */
@@ -293,9 +301,11 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         return -1;
     }
     memset(out, 0, sizeof(*out));
-    /* Defaults for the optional tensor-parallel keys: one rank, no sharding. */
+    /* Defaults for the optional parallel keys: one rank, no sharding. */
     out->tp_size = 1;
     out->tp_rank = 0;
+    out->ep_size = 1;
+    out->ep_rank = 0;
     unsigned char seen[K_COUNT] = {0};
     int eos_count = 0, mixer_count = 0, ffn_count = 0, role_count = 0, template_count = 0;
     int shard_count = 0;
@@ -341,8 +351,11 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         case K_GDN_NUM_V_HEADS: case K_GDN_NUM_K_HEADS: case K_GDN_HEAD_DIM:
         case K_GDN_CONV_KERNEL: case K_FLA_CHUNK_SIZE: case K_MAX_CHUNK:
         case K_TP_SIZE: case K_TP_RANK:
+        case K_EP_SIZE: case K_EP_RANK:
         case K_MOE_NUM_EXPERTS: case K_MOE_TOP_K: case K_MOE_INTERMEDIATE_SIZE:
         case K_MOE_NUM_SHARED_EXPERTS: case K_MOE_SHARED_INTERMEDIATE_SIZE:
+        case K_MLA_KV_LORA_RANK: case K_MLA_QK_NOPE_HEAD_DIM:
+        case K_MLA_QK_ROPE_HEAD_DIM: case K_MLA_V_HEAD_DIM:
             if (parse_number(&c, &number) != 0) {
                 fail(err, err_len, "key %s must be a number", key);
                 return -1;
@@ -444,11 +457,17 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
         case K_MAX_CHUNK: out->max_chunk = (int)number; break;
         case K_TP_SIZE: out->tp_size = (int)number; break;
         case K_TP_RANK: out->tp_rank = (int)number; break;
+        case K_EP_SIZE: out->ep_size = (int)number; break;
+        case K_EP_RANK: out->ep_rank = (int)number; break;
         case K_MOE_NUM_EXPERTS: out->moe_num_experts = (int)number; break;
         case K_MOE_TOP_K: out->moe_top_k = (int)number; break;
         case K_MOE_INTERMEDIATE_SIZE: out->moe_intermediate_size = (int)number; break;
         case K_MOE_ROUTED_SCALING_FACTOR: out->moe_routed_scaling_factor = number; break;
         case K_MOE_NUM_SHARED_EXPERTS: out->moe_num_shared_experts = (int)number; break;
+        case K_MLA_KV_LORA_RANK: out->mla_kv_lora_rank = (int)number; break;
+        case K_MLA_QK_NOPE_HEAD_DIM: out->mla_qk_nope_head_dim = (int)number; break;
+        case K_MLA_QK_ROPE_HEAD_DIM: out->mla_qk_rope_head_dim = (int)number; break;
+        case K_MLA_V_HEAD_DIM: out->mla_v_head_dim = (int)number; break;
         case K_MOE_SHARED_INTERMEDIATE_SIZE: out->moe_shared_intermediate_size = (int)number; break;
         case K_MOE_NORM_TOPK_PROB: out->moe_norm_topk_prob = boolean; break;
         case K_MOE_SHARED_GATE_SCALAR: out->moe_shared_gate_scalar = boolean; break;
@@ -520,6 +539,9 @@ static int shard_rule_fits_role(int role, int rule) {
         return role == ROLE_ATTN_Q || role == ROLE_ATTN_K || role == ROLE_ATTN_V;
     case ENGINE_SHARD_OUT_DIM: return role == ROLE_MLP_GATE || role == ROLE_MLP_UP;
     case ENGINE_SHARD_IN_DIM: return role == ROLE_ATTN_O || role == ROLE_MLP_DOWN;
+    case ENGINE_SHARD_OUT_EXPERTS:
+        return role == ROLE_MOE_EXPERT_GATE || role == ROLE_MOE_EXPERT_UP ||
+               role == ROLE_MOE_EXPERT_DOWN;
     default: return 0;
     }
 }
@@ -546,6 +568,10 @@ int model_desc_shard_view(const struct ModelDesc *desc, int role,
                          ? desc->role_shards[slot] : ENGINE_SHARD_NONE;
     switch (rule) {
     case ENGINE_SHARD_NONE:
+        return 0;
+    case ENGINE_SHARD_OUT_EXPERTS:
+        /* The expert dimension is not a tensor dimension: each expert keeps its
+         * own tensor whole, and the loader picks the local expert range. */
         return 0;
     case ENGINE_SHARD_OUT_HEADS: {
         const int heads = role_heads(desc, role);
@@ -645,6 +671,14 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
         fail(err, err_len, "tp_rank %d is outside [0, tp_size=%d)", d->tp_rank, d->tp_size);
         return -1;
     }
+    if (d->ep_size < 1) {
+        fail(err, err_len, "ep_size %d must be at least 1", d->ep_size);
+        return -1;
+    }
+    if (d->ep_rank < 0 || d->ep_rank >= d->ep_size) {
+        fail(err, err_len, "ep_rank %d is outside [0, ep_size=%d)", d->ep_rank, d->ep_size);
+        return -1;
+    }
     if (d->role_shard_count != d->role_count) {
         fail(err, err_len, "role_shards (%d) and role_names (%d) differ in length",
              d->role_shard_count, d->role_count);
@@ -695,12 +729,13 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
         if (require_role(d, global_roles[i], "required by every layer", err, err_len) != 0)
             return -1;
     }
-    int has_full = 0, has_gdn = 0, has_moe = 0, has_dense = 0;
+    int has_full = 0, has_gdn = 0, has_moe = 0, has_dense = 0, has_mla = 0;
     for (int i = 0; i < d->num_layers; ++i) {
         int mixer = d->layer_mixers[i];
         if (mixer == ENGINE_MIXER_FULL_ATTN) has_full = 1;
         else if (mixer == ENGINE_MIXER_GDN) has_gdn = 1;
-        else if (mixer != ENGINE_MIXER_MLA) {
+        else if (mixer == ENGINE_MIXER_MLA) has_mla = 1;
+        else {
             fail(err, err_len, "layer %d has an unsupported mixer kind %d", i, mixer);
             return -1;
         }
@@ -733,6 +768,23 @@ int model_desc_validate(const struct ModelDesc *d, char *err, size_t err_len) {
         }
         if (d->num_heads % d->num_kv_heads != 0) {
             fail(err, err_len, "num_heads must be a multiple of num_kv_heads");
+            return -1;
+        }
+    }
+    if (has_mla) {
+        const int mla_roles[] = {ROLE_MLA_Q, ROLE_MLA_KV_A, ROLE_MLA_KV_A_NORM,
+                                 ROLE_MLA_KV_B, ROLE_MLA_O};
+        for (size_t i = 0; i < sizeof(mla_roles) / sizeof(mla_roles[0]); ++i) {
+            if (require_role(d, mla_roles[i], "needed by mla layers", err, err_len) != 0)
+                return -1;
+        }
+        if (d->mla_kv_lora_rank <= 0 || d->mla_qk_nope_head_dim <= 0 ||
+            d->mla_qk_rope_head_dim <= 0 || d->mla_v_head_dim <= 0) {
+            fail(err, err_len, "MLA layers need positive kv_lora_rank/qk_nope/qk_rope/v head dims");
+            return -1;
+        }
+        if (d->attn_output_gate) {
+            fail(err, err_len, "MLA layers carry no attention output gate");
             return -1;
         }
     }
@@ -882,6 +934,12 @@ int model_desc_format(const struct ModelDesc *d, char *buf, int buf_len) {
     if (append(buf, buf_len, &used, "\"max_chunk\":%d,", d->max_chunk) != 0) return -1;
     if (append(buf, buf_len, &used, "\"tp_size\":%d,", d->tp_size) != 0) return -1;
     if (append(buf, buf_len, &used, "\"tp_rank\":%d,", d->tp_rank) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"ep_size\":%d,", d->ep_size) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"ep_rank\":%d,", d->ep_rank) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"mla_kv_lora_rank\":%d,", d->mla_kv_lora_rank) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"mla_qk_nope_head_dim\":%d,", d->mla_qk_nope_head_dim) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"mla_qk_rope_head_dim\":%d,", d->mla_qk_rope_head_dim) != 0) return -1;
+    if (append(buf, buf_len, &used, "\"mla_v_head_dim\":%d,", d->mla_v_head_dim) != 0) return -1;
     if (append(buf, buf_len, &used, "\"moe_num_experts\":%d,", d->moe_num_experts) != 0) return -1;
     if (append(buf, buf_len, &used, "\"moe_top_k\":%d,", d->moe_top_k) != 0) return -1;
     if (append(buf, buf_len, &used, "\"moe_intermediate_size\":%d,", d->moe_intermediate_size) != 0) return -1;

@@ -55,6 +55,8 @@ qwen38 = Descriptor
   , dMaxChunk = 128
   , dTpSize = 1
   , dTpRank = 0
+  , dEpSize = 1
+  , dEpRank = 0
   , dMoeNumExperts = 0
   , dMoeTopK = 0
   , dMoeIntermediateSize = 0
@@ -102,10 +104,91 @@ qwen38Roles =
       , (RMlpDown, "model.language_model.layers.%d.mlp.down_proj.weight")
       ]
 
+-- | DeepSeek-V2-Lite's MLA numbers (from its config): the latent cache is the
+-- reason the MLA kind exists, so pin the derived cache claim here; the adapter's
+-- reproduction of the real config is checked by the snapshot test.
+deepseekMla :: Descriptor
+deepseekMla = qwen38
+  { dFamily = "deepseek_v2"
+  , dModelType = "deepseek_v2"
+  , dLayerMixers = replicate 64 MMlaAttention
+  , dLayerFfns = replicate 64 FMoe
+  , dIntermediateSize = 10944
+  , dNumHeads = 16
+  , dNumKvHeads = 16
+  , dHeadDim = 192
+  , dRotaryDim = 64
+  , dRotaryTheta = 1e4
+  , dNormStyle = "plain"
+  , dAttnQkNorm = False
+  , dAttnOutputGate = False
+  , dQGateInterleave = False
+  , dMlaKvLoraRank = 512
+  , dMlaQkNopeHeadDim = 128
+  , dMlaQkRopeHeadDim = 64
+  , dMlaVHeadDim = 128
+  , dMoeNumExperts = 64
+  , dMoeTopK = 6
+  , dMoeIntermediateSize = 1408
+  , dMoeRouterScoring = "softmax"
+  , dMoeNormTopkProb = False
+  , dMoeNumSharedExperts = 2
+  , dMoeSharedIntermediateSize = 1408
+  , dRoleTemplates = mlaRoles
+  , dRoleShards = defaultShards mlaRoles
+  }
+  where
+    layer suffix = "model.layers.%d." ++ suffix
+    mlaRoles =
+      [ (REmbed, "model.embed_tokens.weight")
+      , (RLmHead, "lm_head.weight")
+      , (RFinalNorm, "model.norm.weight")
+      , (RInputNorm, layer "input_layernorm.weight")
+      , (RPostNorm, layer "post_attention_layernorm.weight")
+      , (RMlaQ, layer "self_attn.q_proj.weight")
+      , (RMlaKvA, layer "self_attn.kv_a_proj_with_mqa.weight")
+      , (RMlaKvANorm, layer "self_attn.kv_a_layernorm.weight")
+      , (RMlaKvB, layer "self_attn.kv_b_proj.weight")
+      , (RMlaO, layer "self_attn.o_proj.weight")
+      , (RMlpGate, layer "mlp.gate_proj.weight")
+      , (RMlpUp, layer "mlp.up_proj.weight")
+      , (RMlpDown, layer "mlp.down_proj.weight")
+      , (RMoeRouter, layer "mlp.gate.weight")
+      , (RMoeExpertGate, layer "mlp.experts.%e.gate_proj.weight")
+      , (RMoeExpertUp, layer "mlp.experts.%e.up_proj.weight")
+      , (RMoeExpertDown, layer "mlp.experts.%e.down_proj.weight")
+      , (RMoeSharedGate, layer "mlp.shared_experts.gate_proj.weight")
+      , (RMoeSharedUp, layer "mlp.shared_experts.up_proj.weight")
+      , (RMoeSharedDown, layer "mlp.shared_experts.down_proj.weight")
+      ]
+
 -- | Helper: a validation/placement failure.
 isLeftResult :: Either String a -> Bool
 isLeftResult (Left _) = True
 isLeftResult (Right _) = False
+
+-- | MoE-shaped variant of the fixture: every layer is MoE with 128 experts, and
+-- the dense MLP roles are replaced by the routed-expert roles, which
+-- 'defaultShards' marks @out_experts@.
+qwen38Moe :: Descriptor
+qwen38Moe = qwen38
+  { dLayerFfns = replicate 64 FMoe
+  , dMoeNumExperts = 128
+  , dMoeTopK = 8
+  , dMoeIntermediateSize = 768
+  , dMoeRouterScoring = "softmax"
+  , dMoeNormTopkProb = True
+  , dRoleTemplates = moeRoles
+  , dRoleShards = defaultShards moeRoles
+  }
+  where
+    moeRoles =
+      [ (r, t) | (r, t) <- qwen38Roles, r `notElem` [RMlpGate, RMlpUp, RMlpDown] ]
+        ++ [ (RMoeRouter, "model.language_model.layers.%d.mlp.gate.weight")
+           , (RMoeExpertGate, "model.language_model.layers.%d.mlp.experts.%e.gate_proj.weight")
+           , (RMoeExpertUp, "model.language_model.layers.%d.mlp.experts.%e.up_proj.weight")
+           , (RMoeExpertDown, "model.language_model.layers.%d.mlp.experts.%e.down_proj.weight")
+           ]
 
 -- | Helper: the result is a Left whose message contains the given text.
 mentions :: String -> Either String a -> Bool
@@ -209,6 +292,10 @@ main = hspec $ do
       validateDescriptor qwen38 { dRoleShards = shardsFor qwen38 [(RGdnOut, ShardInDim)] }
         `shouldSatisfy` mentions "role_shards uses a rule"
       validateDescriptor qwen38 { dRoleShards = shardsFor qwen38 [(REmbed, ShardOutDim)] }
+        `shouldSatisfy` mentions "role_shards uses a rule"
+      validateDescriptor qwen38Moe { dRoleShards = shardsFor qwen38Moe [(RMoeExpertGate, ShardOutDim)] }
+        `shouldSatisfy` mentions "role_shards uses a rule"
+      validateDescriptor qwen38Moe { dRoleShards = shardsFor qwen38Moe [(RMoeRouter, ShardOutExperts)] }
         `shouldSatisfy` mentions "role_shards uses a rule"
 
     it "accepts and round-trips a TP2 descriptor with shard rules" $ do
@@ -314,13 +401,60 @@ main = hspec $ do
       modelDef qwen38 (Replicated 2 1) [0] `shouldSatisfy` mentions "devices"
       modelDef qwen38 (Replicated 2 1) [0, 1, 2] `shouldSatisfy` mentions "devices"
 
-    it "rejects expert parallelism until it is implemented" $ do
-      modelDef qwen38 (Replicated 2 2) [0, 1, 2, 3]
-        `shouldSatisfy` mentions "expert parallel"
-
     it "rejects MoE layers under tensor parallel" $ do
       modelDef qwen38 { dLayerFfns = replicate 64 FMoe } (Replicated 2 1) [0, 1]
         `shouldSatisfy` mentions "MoE"
+
+  describe "Expert-parallel placement" $ do
+    it "splits whole experts across ranks" $ do
+      case modelDef qwen38Moe (Replicated 1 2) [0, 1] of
+        Left err -> expectationFailure err
+        Right md -> do
+          plPolicy (mdPlacement md) `shouldBe` Replicated 1 2
+          length (plLayersPerDevice (mdPlacement md)) `shouldBe` 2
+          plLayersPerDevice (mdPlacement md) `shouldBe` [[0 .. 63], [0 .. 63]]
+
+    it "derives out_experts for the routed-expert roles" $ do
+      let ruleOf role =
+            lookup role (zip (map fst (dRoleTemplates qwen38Moe)) (dRoleShards qwen38Moe))
+      ruleOf RMoeExpertGate `shouldBe` Just ShardOutExperts
+      ruleOf RMoeExpertUp `shouldBe` Just ShardOutExperts
+      ruleOf RMoeExpertDown `shouldBe` Just ShardOutExperts
+      ruleOf RMoeRouter `shouldBe` Just ShardNone
+
+    it "rejects ep that does not divide the expert count" $ do
+      modelDef qwen38Moe (Replicated 1 3) [0, 1, 2]
+        `shouldSatisfy` mentions "does not divide the expert count"
+
+    it "rejects ep > 1 without MoE layers" $ do
+      modelDef qwen38 (Replicated 1 2) [0, 1]
+        `shouldSatisfy` mentions "needs at least one MoE layer"
+
+    it "rejects combined tensor and expert parallelism" $ do
+      modelDef qwen38Moe (Replicated 2 2) [0, 1, 2, 3]
+        `shouldSatisfy` mentions "combined tensor and expert parallelism"
+
+    it "rejects expert roles that are not marked out_experts" $ do
+      modelDef qwen38Moe { dRoleShards = allReplicated (dRoleTemplates qwen38Moe) }
+        (Replicated 1 2) [0, 1]
+        `shouldSatisfy` mentions "out_experts"
+
+  describe "MLA descriptor" $ do
+    it "validates and round-trips the DeepSeek-V2-Lite shape" $ do
+      validateDescriptor deepseekMla `shouldBe` Right ()
+      decodeDescriptor (encodeDescriptor deepseekMla) `shouldBe` Right deepseekMla
+      length (mlaLayers deepseekMla) `shouldBe` 64
+
+    it "claims the MLA cache size the kind exists for" $ do
+      -- (512 + 64) * 2 bytes = 1152 B per token per layer, against 8 KB for the
+      -- equivalent GQA cache (16 heads x 192 dims of K plus V).
+      mlaKvBytesPerToken deepseekMla `shouldBe` 1152
+
+    it "requires the MLA dimensions on MLA layers" $ do
+      validateDescriptor deepseekMla { dMlaKvLoraRank = 0 }
+        `shouldSatisfy` mentions "mla_kv_lora_rank"
+      validateDescriptor deepseekMla { dAttnOutputGate = True }
+        `shouldSatisfy` mentions "output gate"
 
   describe "Config" $ do
     it "defaults to two GPUs and a 4096 context" $ do

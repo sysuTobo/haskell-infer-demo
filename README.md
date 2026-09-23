@@ -117,12 +117,15 @@ for `generate` too, and `--check-descriptor` makes the engine echo back the
 descriptor it parsed and fails the run if the two sides disagree.
 
 Placement is chosen on the command line: the default is the layer-wise split over
-`--gpus`, and `--tp N` switches to replicated tensor parallel (every device holds
-the whole model with its weight shards):
+`--gpus`, `--tp N` switches to replicated tensor parallel (every device holds the
+whole model with its weight shards) and `--ep N` splits whole MoE experts across
+the devices (router and shared experts stay replicated):
 
 ```bash
 cabal run haskell-infer-demo -- generate --model-dir "$MODEL_DIR" --gpus 0,1 --tp 2 -p "Hello"
+cabal run haskell-infer-demo -- generate --model-dir "$MODEL_DIR" --gpus 0,1 --ep 2 -p "Hello"
 python tests/test_tp.py --library csrc/build-libs/libengine.so --model-dir "$MODEL_DIR" --devices 0,1
+python tests/test_tp.py --library csrc/build-libs/libengine.so --model-dir "$MODEL_DIR" --devices 0,1 --ep 2
 ```
 
 Full-model validation uses independently generated reference logits:

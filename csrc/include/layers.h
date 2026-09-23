@@ -38,6 +38,11 @@ typedef struct ModelDims {
     int gdn_num_k_heads;
     int gdn_head_dim;
     int gdn_conv_kernel;
+    // MLA (multi-head latent attention); all zero when the model has none
+    int mla_kv_lora_rank;
+    int mla_qk_nope_head_dim;
+    int mla_qk_rope_head_dim;
+    int mla_v_head_dim;
     int max_chunk;            /* prefill batch size (<= ENGINE_MAX_CHUNK) */
 } ModelDims;
 
@@ -78,6 +83,16 @@ typedef struct {
     const float *gdn_norm_w;           // [head_dim], effective FP32 weight (no +1)
     const __nv_bfloat16 *input_norm_w;  // [hidden], raw Gemma weight
 } GdnWeights;
+
+/* MLA layer weights (DeepSeek-V2 style). */
+typedef struct {
+    const __nv_bfloat16 *q_proj_w;      // [H*(nope+rope), hidden]
+    const __nv_bfloat16 *kv_a_proj_w;   // [kv_lora_rank + rope, hidden]
+    const __nv_bfloat16 *kv_a_norm_w;   // [kv_lora_rank], plain RMSNorm weight
+    const __nv_bfloat16 *kv_b_proj_w;   // [H*(nope+v), kv_lora_rank]
+    const __nv_bfloat16 *o_proj_w;      // [hidden, H*v]
+    const __nv_bfloat16 *input_norm_w;  // [hidden]
+} MlaWeights;
 
 /* ------------------------------------------------------------------ */
 /* Layer plan and dispatch                                            */
@@ -121,7 +136,13 @@ struct LayerWeights {
     __nv_bfloat16 *gdn_out_proj_w;
     __nv_bfloat16 *gdn_norm_w;
     float *gdn_norm_f32;
+    __nv_bfloat16 *mla_q_proj_w;
+    __nv_bfloat16 *mla_kv_a_proj_w;
+    __nv_bfloat16 *mla_kv_a_norm_w;
+    __nv_bfloat16 *mla_kv_b_proj_w;
+    __nv_bfloat16 *mla_o_proj_w;
     __nv_bfloat16 *kv_cache;
+    __nv_bfloat16 *mla_cache;   /* latent KV: [max_seq, kv_lora_rank + rope] */
     __nv_bfloat16 *conv_state;
     float *ssm_state;
 
@@ -160,6 +181,13 @@ struct GdnTapSites {
     int device;
 };
 
+/* Optional cross-rank reduce wired in by the caller for sublayers whose output
+ * is a partial sum (expert parallelism: the routed experts live on different
+ * ranks). It reduces the rank's sublayer output buffer across the group; the
+ * engine owns those buffers, so only the element count crosses the boundary.
+ * Returns 0 or a transport error status. */
+typedef int (*LayerReduceFn)(void *opaque, size_t elements);
+
 /* Per-invocation context: device handles, scratch and sequence position. */
 typedef struct {
     cublasHandle_t cublas;
@@ -169,12 +197,19 @@ typedef struct {
     const int64_t *positions;
     void *fla_scratch;
     void *moe_scratch;
+    void *mla_scratch;
     int tokens;
     int seq_len;              /* sequence length including the current tokens */
     int layer_index;          /* for diagnostics only */
     int device;               /* CUDA ordinal, for diagnostics only */
     const ModelDims *dims;
     const TapConfig *taps;
+    /* Non-null when a sublayer's parts are split across ranks. The caller then
+     * drives the sublayer in two passes: split_phase 0 computes the local part,
+     * the caller reduces, and split_phase 1 finishes the sublayer. */
+    LayerReduceFn reduce;
+    void *reduce_opaque;
+    int split_phase;
 } LayerContext;
 
 /* norm -> mixer -> residual -> norm -> ffn -> residual, dispatched on the plan.
@@ -236,6 +271,18 @@ int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
 int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
     const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
     const MlpWeights *w, int tokens, const ModelDims *dims);
+
+/* Multi-head latent attention (DeepSeek-V2 style). latent_cache is
+ * [max_seq_len, kv_lora_rank + qk_rope_head_dim] BF16 and holds the compressed
+ * KV; scratch needs kernel_mla_scratch_size(max_seq_len, dims) bytes. Positions
+ * are int64[tokens]; seq_len includes these tokens. */
+int forward_mla_layer(cublasHandle_t cublas, cudaStream_t stream,
+    const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
+    const MlaWeights *w, __nv_bfloat16 *latent_cache, void *scratch,
+    const int64_t *positions, int tokens, int seq_len, const ModelDims *dims);
+
+/* Bytes for the MLA decoder scratch (decompressed K/V + repacked latent). */
+size_t kernel_mla_scratch_size(int max_seq, const ModelDims *dims);
 
 /* GEMM declarations (gemm.cu) */
 int gemm_bf16(cublasHandle_t handle, __nv_bfloat16 *out,

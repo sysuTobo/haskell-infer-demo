@@ -41,12 +41,18 @@ extern "C" {
  *   OUT_DIM   - output dimension (rows of an [out, in] weight) split into
  *               tp_size contiguous blocks;
  *   IN_DIM    - input dimension (columns) split into tp_size contiguous blocks.
+ *   OUT_EXPERTS - the expert dimension: rank r keeps experts
+ *               [r * E/ep_size, (r + 1) * E/ep_size) (expert parallelism; the
+ *               router and the shared experts stay replicated). The rule names
+ *               the tensor's *role* rather than a dimension: each expert's own
+ *               tensor is loaded whole, the loader just picks the local range.
  *
- * With tp_size == 1 every rule is a no-op. */
+ * With tp_size == 1 / ep_size == 1 every rule is a no-op. */
 #define ENGINE_SHARD_NONE 0
 #define ENGINE_SHARD_OUT_HEADS 1
 #define ENGINE_SHARD_OUT_DIM 2
 #define ENGINE_SHARD_IN_DIM 3
+#define ENGINE_SHARD_OUT_EXPERTS 4
 
 /* Weight roles (mirrors Infer.Descriptor.Role, same order). */
 enum {
@@ -84,6 +90,11 @@ enum {
     ROLE_MOE_SHARED_UP,
     ROLE_MOE_SHARED_DOWN,
     ROLE_MOE_SHARED_GATE_SCALAR,
+    ROLE_MLA_Q,           /* MLA query projection */
+    ROLE_MLA_KV_A,        /* latent KV + shared RoPE key projection */
+    ROLE_MLA_KV_A_NORM,   /* RMSNorm over the latent */
+    ROLE_MLA_KV_B,        /* latent -> per-head k_nope and v */
+    ROLE_MLA_O,           /* output projection */
     ROLE_COUNT
 };
 
@@ -130,6 +141,13 @@ struct ModelDesc {
     double moe_routed_scaling_factor;
     int moe_shared_gate_scalar;
 
+    /* Multi-head latent attention (used when a layer's mixer kind is MLA).
+     * 0 means "no MLA layers in this model". */
+    int mla_kv_lora_rank;       /* compressed KV width the cache holds */
+    int mla_qk_nope_head_dim;   /* per-head q/k width carried explicitly */
+    int mla_qk_rope_head_dim;   /* per-head q/k width carrying RoPE */
+    int mla_v_head_dim;         /* per-head value width */
+
     /* Tensor parallelism (defaults: tp_size 1, tp_rank 0 = no sharding).
      * tp_size is the number of ranks; tp_rank identifies this rank. role_shards
      * is parallel to role_ids/role_templates and holds one ENGINE_SHARD_* rule
@@ -137,6 +155,13 @@ struct ModelDesc {
      * wire document omits the key the table is all ENGINE_SHARD_NONE. */
     int tp_size;
     int tp_rank;
+
+    /* Expert parallelism (defaults: ep_size 1, ep_rank 0 = whole experts per
+     * rank). Rank r holds experts [r * E/ep_size, (r + 1) * E/ep_size); the
+     * router and the shared experts stay replicated, so every rank computes the
+     * same top-k and the routed partial is all-reduced. */
+    int ep_size;
+    int ep_rank;
     int role_shard_count;
     int role_shards[ENGINE_MAX_ROLES];
 

@@ -39,7 +39,7 @@ add_library(engine SHARED
     engine.cu memory.cu safetensors_loader.cu model_desc.c layer_dispatch.cu collective.cu moe.cu tap.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
-    kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu
+    kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu kernels/mla.cu
     "${GENERATED}/aot_kernels.cpp" "${GENERATED}/aot_kernels.h"
     "${GENERATED}/causal_conv1d.h" "${GENERATED}/causal_conv1d_update.cuh"
 )

@@ -68,6 +68,18 @@ static int run_mixer(const LayerContext *ctx, const struct LayerWeights *w,
                                        layer_out, &aw, w->kv_cache, ctx->positions,
                                        ctx->tokens, ctx->seq_len, ctx->dims);
     }
+    case ENGINE_MIXER_MLA: {
+        MlaWeights mw{};
+        mw.q_proj_w = w->mla_q_proj_w;
+        mw.kv_a_proj_w = w->mla_kv_a_proj_w;
+        mw.kv_a_norm_w = w->mla_kv_a_norm_w;
+        mw.kv_b_proj_w = w->mla_kv_b_proj_w;
+        mw.o_proj_w = w->mla_o_proj_w;
+        mw.input_norm_w = w->input_norm_w;
+        return forward_mla_layer(ctx->cublas, ctx->stream, residual, ctx->workspace,
+                                 layer_out, &mw, w->mla_cache, ctx->mla_scratch,
+                                 ctx->positions, ctx->tokens, ctx->seq_len, ctx->dims);
+    }
     case ENGINE_MIXER_GDN: {
         GdnWeights gw{};
         gw.in_proj_qkv_w = w->in_proj_qkv_w;
@@ -102,8 +114,21 @@ static int run_ffn(const LayerContext *ctx, const struct LayerWeights *w,
     case ENGINE_FFN_MOE: {
         MoeScratch scratch{ctx->moe_scratch, 0};
         MoeConfig config = w->moe_config;
-        return forward_moe_ffn(ctx->cublas, ctx->stream, residual, layer_out, &w->moe,
-                               &config, scratch, ctx->tokens, ctx->dims);
+        if (ctx->reduce == nullptr) {
+            return forward_moe_ffn(ctx->cublas, ctx->stream, residual, layer_out, &w->moe,
+                                   &config, scratch, ctx->tokens, ctx->dims);
+        }
+        /* Expert parallelism: the routed experts are split across ranks, so the
+         * routed part is only this rank's partial sum. The caller computes every
+         * rank's routed half first, reduces, and only then asks for the
+         * (replicated) shared experts -- adding them per rank would otherwise
+         * count them once per rank. */
+        if (ctx->split_phase == 0) {
+            return forward_moe_routed(ctx->cublas, ctx->stream, residual, layer_out,
+                                      &w->moe, &config, scratch, ctx->tokens, ctx->dims);
+        }
+        return forward_moe_shared(ctx->cublas, ctx->stream, residual, layer_out, &w->moe,
+                                  &config, scratch, ctx->tokens, ctx->dims);
     }
     default:
         throw std::runtime_error("unsupported ffn kind " + std::to_string(w->plan.ffn));

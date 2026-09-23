@@ -45,6 +45,7 @@ data GenOptions = GenOptions
   , genDesc      :: Maybe FilePath
   , genGpus      :: [Int]
   , genTp        :: Int
+  , genEp        :: Int
   , genMaxSeqLen :: Int
   , genMaxTokens :: Int
   , genPrompt    :: String
@@ -85,6 +86,13 @@ generateCmd = Generate <$> (GenOptions
      <> value 1
      <> showDefault
      <> help "Tensor-parallel ranks: N > 1 keeps the whole model on N devices and loads weight shards"
+      )
+  <*> option auto
+      ( long "ep"
+     <> metavar "N"
+     <> value 1
+     <> showDefault
+     <> help "Expert-parallel ranks: N > 1 splits the MoE experts across N devices"
       )
   <*> option auto
       ( long "max-seq-len"
@@ -261,6 +269,7 @@ runGenerate opts = do
         , rcDescriptor = genDesc opts
         , rcDevices   = genGpus opts
         , rcTp        = genTp opts
+        , rcEp        = genEp opts
         , rcMaxSeqLen = genMaxSeqLen opts
         , rcMaxTokens = genMaxTokens opts
         , rcPrompt    = genPrompt opts

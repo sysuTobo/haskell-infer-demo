@@ -89,6 +89,9 @@ qwen35DescriptorFromConfig tc tokenizer = do
     , dFlaChunkSize = 64
     , dMaxChunk = 128
     , dTpSize = 1, dTpRank = 0
+    , dEpSize = 1, dEpRank = 0
+    , dMlaKvLoraRank = 0, dMlaQkNopeHeadDim = 0
+    , dMlaQkRopeHeadDim = 0, dMlaVHeadDim = 0
     , dMoeNumExperts = 0, dMoeTopK = 0, dMoeIntermediateSize = 0
     , dMoeRouterScoring = "softmax", dMoeNormTopkProb = False
     , dMoeNumSharedExperts = 0, dMoeSharedIntermediateSize = 0

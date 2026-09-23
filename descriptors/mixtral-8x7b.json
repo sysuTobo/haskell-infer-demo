@@ -129,9 +129,9 @@
     "out_heads",
     "in_dim",
     "none",
-    "none",
-    "none",
-    "none"
+    "out_experts",
+    "out_experts",
+    "out_experts"
   ],
   "role_templates": [
     "model.embed_tokens.weight",
@@ -150,6 +150,13 @@
   ],
   "rotary_dim": 128,
   "rotary_theta": 1000000,
+  "ep_rank": 0,
+  "ep_size": 1,
+  "mla_kv_lora_rank": 0,
+  "mla_qk_nope_head_dim": 0,
+  "mla_qk_rope_head_dim": 0,
+  "mla_v_head_dim": 0,
+  "ep_size": 1,
   "tp_rank": 0,
   "tp_size": 1,
   "vocab_size": 32000

@@ -28,8 +28,10 @@ module Infer.Descriptor
   , allReplicated
   , defaultShards
   , kvBytesPerToken
+  , mlaKvBytesPerToken
   , attentionLayers
   , gdnLayers
+  , mlaLayers
   ) where
 
 import Data.Aeson (Object, Value(..), eitherDecodeStrict', encode, object, (.=))
@@ -64,6 +66,7 @@ data Role
   | RMoeRouter | RMoeRouterBias
   | RMoeExpertGate | RMoeExpertUp | RMoeExpertDown
   | RMoeSharedGate | RMoeSharedUp | RMoeSharedDown | RMoeSharedGateScalar
+  | RMlaQ | RMlaKvA | RMlaKvANorm | RMlaKvB | RMlaO
   deriving (Eq, Ord, Show, Read, Enum, Bounded)
 
 mixerName :: MixerKind -> String
@@ -87,10 +90,13 @@ ffnName FMoe = "moe"
 --                        into @tp_size@ contiguous blocks.
 --   * 'ShardInDim'    -- input dimension (columns) split into @tp_size@
 --                        contiguous blocks.
+--   * 'ShardOutExperts' -- the expert dimension: rank @r@ holds experts
+--                        @[r * E\/ep, (r + 1) * E\/ep)@ (expert parallelism;
+--                        the router and the shared experts stay replicated).
 --
--- With @tp_size == 1@ every rule is a no-op; the default for a freshly built
--- descriptor is 'ShardNone' for every role (see 'allReplicated').
-data ShardKind = ShardNone | ShardOutHeads | ShardOutDim | ShardInDim
+-- With @tp_size == 1@ / @ep_size == 1@ every rule is a no-op; the default for a
+-- freshly built descriptor is 'ShardNone' for every role (see 'allReplicated').
+data ShardKind = ShardNone | ShardOutHeads | ShardOutDim | ShardInDim | ShardOutExperts
   deriving (Eq, Ord, Show, Read, Enum, Bounded)
 
 -- | Wire name of a 'ShardKind'. @csrc/model_desc.c@ carries the same names.
@@ -99,6 +105,7 @@ shardName ShardNone = "none"
 shardName ShardOutHeads = "out_heads"
 shardName ShardOutDim = "out_dim"
 shardName ShardInDim = "in_dim"
+shardName ShardOutExperts = "out_experts"
 
 -- | The default shard rules: one 'ShardNone' per role, parallel to the role
 -- table. Building a descriptor with these plus @dTpSize = 1@ keeps the model
@@ -128,6 +135,9 @@ defaultShard role = case role of
   RMlpGate -> ShardOutDim
   RMlpUp -> ShardOutDim
   RMlpDown -> ShardInDim
+  RMoeExpertGate -> ShardOutExperts
+  RMoeExpertUp -> ShardOutExperts
+  RMoeExpertDown -> ShardOutExperts
   _ -> ShardNone
 
 -- | Which shard rules a role's tensor layout can carry. The engine enforces the
@@ -137,6 +147,8 @@ shardFitsRole _ ShardNone = True
 shardFitsRole role ShardOutHeads = role `elem` [RAttnQ, RAttnK, RAttnV]
 shardFitsRole role ShardOutDim = role `elem` [RMlpGate, RMlpUp]
 shardFitsRole role ShardInDim = role `elem` [RAttnO, RMlpDown]
+shardFitsRole role ShardOutExperts =
+  role `elem` [RMoeExpertGate, RMoeExpertUp, RMoeExpertDown]
 
 -- | The role table paired with its shard rules (truncated to the shorter side
 -- when a descriptor is malformed; the parallel-length check reports that).
@@ -186,6 +198,13 @@ data Descriptor = Descriptor
   , dMaxChunk :: !Int             -- ^ prefill batch size (<= the kernels' limit)
   , dTpSize :: !Int               -- ^ tensor-parallel ranks (1 = no sharding)
   , dTpRank :: !Int               -- ^ this rank, in [0, dTpSize)
+  , dEpSize :: !Int               -- ^ expert-parallel ranks (1 = no expert split)
+  , dEpRank :: !Int               -- ^ this rank, in [0, dEpSize)
+  -- Multi-head latent attention (MLA; used when a layer's mixer kind is mla)
+  , dMlaKvLoraRank :: !Int        -- ^ compressed KV width (the cache holds the latent)
+  , dMlaQkNopeHeadDim :: !Int     -- ^ per-head q/k width carried explicitly
+  , dMlaQkRopeHeadDim :: !Int     -- ^ per-head q/k width carrying RoPE
+  , dMlaVHeadDim :: !Int          -- ^ per-head value width
   -- Mixture-of-experts feed-forward (used when a layer's ffn kind is moe)
   , dMoeNumExperts :: !Int        -- ^ routed experts per layer
   , dMoeTopK :: !Int              -- ^ experts selected per token
@@ -212,9 +231,19 @@ attentionLayers d = [i | (i, MFullAttention) <- zip [0 ..] (dLayerMixers d)]
 gdnLayers :: Descriptor -> [Int]
 gdnLayers d = [i | (i, MGatedDeltaNet) <- zip [0 ..] (dLayerMixers d)]
 
+mlaLayers :: Descriptor -> [Int]
+mlaLayers d = [i | (i, MMlaAttention) <- zip [0 ..] (dLayerMixers d)]
+
 -- | Bytes of KV cache per token per attention layer (K and V, bf16).
 kvBytesPerToken :: Descriptor -> Int
 kvBytesPerToken d = 2 * dNumKvHeads d * dHeadDim d * 2
+
+-- | Bytes of KV cache per token per MLA layer (bf16): the cache holds the
+-- compressed latent plus the shared RoPE key instead of per-head K/V. For
+-- DeepSeek-V2-Lite that is (512 + 64) * 2 = @1152@ bytes per token per layer --
+-- the quantity the MLA design exists for.
+mlaKvBytesPerToken :: Descriptor -> Int
+mlaKvBytesPerToken d = (dMlaKvLoraRank d + dMlaQkRopeHeadDim d) * 2
 
 -- ---------------------------------------------------------------------------
 -- Wire encoding (flat JSON, fixed key set)
@@ -229,6 +258,8 @@ descriptorKeys =
   , "q_gate_interleave", "gdn_conv_dim"
   , "gdn_value_dim", "gdn_num_v_heads", "gdn_num_k_heads", "gdn_head_dim"
   , "gdn_conv_kernel", "fla_chunk_size", "max_chunk", "tp_size", "tp_rank"
+  , "ep_size", "ep_rank"
+  , "mla_kv_lora_rank", "mla_qk_nope_head_dim", "mla_qk_rope_head_dim", "mla_v_head_dim"
   , "moe_num_experts", "moe_top_k"
   , "moe_intermediate_size", "moe_router_scoring", "moe_norm_topk_prob"
   , "moe_num_shared_experts", "moe_shared_intermediate_size", "moe_routed_scaling_factor"
@@ -269,6 +300,12 @@ encodeDescriptor d = BL.toStrict . encode $ object
   , "max_chunk" .= dMaxChunk d
   , "tp_size" .= dTpSize d
   , "tp_rank" .= dTpRank d
+  , "ep_size" .= dEpSize d
+  , "ep_rank" .= dEpRank d
+  , "mla_kv_lora_rank" .= dMlaKvLoraRank d
+  , "mla_qk_nope_head_dim" .= dMlaQkNopeHeadDim d
+  , "mla_qk_rope_head_dim" .= dMlaQkRopeHeadDim d
+  , "mla_v_head_dim" .= dMlaVHeadDim d
   , "moe_num_experts" .= dMoeNumExperts d
   , "moe_top_k" .= dMoeTopK d
   , "moe_intermediate_size" .= dMoeIntermediateSize d
@@ -330,6 +367,12 @@ decodeDescriptor bytes = do
   -- which is what every descriptor written before they existed means.
   tpSize <- optInt obj "tp_size" 1
   tpRank <- optInt obj "tp_rank" 0
+  epSize <- optInt obj "ep_size" 1
+  epRank <- optInt obj "ep_rank" 0
+  mlaKvLoraRank <- optInt obj "mla_kv_lora_rank" 0
+  mlaQkNopeHeadDim <- optInt obj "mla_qk_nope_head_dim" 0
+  mlaQkRopeHeadDim <- optInt obj "mla_qk_rope_head_dim" 0
+  mlaVHeadDim <- optInt obj "mla_v_head_dim" 0
   moeExperts <- reqInt obj "moe_num_experts"
   moeTopK <- reqInt obj "moe_top_k"
   moeIntermediate <- reqInt obj "moe_intermediate_size"
@@ -365,6 +408,11 @@ decodeDescriptor bytes = do
     , dGdnNumVHeads = vHeads, dGdnNumKHeads = kHeads, dGdnHeadDim = gdnHeadDim
     , dGdnConvKernel = convKernel, dFlaChunkSize = chunkSize, dMaxChunk = maxChunk
     , dTpSize = tpSize, dTpRank = tpRank
+    , dEpSize = epSize, dEpRank = epRank
+    , dMlaKvLoraRank = mlaKvLoraRank
+    , dMlaQkNopeHeadDim = mlaQkNopeHeadDim
+    , dMlaQkRopeHeadDim = mlaQkRopeHeadDim
+    , dMlaVHeadDim = mlaVHeadDim
     , dMoeNumExperts = moeExperts, dMoeTopK = moeTopK
     , dMoeIntermediateSize = moeIntermediate, dMoeRouterScoring = moeScoring
     , dMoeNormTopkProb = moeNormTopk, dMoeNumSharedExperts = moeSharedExperts
@@ -497,6 +545,10 @@ checks d =
         "tp_size must be at least 1"
   , err (dTpRank d < 0 || dTpRank d >= dTpSize d)
         "tp_rank must be in [0, tp_size)"
+  , err (dEpSize d < 1)
+        "ep_size must be at least 1"
+  , err (dEpRank d < 0 || dEpRank d >= dEpSize d)
+        "ep_rank must be in [0, ep_size)"
   , err (length (dRoleShards d) /= length (dRoleTemplates d))
         "role_shards must be parallel to role_names/role_templates"
   , err (not (all (uncurry shardFitsRole) (shardRules d)))
@@ -505,6 +557,7 @@ checks d =
   , err (any (\t -> t < 0 || t >= dVocabSize d) (dEosTokens d))
         "eos_tokens must be within the vocabulary"
   , gdnCheck d
+  , mlaCheck d
   , moeCheck d
   , rolesCheck d
   ]
@@ -526,6 +579,16 @@ gdnCheck d
       Just "gdn_conv_dim must equal 2 * gdn_num_k_heads * gdn_head_dim + gdn_value_dim"
   | dGdnConvKernel d <= 0 = Just "gdn_conv_kernel must be positive"
   | dFlaChunkSize d `notElem` [1 .. 128] = Just "fla_chunk_size must be in [1,128]"
+  | otherwise = Nothing
+
+mlaCheck :: Descriptor -> Maybe String
+mlaCheck d
+  | null (mlaLayers d) = Nothing
+  | dMlaKvLoraRank d <= 0 = Just "mla_kv_lora_rank must be positive for MLA layers"
+  | dMlaQkNopeHeadDim d <= 0 = Just "mla_qk_nope_head_dim must be positive for MLA layers"
+  | dMlaQkRopeHeadDim d <= 0 = Just "mla_qk_rope_head_dim must be positive for MLA layers"
+  | dMlaVHeadDim d <= 0 = Just "mla_v_head_dim must be positive for MLA layers"
+  | dAttnOutputGate d = Just "MLA layers carry no attention output gate"
   | otherwise = Nothing
 
 moeCheck :: Descriptor -> Maybe String

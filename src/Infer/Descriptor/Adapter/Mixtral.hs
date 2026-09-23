@@ -93,6 +93,9 @@ moeDenseDescriptorFromConfig cfg tokenizer = do
     , dFlaChunkSize = 64
     , dMaxChunk = 128
     , dTpSize = 1, dTpRank = 0
+    , dEpSize = 1, dEpRank = 0
+    , dMlaKvLoraRank = 0, dMlaQkNopeHeadDim = 0
+    , dMlaQkRopeHeadDim = 0, dMlaVHeadDim = 0
     , dMoeNumExperts = numExperts
     , dMoeTopK = topK
     , dMoeIntermediateSize = expertIntermediate

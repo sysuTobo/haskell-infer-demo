@@ -94,6 +94,9 @@ qwen3NextDescriptorFromConfig cfg tokenizer = do
     , dFlaChunkSize = 64
     , dMaxChunk = 128
     , dTpSize = 1, dTpRank = 0
+    , dEpSize = 1, dEpRank = 0
+    , dMlaKvLoraRank = 0, dMlaQkNopeHeadDim = 0
+    , dMlaQkRopeHeadDim = 0, dMlaVHeadDim = 0
     , dMoeNumExperts = numExperts
     , dMoeTopK = fromMaybe 1 (lookupInt cfg "num_experts_per_tok")
     , dMoeIntermediateSize = fromMaybe 0 (lookupInt cfg "moe_intermediate_size")

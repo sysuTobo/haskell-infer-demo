@@ -17,6 +17,10 @@ with the boundary: 0.029, measured on Qwen3.8-27B, 2x A40).
 
     python tests/test_tp.py --library csrc/build-libs/libengine.so \
         --model-dir "$MODEL_DIR" --devices 0,1
+
+With `--ep N` the second arm is expert parallelism instead of tensor parallelism
+(the layer split stays the baseline), which is how the MoE families are checked:
+`--desc descriptors/qwen3-30b-a3b.json --ep 2`.
 """
 
 import argparse
@@ -65,21 +69,34 @@ def main():
     parser.add_argument("--desc", default="descriptors/qwen38-27b.json")
     parser.add_argument("--devices", default="0,1")
     parser.add_argument("--steps", type=int, default=STEPS)
+    parser.add_argument("--rms-gate", type=float, default=RMS_GATE)
+    parser.add_argument("--ep", type=int, default=1,
+                        help="expert-parallel ranks for the second arm "
+                             "(> 1 compares the layer split against EP on MoE models)")
     args = parser.parse_args()
 
     lib = bind(ctypes.CDLL(args.library))
     devices = [int(x) for x in args.devices.split(",")]
-    if len(devices) != 2:
+    if args.ep > 1:
+        if len(devices) != args.ep:
+            print(f"expert parallel needs exactly --ep {args.ep} devices", file=sys.stderr)
+            return 1
+    elif len(devices) != 2:
         print("this test compares one two-device placement against another", file=sys.stderr)
         return 1
     base = load_descriptor(args.desc, max_seq_len=256)
-    if base.get("tp_size", 1) != 1:
-        print("the descriptor snapshot must be single-rank; it is the tp_size=1 arm",
+    if base.get("tp_size", 1) != 1 or base.get("ep_size", 1) != 1:
+        print("the descriptor snapshot must be single-rank; it is the first arm",
               file=sys.stderr)
         return 1
 
-    tp2 = dict(base)
-    tp2["tp_size"] = 2
+    other = dict(base)
+    if args.ep > 1:
+        other["ep_size"] = args.ep
+        label = f"ep={args.ep}"
+    else:
+        other["tp_size"] = 2
+        label = "tp=2"
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
@@ -91,11 +108,10 @@ def main():
     for name, prompt in cases:
         start = time.monotonic()
         tokens_a, logits_a = run_case(lib, args.model_dir, base, devices, prompt, args.steps)
-        print(f"[{name}] pipelined (tp=1): {tokens_a}  ({time.monotonic() - start:.0f}s)",
-              flush=True)
+        print(f"[{name}] layer split: {tokens_a}  ({time.monotonic() - start:.0f}s)", flush=True)
         start = time.monotonic()
-        tokens_b, logits_b = run_case(lib, args.model_dir, tp2, devices, prompt, args.steps)
-        print(f"[{name}] replicated (tp=2): {tokens_b}  ({time.monotonic() - start:.0f}s)",
+        tokens_b, logits_b = run_case(lib, args.model_dir, other, devices, prompt, args.steps)
+        print(f"[{name}] replicated ({label}): {tokens_b}  ({time.monotonic() - start:.0f}s)",
               flush=True)
 
         if tokens_a != tokens_b:
@@ -105,11 +121,12 @@ def main():
             std = float(a.std())
             print(f"[{name}] step {step}: rms={rms:.4g} (logit std={std:.3g}, "
                   f"top1 {int(a.argmax())}/{int(b.argmax())})", flush=True)
-            if not np.isfinite(rms) or rms > RMS_GATE:
+            if not np.isfinite(rms) or rms > args.rms_gate:
                 failures.append({"case": name, "step": step, "rms": rms})
 
     assert not failures, failures
-    print(f"tensor-parallel equivalence passed (rms <= {RMS_GATE}, greedy tokens identical)")
+    print(f"placement equivalence passed ({label} vs layer split: rms <= {args.rms_gate}, "
+          "greedy tokens identical)")
 
 
 if __name__ == "__main__":

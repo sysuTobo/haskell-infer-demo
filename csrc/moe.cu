@@ -201,6 +201,8 @@ __global__ void moe_combine_kernel(const __nv_bfloat16 *expert_out, const int *s
         float acc = 0.0f;
         for (int k = 0; k < top_k; ++k) {
             const int slot = slot_of[token * top_k + k];
+            /* Negative slots are entries routed to another rank's experts. */
+            if (slot < 0) continue;
             acc += weights[token * top_k + k] *
                    __bfloat162float(expert_out[(size_t)slot * width + j]);
         }
@@ -213,6 +215,21 @@ void kernel_moe_combine(const __nv_bfloat16 *expert_out, const int *slot_of,
                         __nv_bfloat16 *out, cudaStream_t stream) {
     moe_combine_kernel<<<tokens, kThreads, 0, stream>>>(expert_out, slot_of, weights,
                                                         top_k, width, out);
+}
+
+__global__ void moe_localize_kernel(int *ids, int entries, int offset, int local) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < entries;
+         i += gridDim.x * blockDim.x) {
+        const int expert = ids[i];
+        ids[i] = (expert >= offset && expert < offset + local) ? expert - offset : -1;
+    }
+}
+
+void kernel_moe_localize_ids(int *ids, int entries, int offset, int local,
+                             cudaStream_t stream) {
+    if (entries <= 0 || local <= 0) return;
+    const int blocks = (entries + kThreads - 1) / kThreads;
+    moe_localize_kernel<<<blocks, kThreads, 0, stream>>>(ids, entries, offset, local);
 }
 
 __global__ void moe_scale_add_kernel(__nv_bfloat16 *out, const __nv_bfloat16 *extra,
@@ -235,11 +252,17 @@ void kernel_moe_scale_add(__nv_bfloat16 *out, const __nv_bfloat16 *extra,
 /* Forward                                                                 */
 /* ----------------------------------------------------------------------- */
 
+/* Experts this rank holds (expert parallelism); <= 0 means all of them. */
+static int moe_local_experts(const MoeConfig *moe) {
+    return moe->num_local_experts > 0 ? moe->num_local_experts : moe->num_experts;
+}
+
 size_t moe_workspace_size(int tokens, const ModelDims *dims, const MoeConfig *moe) {
     if (tokens < 1) throw std::invalid_argument("MoE token count must be positive");
     const size_t t = (size_t)tokens;
     const size_t k = (size_t)moe->top_k;
     const size_t experts = (size_t)moe->num_experts;
+    const size_t local = (size_t)moe_local_experts(moe);
     const size_t hidden = (size_t)dims->hidden_size;
     const size_t inner = (size_t)moe->intermediate_size;
     size_t bytes = 0;
@@ -247,9 +270,9 @@ size_t moe_workspace_size(int tokens, const ModelDims *dims, const MoeConfig *mo
     bytes += align_up(t * experts * sizeof(__nv_bfloat16));   // router logits
     bytes += align_up(t * k * sizeof(int));                   // expert ids
     bytes += align_up(t * k * sizeof(float));                 // routing weights
-    bytes += align_up(experts * sizeof(int));                 // counts
-    bytes += align_up((experts + 1) * sizeof(int));           // offsets
-    bytes += align_up(experts * sizeof(int));                 // cursor
+    bytes += align_up(local * sizeof(int));                   // counts (local experts)
+    bytes += align_up((local + 1) * sizeof(int));             // offsets
+    bytes += align_up(local * sizeof(int));                   // cursor
     bytes += align_up(t * k * sizeof(int));                   // slot per entry
     bytes += align_up(t * k * sizeof(int));                   // token per slot
     bytes += align_up(t * k * hidden * sizeof(__nv_bfloat16));  // packed input
@@ -267,10 +290,10 @@ size_t moe_workspace_size(int tokens, const ModelDims *dims, const MoeConfig *mo
     return bytes;
 }
 
-int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
-                    const __nv_bfloat16 *normed, __nv_bfloat16 *out,
-                    const MoeWeights *w, const MoeConfig *moe,
-                    MoeScratch scratch, int tokens, const ModelDims *dims) {
+int forward_moe_routed(cublasHandle_t cublas, cudaStream_t stream,
+                       const __nv_bfloat16 *normed, __nv_bfloat16 *out,
+                       const MoeWeights *w, const MoeConfig *moe,
+                       MoeScratch scratch, int tokens, const ModelDims *dims) {
     try {
         if (tokens < 1 || tokens > dims->max_chunk)
             throw std::invalid_argument("MoE token count exceeds max_chunk");
@@ -280,52 +303,36 @@ int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
          * of 8 bf16 elements, so the per-expert width must be a multiple of 8. */
         if (moe->intermediate_size % 8 != 0)
             throw std::invalid_argument("MoE expert width must be a multiple of 8");
-        const int shared = moe->num_shared_experts;
-        if (shared > 0 && moe->shared_intermediate_size % 8 != 0)
-            throw std::invalid_argument("shared expert width must be a multiple of 8");
-        if (shared > 0 && (w->shared_gate == nullptr || w->shared_up == nullptr ||
-                           w->shared_down == nullptr))
-            throw std::invalid_argument("shared expert weights are missing");
 
         const int hidden = dims->hidden_size;
         const int inner = moe->intermediate_size;
-        const int experts = moe->num_experts;
+        const int experts = moe->num_experts;     /* the router covers them all */
+        const int local = moe_local_experts(moe); /* this rank's experts */
+        const int expert_offset = moe->expert_offset;
         const int top_k = moe->top_k;
         const int entries = tokens * top_k;
 
         /* Carve the scratch buffer in the same order as moe_workspace_size. */
         char *base = (char *)scratch.base;
-        size_t offset = 0;
+        size_t used = 0;
         auto take = [&](size_t bytes) {
-            char *result = base + offset;
-            offset += align_up(bytes);
+            char *result = base + used;
+            used += align_up(bytes);
             return result;
         };
         __nv_bfloat16 *normed_input = (__nv_bfloat16 *)take((size_t)tokens * hidden * 2);
         __nv_bfloat16 *router_logits = (__nv_bfloat16 *)take((size_t)tokens * experts * 2);
         int *ids = (int *)take((size_t)entries * sizeof(int));
         float *weights = (float *)take((size_t)entries * sizeof(float));
-        int *counts = (int *)take((size_t)experts * sizeof(int));
-        int *offsets = (int *)take((size_t)(experts + 1) * sizeof(int));
-        int *cursor = (int *)take((size_t)experts * sizeof(int));
+        int *counts = (int *)take((size_t)local * sizeof(int));
+        int *offsets = (int *)take((size_t)(local + 1) * sizeof(int));
+        int *cursor = (int *)take((size_t)local * sizeof(int));
         int *slot_of = (int *)take((size_t)entries * sizeof(int));
         int *token_of_slot = (int *)take((size_t)entries * sizeof(int));
         __nv_bfloat16 *packed = (__nv_bfloat16 *)take((size_t)entries * hidden * 2);
         __nv_bfloat16 *gate_up = (__nv_bfloat16 *)take((size_t)entries * 2 * inner * 2);
         __nv_bfloat16 *activated = (__nv_bfloat16 *)take((size_t)entries * inner * 2);
         __nv_bfloat16 *expert_out = (__nv_bfloat16 *)take((size_t)entries * hidden * 2);
-        __nv_bfloat16 *shared_out = shared > 0
-            ? (__nv_bfloat16 *)take((size_t)tokens * hidden * 2) : nullptr;
-        const size_t shared_inner = (size_t)moe->shared_intermediate_size;
-        /* [gate; up] adjacency is what the activation kernel consumes. */
-        __nv_bfloat16 *shared_gate = shared > 0
-            ? (__nv_bfloat16 *)take(2 * (size_t)tokens * shared_inner * 2) : nullptr;
-        __nv_bfloat16 *shared_up = shared > 0
-            ? shared_gate + (size_t)tokens * shared_inner : nullptr;
-        __nv_bfloat16 *shared_act = shared > 0
-            ? (__nv_bfloat16 *)take((size_t)tokens * shared_inner * 2) : nullptr;
-        float *shared_scale = moe->shared_gate_scalar
-            ? (float *)take((size_t)tokens * sizeof(float)) : nullptr;
 
         if (w->post_norm_w != nullptr) {
             if (dims->norm_style == 1) {
@@ -349,24 +356,35 @@ int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
                                moe->norm_topk_prob, moe->scoring_sigmoid,
                                moe->routed_scaling_factor, ids, weights, stream);
 
-        kernel_moe_count(ids, entries, experts, counts, stream);
-        kernel_moe_offsets(counts, experts, offsets, stream);
-        kernel_moe_permute(ids, tokens, top_k, experts, offsets, cursor, slot_of,
+        /* Expert parallelism: keep only this rank's experts; the entries for
+         * other ranks' experts become -1 and are skipped downstream. */
+        if (local != experts || expert_offset != 0) {
+            kernel_moe_localize_ids(ids, entries, expert_offset, local, stream);
+        }
+        kernel_moe_count(ids, entries, local, counts, stream);
+        kernel_moe_offsets(counts, local, offsets, stream);
+        check_cuda(cudaMemsetAsync(slot_of, 0xff, (size_t)entries * sizeof(int), stream),
+                   "MoE slot init");
+        kernel_moe_permute(ids, tokens, top_k, local, offsets, cursor, slot_of,
                            token_of_slot, stream);
-        kernel_moe_gather(normed_input, token_of_slot, packed, entries, hidden, stream);
 
         /* Expert loop: one plain GEMM per non-empty expert over its packed slice.
          * The per-expert token counts are device data, so this pulls the offsets
          * back once per MoE layer. That is one small sync per layer; the
          * capacity-padded batched-GEMM variant would remove it, at the cost of
          * padding every expert to the same capacity. */
-        std::vector<int> host_offsets((size_t)experts + 1);
+        std::vector<int> host_offsets((size_t)local + 1);
         check_cuda(cudaMemcpyAsync(host_offsets.data(), offsets,
-                                   (experts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream),
+                                   (local + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream),
                    "MoE offsets download");
         check_cuda(cudaStreamSynchronize(stream), "MoE offsets sync");
+        /* Only this rank's packed prefix is populated; the tail's slots are -1. */
+        const int packed_rows = host_offsets[local];
+        if (packed_rows > 0) {
+            kernel_moe_gather(normed_input, token_of_slot, packed, packed_rows, hidden, stream);
+        }
 
-        for (int e = 0; e < experts; ++e) {
+        for (int e = 0; e < local; ++e) {
             const int count = host_offsets[e + 1] - host_offsets[e];
             if (count == 0) continue;
             const size_t slice = (size_t)host_offsets[e];
@@ -391,11 +409,66 @@ int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
         }
 
         kernel_moe_combine(expert_out, slot_of, weights, tokens, top_k, hidden, out, stream);
+        check_cuda(cudaGetLastError(), "MoE routed forward");
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "MoE routed forward failed: %s\n", e.what());
+        return -1;
+    }
+}
+
+int forward_moe_shared(cublasHandle_t cublas, cudaStream_t stream,
+                       const __nv_bfloat16 *normed, __nv_bfloat16 *out,
+                       const MoeWeights *w, const MoeConfig *moe,
+                       MoeScratch scratch, int tokens, const ModelDims *dims) {
+    try {
+        if (tokens < 1 || tokens > dims->max_chunk)
+            throw std::invalid_argument("MoE token count exceeds max_chunk");
+        const int shared = moe->num_shared_experts;
+        if (shared <= 0) return 0;
+        if (moe->shared_intermediate_size % 8 != 0)
+            throw std::invalid_argument("shared expert width must be a multiple of 8");
+        if (w->shared_gate == nullptr || w->shared_up == nullptr ||
+            w->shared_down == nullptr)
+            throw std::invalid_argument("shared expert weights are missing");
+
+        const int hidden = dims->hidden_size;
+        const size_t shared_inner = (size_t)moe->shared_intermediate_size;
+
+        char *base = (char *)scratch.base;
+        size_t used = 0;
+        auto take = [&](size_t bytes) {
+            char *result = base + used;
+            used += align_up(bytes);
+            return result;
+        };
+        __nv_bfloat16 *normed_input = (__nv_bfloat16 *)take((size_t)tokens * hidden * 2);
+        __nv_bfloat16 *shared_out = (__nv_bfloat16 *)take((size_t)tokens * hidden * 2);
+        /* [gate; up] adjacency is what the activation kernel consumes. */
+        __nv_bfloat16 *shared_gate = (__nv_bfloat16 *)take(2 * (size_t)tokens * shared_inner * 2);
+        __nv_bfloat16 *shared_up = shared_gate + (size_t)tokens * shared_inner;
+        __nv_bfloat16 *shared_act = (__nv_bfloat16 *)take((size_t)tokens * shared_inner * 2);
+        float *shared_scale = moe->shared_gate_scalar
+            ? (float *)take((size_t)tokens * sizeof(float)) : nullptr;
+
+        if (w->post_norm_w != nullptr) {
+            if (dims->norm_style == 1) {
+                kernel_rms_norm_plain(normed_input, normed, w->post_norm_w, hidden, tokens,
+                                      dims->rms_eps, stream);
+            } else {
+                kernel_gemma_rms_norm(normed_input, normed, w->post_norm_w, hidden, tokens,
+                                      dims->rms_eps, stream);
+            }
+        } else {
+            check_cuda(cudaMemcpyAsync(normed_input, normed, (size_t)tokens * hidden * 2,
+                                       cudaMemcpyDeviceToDevice, stream),
+                       "MoE input copy");
+        }
 
         /* Always-on experts: a dense MLP (or several, summed) on the same normed
          * input, optionally scaled per token by sigmoid(x @ w). The gate is a
          * single projection over the hidden state, so compute it first. */
-        if (shared > 0 && moe->shared_gate_scalar && w->shared_gate_scalar_w != nullptr) {
+        if (moe->shared_gate_scalar && w->shared_gate_scalar_w != nullptr) {
             const int status = gemm_bf16_f32out(cublas, shared_scale, normed_input,
                                                 w->shared_gate_scalar_w, tokens, 1, hidden);
             if (status != 0) return status;
@@ -420,10 +493,20 @@ int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
                 kernel_moe_scale_add(out, shared_out, nullptr, tokens, hidden, stream);
             }
         }
-        check_cuda(cudaGetLastError(), "MoE forward");
+        check_cuda(cudaGetLastError(), "MoE shared forward");
         return 0;
     } catch (const std::exception &e) {
-        fprintf(stderr, "MoE forward failed: %s\n", e.what());
+        fprintf(stderr, "MoE shared forward failed: %s\n", e.what());
         return -1;
     }
+}
+
+int forward_moe_ffn(cublasHandle_t cublas, cudaStream_t stream,
+                    const __nv_bfloat16 *normed, __nv_bfloat16 *out,
+                    const MoeWeights *w, const MoeConfig *moe,
+                    MoeScratch scratch, int tokens, const ModelDims *dims) {
+    const int status = forward_moe_routed(cublas, stream, normed, out, w, moe, scratch,
+                                          tokens, dims);
+    if (status != 0) return status;
+    return forward_moe_shared(cublas, stream, normed, out, w, moe, scratch, tokens, dims);
 }

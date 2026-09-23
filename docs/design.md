@@ -137,6 +137,23 @@ and the BF16 all-reduce reorder additions. The gate for the equivalence test
 inside the engine-vs-PyTorch RMS (0.02–0.04 for this family); the layer-wise
 path itself stays bit-identical to the historical baseline.
 
+### Expert-parallel placement
+
+`--ep N` splits whole experts across the ranks: rank r holds experts
+@[r * E\/ep, (r + 1) * E\/ep)@ and loads only those tensors (the descriptor
+marks the routed-expert roles `out_experts`). The router and the shared experts
+stay replicated, so every rank computes the same top-k and the same shared
+output; the routed part is a partial sum that is all-reduced before the shared
+experts are added — fewer experts per rank must not change how often the shared
+contribution is counted, which is why the reduce sits between the two halves of
+the MoE (`forward_moe_routed` / `forward_moe_shared`). Entries routed to another
+rank are localized away (`kernel_moe_localize_ids` -> -1 slots the combine
+skips), so the packed expert work stays proportional to the local experts.
+
+Combined TP+EP placement needs subgroup collectives and is rejected for now;
+MoE layers under `--tp` point at `--ep`. Verified with `tests/test_tp.py --ep 2`
+on Qwen3-30B-A3B (see the README gate list).
+
 ### Model architecture (Qwen3.8-27B)
 
 | Component | Detail |

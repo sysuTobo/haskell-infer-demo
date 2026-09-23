@@ -60,9 +60,11 @@ loadDescriptor cfg = case rcDescriptor cfg of
 initRuntime :: RuntimeConfig -> IO Runtime
 initRuntime cfg = do
   base <- loadDescriptor cfg
-  let policy = if rcTp cfg > 1 then Replicated (rcTp cfg) 1 else Pipelined
+  let policy
+        | rcTp cfg > 1 || rcEp cfg > 1 = Replicated (rcTp cfg) (rcEp cfg)
+        | otherwise = Pipelined
       desc = case policy of
-        Replicated tp _ -> base { dTpSize = tp }
+        Replicated tp ep -> base { dTpSize = tp, dEpSize = ep }
         Pipelined -> base
   putStrLn $ "Descriptor: " ++ dFamily desc ++ " (" ++ dModelType desc ++ "), "
     ++ show (dNumLayers desc) ++ " layers, hidden " ++ show (dHiddenSize desc)

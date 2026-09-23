@@ -468,11 +468,77 @@ static void test_errors(void) {
     test_rejects(buf, "version", "unsupported descriptor version is rejected");
 }
 
+/* The MoE descriptor with expert parallelism enabled (ep_size 2, rank 1) and a
+ * role_shards table whose expert roles carry out_experts. The table is parallel
+ * to role_names (18 entries). */
+static void build_ep2(char *buf, size_t buf_len) {
+    snprintf(buf, buf_len, "%s", kMoeDesc);
+    set_literal(buf, "\"num_layers\":2,",
+        "\"num_layers\":2,\"ep_size\":2,\"ep_rank\":1,\"role_shards\":["
+        "\"none\",\"none\",\"none\",\"none\",\"none\","
+        "\"out_heads\",\"out_heads\",\"out_heads\",\"in_dim\",\"none\",\"none\","
+        "\"none\","
+        "\"out_experts\",\"out_experts\",\"out_experts\","
+        "\"none\",\"none\",\"none\"],");
+}
+
+/* Expert-parallel keys and the out_experts rule. */
+static void test_ep(void) {
+    char buf[8192];
+    struct ModelDesc desc;
+    char err[256] = {0};
+    build_ep2(buf, sizeof(buf));
+    int rc = model_desc_parse(buf, &desc, err, sizeof(err));
+    check(rc == 0, err[0] ? err : "well-formed EP2 descriptor is rejected");
+    check(desc.ep_size == 2 && desc.ep_rank == 1, "ep_size/ep_rank parsed");
+    check(model_desc_role_index(&desc, ROLE_MOE_EXPERT_GATE) >= 0 &&
+              desc.role_shards[model_desc_role_index(&desc, ROLE_MOE_EXPERT_GATE)] ==
+                  ENGINE_SHARD_OUT_EXPERTS,
+          "out_experts parsed on the expert role");
+    check(desc.role_shards[model_desc_role_index(&desc, ROLE_MOE_ROUTER)] ==
+              ENGINE_SHARD_NONE,
+          "the router stays replicated");
+
+    /* The expert dimension is not a tensor dimension: an expert's own tensor is
+     * kept whole, the loader picks the local expert range. */
+    struct ShardView view;
+    rc = model_desc_shard_view(&desc, ROLE_MOE_EXPERT_GATE, 6, 8, 1, &view, err, sizeof(err));
+    check(rc == 0 && view.row_off == 0 && view.rows == 6 && view.col_off == 0 && view.cols == 8,
+          "an out_experts role keeps each expert's tensor whole");
+
+    /* The echo must reproduce the expert-parallel keys. */
+    char echo[8192];
+    int written = model_desc_format(&desc, echo, sizeof(echo));
+    check(written > 0 && strstr(echo, "\"ep_size\":2") != NULL &&
+              strstr(echo, "\"ep_rank\":1") != NULL &&
+              strstr(echo, "\"out_experts\"") != NULL,
+          "canonical echo carries the expert-parallel keys");
+    struct ModelDesc again;
+    rc = model_desc_parse(echo, &again, err, sizeof(err));
+    check(rc == 0, err[0] ? err : "EP2 echo does not re-parse");
+    check(again.ep_size == 2 && again.ep_rank == 1, "EP2 echo round-trips");
+
+    /* ep_rank must be inside [0, ep_size) and ep_size at least 1. */
+    build_ep2(buf, sizeof(buf));
+    set_literal(buf, "\"ep_size\":2,", "\"ep_size\":0,");
+    test_rejects(buf, "ep_size", "ep_size below 1 is rejected");
+    build_ep2(buf, sizeof(buf));
+    set_literal(buf, "\"ep_rank\":1,", "\"ep_rank\":2,");
+    test_rejects(buf, "ep_rank", "ep_rank >= ep_size is rejected");
+
+    /* out_experts only fits the routed-expert roles. */
+    build_ep2(buf, sizeof(buf));
+    set_literal(buf, "\"out_experts\",\"out_experts\"", "\"out_heads\",\"out_experts\"");
+    test_rejects(buf, "cannot carry", "out_heads on a routed-expert role is rejected");
+}
+
+
 int main(void) {
     test_good();
     test_tp();
     test_shard_view();
     test_moe();
+    test_ep();
     test_errors();
     if (failures == 0) {
         printf("model_desc tests passed\n");

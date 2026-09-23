@@ -66,22 +66,24 @@ pipelined desc devices = do
 
 -- | Replicated placement: @tp@ ranks holding shards of the same layers on
 -- @tp * ep@ devices, all running the full forward pass. The device list order is
--- the rank order (rank r = devices !! r).
+-- the rank order (rank r = devices !! r). @ep@ splits whole experts across
+-- ranks (expert parallelism); the router and the shared experts stay replicated,
+-- so every rank computes the same top-k and the routed partial is all-reduced.
 replicated :: Descriptor -> Int -> Int -> [Int] -> Either String Placement
 replicated desc tp ep devices = do
   check (tp < 1) "tp must be at least 1"
   check (ep < 1) "ep must be at least 1"
-  check (ep /= 1) "expert parallel (ep > 1) is not implemented"
+  check (tp > 1 && ep > 1)
+    "combined tensor and expert parallelism (tp > 1 and ep > 1) is not implemented"
   check (length devices /= tp * ep)
     ("replicated placement needs tp * ep = " ++ show (tp * ep)
      ++ " devices, got " ++ show (length devices))
   case [msg | msg <- shardSizeProblems desc tp] of
     [] -> Right ()
     msg : _ -> Left msg
-  case [i | (i, FMoe) <- zip [0 :: Int ..] (dLayerFfns desc)] of
+  case [msg | msg <- expertParallelProblems desc tp ep] of
     [] -> Right ()
-    i : _ -> Left ("layer " ++ show i ++ " is MoE; tensor parallelism with MoE layers"
-                   ++ " is not implemented yet (expert parallel lands separately)")
+    msg : _ -> Left msg
   let layers = [0 .. dNumLayers desc - 1]
       result = Placement (Replicated tp ep) devices
                          (replicate (dNumLayers desc) (head devices))
@@ -91,6 +93,29 @@ replicated desc tp ep devices = do
   where
     check True message = Left message
     check False _ = Right ()
+
+-- | Expert parallelism needs MoE layers, a split that divides the expert count,
+-- and the expert roles marked @out_experts@ -- otherwise the engine would load
+-- whole experts on every rank while the reduce still sums them.
+expertParallelProblems :: Descriptor -> Int -> Int -> [String]
+expertParallelProblems desc tp ep
+  | tp > 1, moeLayer : _ <- moeLayers =
+      ["layer " ++ show moeLayer
+       ++ " is MoE; tensor parallelism cannot split MoE layers (use ep_size)"]
+  | otherwise = epProblems
+  where
+    moeLayers = [i | (i, FMoe) <- zip [0 :: Int ..] (dLayerFfns desc)]
+    expertRoles = [RMoeExpertGate, RMoeExpertUp, RMoeExpertDown]
+    rule role = lookup role (shardRules desc)
+    epProblems
+      | ep <= 1 = []
+      | null moeLayers = ["ep > 1 needs at least one MoE layer"]
+      | dMoeNumExperts desc `mod` ep /= 0 =
+          ["ep " ++ show ep ++ " does not divide the expert count ("
+           ++ show (dMoeNumExperts desc) ++ ")"]
+      | not (all ((== Just ShardOutExperts) . rule) expertRoles) =
+          ["expert roles must carry the out_experts rule when ep > 1"]
+      | otherwise = []
 
 -- | The sharded roles need their split dimension to divide evenly by @tp@.
 shardSizeProblems :: Descriptor -> Int -> [String]

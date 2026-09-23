@@ -98,6 +98,22 @@ void kernel_cast_bf16_f32(float *out, const __nv_bfloat16 *in, int n,
     cast_bf16_f32_kernel<<<grid, block, 0, stream>>>(out, in, n);
 }
 
+/** Cast F32 to BF16: one rounding, for a merged FP32 partial becoming an
+ *  activation. */
+__global__ void cast_f32_bf16_kernel(__nv_bfloat16 *__restrict__ out,
+                                     const float *__restrict__ in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __float2bfloat16_rn(in[i]);
+}
+
+void kernel_cast_f32_bf16(__nv_bfloat16 *out, const float *in, int n,
+                          cudaStream_t stream) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    cast_f32_bf16_kernel<<<grid, block, 0, stream>>>(out, in, n);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Residual add: dst[i] += src[i] (BF16)                             */
 /* ------------------------------------------------------------------ */

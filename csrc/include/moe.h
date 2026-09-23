@@ -85,6 +85,13 @@ int forward_moe_routed(cublasHandle_t cublas, cudaStream_t stream,
                        const MoeWeights *w, const MoeConfig *moe,
                        MoeScratch scratch, int tokens, const struct ModelDims *dims);
 
+/* Same routed partial, kept in FP32: expert parallelism merges these across
+ * ranks and rounds once, into the activation, afterwards. */
+int forward_moe_routed_f32(cublasHandle_t cublas, cudaStream_t stream,
+                           const __nv_bfloat16 *normed, float *out_f32,
+                           const MoeWeights *w, const MoeConfig *moe,
+                           MoeScratch scratch, int tokens, const struct ModelDims *dims);
+
 /* Shared experts: out += scaled dense MLP(s) on the same normed input. */
 int forward_moe_shared(cublasHandle_t cublas, cudaStream_t stream,
                        const __nv_bfloat16 *normed, __nv_bfloat16 *out,

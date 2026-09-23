@@ -126,6 +126,14 @@ static int run_ffn(const LayerContext *ctx, const struct LayerWeights *w,
          * (replicated) shared experts -- adding them per rank would otherwise
          * count them once per rank. */
         if (ctx->split_phase == 0) {
+            /* With expert parallelism the partial is merged across ranks before
+             * anything rounds, so it is written to the FP32 buffer and turned
+             * into the activation by the caller once the merge is done. */
+            if (ctx->moe_partial_f32 != nullptr) {
+                return forward_moe_routed_f32(ctx->cublas, ctx->stream, residual,
+                                              ctx->moe_partial_f32, &w->moe, &config, scratch,
+                                              ctx->tokens, ctx->dims);
+            }
             return forward_moe_routed(ctx->cublas, ctx->stream, residual, layer_out,
                                       &w->moe, &config, scratch, ctx->tokens, ctx->dims);
         }

@@ -101,6 +101,11 @@ void kernel_embedding(__nv_bfloat16 *out, const __nv_bfloat16 *table,
 void kernel_cast_bf16_f32(float *out, const __nv_bfloat16 *in, int n,
                           cudaStream_t stream);
 
+/** F32 to BF16 cast: the single rounding that turns a merged FP32 partial into
+ *  the activation it belongs to. */
+void kernel_cast_f32_bf16(__nv_bfloat16 *out, const float *in, int n,
+                          cudaStream_t stream);
+
 /** Residual add: dst[i] += src[i] (BF16, element-wise). */
 void kernel_residual_add(__nv_bfloat16 *dst, const __nv_bfloat16 *src,
                          int n, cudaStream_t stream);

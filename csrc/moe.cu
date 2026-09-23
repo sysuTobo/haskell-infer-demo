@@ -192,9 +192,22 @@ void kernel_moe_gather(const __nv_bfloat16 *input, const int *token_of_slot,
 /* Combine                                                                 */
 /* ----------------------------------------------------------------------- */
 
+/* Store one combined value. The activation path rounds into BF16 here; the
+ * expert-parallel partial is kept in FP32 because it is merged across ranks
+ * before anything rounds, so rounding it early would cost a precision step the
+ * single-rank path does not pay. */
+__device__ inline void moe_store(__nv_bfloat16 *out, size_t index, float value) {
+    out[index] = __float2bfloat16_rn(value);
+}
+
+__device__ inline void moe_store(float *out, size_t index, float value) {
+    out[index] = value;
+}
+
+template <typename Output>
 __global__ void moe_combine_kernel(const __nv_bfloat16 *expert_out, const int *slot_of,
                                    const float *weights, int top_k, int width,
-                                   __nv_bfloat16 *out) {
+                                   Output *out) {
     const int token = blockIdx.x;
     const size_t total = (size_t)width;
     for (size_t j = threadIdx.x; j < total; j += blockDim.x) {
@@ -206,7 +219,7 @@ __global__ void moe_combine_kernel(const __nv_bfloat16 *expert_out, const int *s
             acc += weights[token * top_k + k] *
                    __bfloat162float(expert_out[(size_t)slot * width + j]);
         }
-        out[(size_t)token * width + j] = __float2bfloat16_rn(acc);
+        moe_store(out, (size_t)token * width + j, acc);
     }
 }
 
@@ -215,6 +228,26 @@ void kernel_moe_combine(const __nv_bfloat16 *expert_out, const int *slot_of,
                         __nv_bfloat16 *out, cudaStream_t stream) {
     moe_combine_kernel<<<tokens, kThreads, 0, stream>>>(expert_out, slot_of, weights,
                                                         top_k, width, out);
+}
+
+void kernel_moe_combine_f32(const __nv_bfloat16 *expert_out, const int *slot_of,
+                            const float *weights, int tokens, int top_k, int width,
+                            float *out, cudaStream_t stream) {
+    moe_combine_kernel<<<tokens, kThreads, 0, stream>>>(expert_out, slot_of, weights,
+                                                        top_k, width, out);
+}
+
+/* Pick the combine flavour from the destination type. */
+inline void kernel_moe_combine_into(const __nv_bfloat16 *expert_out, const int *slot_of,
+                                    const float *weights, int tokens, int top_k, int width,
+                                    __nv_bfloat16 *out, cudaStream_t stream) {
+    kernel_moe_combine(expert_out, slot_of, weights, tokens, top_k, width, out, stream);
+}
+
+inline void kernel_moe_combine_into(const __nv_bfloat16 *expert_out, const int *slot_of,
+                                    const float *weights, int tokens, int top_k, int width,
+                                    float *out, cudaStream_t stream) {
+    kernel_moe_combine_f32(expert_out, slot_of, weights, tokens, top_k, width, out, stream);
 }
 
 __global__ void moe_localize_kernel(int *ids, int entries, int offset, int local) {
@@ -290,10 +323,13 @@ size_t moe_workspace_size(int tokens, const ModelDims *dims, const MoeConfig *mo
     return bytes;
 }
 
-int forward_moe_routed(cublasHandle_t cublas, cudaStream_t stream,
-                       const __nv_bfloat16 *normed, __nv_bfloat16 *out,
-                       const MoeWeights *w, const MoeConfig *moe,
-                       MoeScratch scratch, int tokens, const ModelDims *dims) {
+/* The routed partial, written either straight into the activation (BF16) or into
+ * an FP32 buffer that expert parallelism merges across ranks first. */
+template <typename Output>
+static int moe_routed_forward(cublasHandle_t cublas, cudaStream_t stream,
+                              const __nv_bfloat16 *normed, Output *out,
+                              const MoeWeights *w, const MoeConfig *moe,
+                              MoeScratch scratch, int tokens, const ModelDims *dims) {
     try {
         if (tokens < 1 || tokens > dims->max_chunk)
             throw std::invalid_argument("MoE token count exceeds max_chunk");
@@ -408,13 +444,29 @@ int forward_moe_routed(cublasHandle_t cublas, cudaStream_t stream,
             if (status_down != 0) return status_down;
         }
 
-        kernel_moe_combine(expert_out, slot_of, weights, tokens, top_k, hidden, out, stream);
+        kernel_moe_combine_into(expert_out, slot_of, weights, tokens, top_k, hidden, out,
+                                stream);
         check_cuda(cudaGetLastError(), "MoE routed forward");
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "MoE routed forward failed: %s\n", e.what());
         return -1;
     }
+}
+
+int forward_moe_routed(cublasHandle_t cublas, cudaStream_t stream,
+                       const __nv_bfloat16 *normed, __nv_bfloat16 *out,
+                       const MoeWeights *w, const MoeConfig *moe,
+                       MoeScratch scratch, int tokens, const ModelDims *dims) {
+    return moe_routed_forward(cublas, stream, normed, out, w, moe, scratch, tokens, dims);
+}
+
+int forward_moe_routed_f32(cublasHandle_t cublas, cudaStream_t stream,
+                           const __nv_bfloat16 *normed, float *out_f32,
+                           const MoeWeights *w, const MoeConfig *moe,
+                           MoeScratch scratch, int tokens, const ModelDims *dims) {
+    return moe_routed_forward(cublas, stream, normed, out_f32, w, moe, scratch, tokens,
+                              dims);
 }
 
 int forward_moe_shared(cublasHandle_t cublas, cudaStream_t stream,

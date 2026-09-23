@@ -197,6 +197,10 @@ typedef struct {
     const int64_t *positions;
     void *fla_scratch;
     void *moe_scratch;
+    /* Expert parallelism only: this rank's routed partial in FP32. The merge
+     * across ranks happens here and the activation is rounded once afterwards,
+     * so the partial must not be rounded on the way out. Null otherwise. */
+    float *moe_partial_f32;
     void *mla_scratch;
     int tokens;
     int seq_len;              /* sequence length including the current tokens */

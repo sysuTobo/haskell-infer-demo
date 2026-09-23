@@ -232,6 +232,10 @@ struct DeviceCtx {
     void *moe_scratch = nullptr;
     void *mla_scratch = nullptr;
     __nv_bfloat16 *reduce_staging = nullptr;  // rank-0 all-reduce scratch
+    /* Expert parallelism: this rank's routed partial in FP32 and the FP32
+     * leader staging the merge goes through. */
+    float *moe_partial_f32 = nullptr;
+    float *moe_staging_f32 = nullptr;
     size_t ws_size = 0;
     size_t fla_size = 0;
     size_t moe_ws_size = 0;
@@ -769,6 +773,17 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                 check_cuda(cudaMalloc(&ctx.reduce_staging, activation_bytes),
                            "Allocate reduce staging");
             }
+            if (eng->expert_parallel) {
+                /* One FP32 copy of the activation per rank for the routed partial,
+                 * plus the leader's FP32 staging; the merge rounds once, when the
+                 * merged partial becomes the activation. */
+                check_cuda(cudaMalloc(&ctx.moe_partial_f32, activation_bytes * 2),
+                           "Allocate the FP32 expert partial");
+                if (d == 0) {
+                    check_cuda(cudaMalloc(&ctx.moe_staging_f32, activation_bytes * 2),
+                               "Allocate the FP32 expert staging");
+                }
+            }
                     ctx.moe_scratch = nullptr;
             if (has_gdn) {
                 ctx.fla_size = kernel_fla_workspace_size(max_chunk, eng->dims.gdn_num_v_heads);
@@ -958,6 +973,7 @@ static LayerContext make_layer_context(EngineHandle *eng, int layer, int dev_idx
     lctx.positions = ctx.positions;
     lctx.fla_scratch = ctx.fla_scratch;
     lctx.moe_scratch = ctx.moe_scratch;
+    lctx.moe_partial_f32 = ctx.moe_partial_f32;
     lctx.mla_scratch = ctx.mla_scratch;
     lctx.tokens = tokens;
     lctx.seq_len = eng->seq_len + tokens;
@@ -995,6 +1011,26 @@ static int allreduce_layer_out(EngineHandle *eng, size_t elements) {
     return allreduce_sum(eng->devices.data(), streams.data(), events.data(),
                          done_events.data(), eng->num_devices, buffers.data(),
                          eng->ctx[0].reduce_staging, elements, COLLECTIVE_BF16);
+}
+
+/* Merge the FP32 expert partials across ranks. These are the values the routed
+ * experts produced, before anything rounds them, so the merge is exact and the
+ * activation is rounded exactly once afterwards; merging them in BF16 instead
+ * would add a rounding the single-rank path does not pay. */
+static int allreduce_moe_partial(EngineHandle *eng, size_t elements) {
+    std::vector<void *> buffers(eng->num_devices);
+    std::vector<cudaStream_t> streams(eng->num_devices);
+    std::vector<cudaEvent_t> events(eng->num_devices);
+    std::vector<cudaEvent_t> done_events(eng->num_devices);
+    for (int d = 0; d < eng->num_devices; ++d) {
+        buffers[d] = eng->ctx[d].moe_partial_f32;
+        streams[d] = eng->ctx[d].stream;
+        events[d] = eng->ctx[d].copy_event;
+        done_events[d] = eng->ctx[d].read_done_event;
+    }
+    return allreduce_sum(eng->devices.data(), streams.data(), events.data(),
+                         done_events.data(), eng->num_devices, buffers.data(),
+                         eng->ctx[0].moe_staging_f32, elements, COLLECTIVE_F32);
 }
 
 /* LayerContext hook for sublayers whose parts live on different ranks (expert
@@ -1104,9 +1140,19 @@ static void forward_replicated(EngineHandle *eng, const int64_t *token_ids, int 
                     check_forward(status, is_mixer ? "Layer mixer" : "Layer feed-forward");
                 }
                 if (ep_moe && pass == 0 && eng->num_devices > 1) {
-                    int status = allreduce_layer_out(eng, elements);
+                    int status = allreduce_moe_partial(eng, elements);
                     if (status != 0)
                         throw EngineError(ENGINE_ERR_CUDA, "Expert all-reduce failed");
+                    /* The merged FP32 partial becomes this rank's activation with
+                     * a single rounding, exactly as the single-rank path does
+                     * after summing every expert. */
+                    for (int d = 0; d < eng->num_devices; ++d) {
+                        DeviceCtx &ctx = eng->ctx[d];
+                        check_cuda(cudaSetDevice(ctx.device_id), "Select fold device");
+                        kernel_cast_f32_bf16(ctx.layer_out, ctx.moe_partial_f32,
+                                             (int)elements, ctx.stream);
+                        check_cuda(cudaGetLastError(), "Fold the expert partial");
+                    }
                 }
             }
             if ((is_mixer ? reduce_mixer : reduce_ffn) && eng->num_devices > 1) {
@@ -1282,7 +1328,8 @@ void engine_destroy(EngineHandle *eng) {
             void *buffers[] = {ctx.residual, ctx.layer_out, ctx.workspace, ctx.conv_bias_zero,
                                ctx.positions, ctx.fla_scratch, ctx.moe_scratch, ctx.mla_scratch,
                                ctx.token_ids, ctx.embed_w, ctx.lm_head_w, ctx.final_norm_w,
-                               ctx.d_logits, ctx.reduce_staging};
+                               ctx.d_logits, ctx.reduce_staging, ctx.moe_partial_f32,
+                               ctx.moe_staging_f32};
             for (void *ptr : buffers) if (ptr) cleanup_cuda(cudaFree(ptr));
             if (ctx.cublas) {
                 cublasStatus_t status = cublasDestroy(ctx.cublas);

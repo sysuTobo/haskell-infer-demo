@@ -279,7 +279,8 @@ int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
 int forward_mla_layer(cublasHandle_t cublas, cudaStream_t stream,
     const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,
     const MlaWeights *w, __nv_bfloat16 *latent_cache, void *scratch,
-    const int64_t *positions, int tokens, int seq_len, const ModelDims *dims);
+    const int64_t *positions, int tokens, int seq_len, const ModelDims *dims,
+    const GdnTapSites *taps = nullptr);
 
 /* Bytes for the MLA decoder scratch (decompressed K/V + repacked latent). */
 size_t kernel_mla_scratch_size(int max_seq, const ModelDims *dims);

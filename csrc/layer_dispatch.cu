@@ -76,9 +76,11 @@ static int run_mixer(const LayerContext *ctx, const struct LayerWeights *w,
         mw.kv_b_proj_w = w->mla_kv_b_proj_w;
         mw.o_proj_w = w->mla_o_proj_w;
         mw.input_norm_w = w->input_norm_w;
+        const GdnTapSites sites{ctx->taps, ctx->layer_index, ctx->device};
         return forward_mla_layer(ctx->cublas, ctx->stream, residual, ctx->workspace,
                                  layer_out, &mw, w->mla_cache, ctx->mla_scratch,
-                                 ctx->positions, ctx->tokens, ctx->seq_len, ctx->dims);
+                                 ctx->positions, ctx->tokens, ctx->seq_len, ctx->dims,
+                                 &sites);
     }
     case ENGINE_MIXER_GDN: {
         GdnWeights gw{};

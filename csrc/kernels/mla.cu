@@ -152,7 +152,7 @@ int forward_mla_layer(cublasHandle_t cublas, cudaStream_t stream,
                       __nv_bfloat16 *layer_out, const MlaWeights *w,
                       __nv_bfloat16 *latent_cache, void *scratch,
                       const int64_t *positions, int tokens, int seq_len,
-                      const ModelDims *dims) {
+                      const ModelDims *dims, const GdnTapSites *taps) {
     try {
         if (tokens < 1 || tokens > dims->max_chunk)
             throw std::invalid_argument("MLA token count exceeds max_chunk");
@@ -182,6 +182,15 @@ int forward_mla_layer(cublasHandle_t cublas, cudaStream_t stream,
         __nv_bfloat16 *kv_a = q + (size_t)tokens * q_width;
         __nv_bfloat16 *attn = kv_a + (size_t)tokens * latent_width;
 
+        /* Stage taps line up with the oracle's submodule hooks: mla_in is the
+         * input norm, mla_q_pre/mla_kv_pre the raw projections, mla_latent the
+         * normalized latent, mla_q/mla_kv the post-RoPE values, mla_knope the
+         * decompressed per-head K/V and mla_attn the attention output. */
+        auto tap = [&](const char *kind, const __nv_bfloat16 *data, int cols) {
+            if (taps != nullptr)
+                tap_dump_rows(taps->config, kind, taps->layer, taps->device, stream, data,
+                              tokens, cols);
+        };
         if (w->input_norm_w != nullptr) {
             if (dims->norm_style == 1) {
                 kernel_rms_norm_plain(normed, residual, w->input_norm_w, hidden, tokens,
@@ -195,19 +204,35 @@ int forward_mla_layer(cublasHandle_t cublas, cudaStream_t stream,
                                        cudaMemcpyDeviceToDevice, stream), "MLA input copy");
         }
 
+        tap("mla_in", normed, hidden);
         int status = gemm_bf16(cublas, q, normed, w->q_proj_w, tokens, q_width, hidden);
         if (status != 0) return status;
         status = gemm_bf16(cublas, kv_a, normed, w->kv_a_proj_w, tokens, latent_width, hidden);
         if (status != 0) return status;
+        tap("mla_q_pre", q, q_width);
+        tap("mla_kv_pre", kv_a, latent_width);
 
         /* The latent is normalized with a plain RMSNorm (the reference's
          * kv_a_layernorm is an ordinary RMSNorm even in otherwise shifted-norm
-         * families), in place on the first `lora` channels. The descriptor
-         * requires lora to be a multiple of 8: the library norm kernel
-         * vectorizes in 8-element units, so narrower rows corrupt neighbouring
-         * rows when more than one row is normalized at once. */
-        kernel_rms_norm_plain(kv_a, kv_a, w->kv_a_norm_w, lora, tokens, dims->rms_eps, stream);
+         * families). The library norm kernel assumes both operands are
+         * contiguous [rows, cols] blocks, while the latent lives inside rows that
+         * are (lora + rope) wide: stage it through the repack block (exactly
+         * [tokens, lora]), normalize, and copy back. Reading the strided rows
+         * directly corrupts every row after the first (measured: 15x the row's
+         * scale). */
+        check_cuda(cudaMemcpy2DAsync(repack, (size_t)lora * sizeof(__nv_bfloat16),
+                                     kv_a, (size_t)latent_width * sizeof(__nv_bfloat16),
+                                     (size_t)lora * sizeof(__nv_bfloat16), (size_t)tokens,
+                                     cudaMemcpyDeviceToDevice, stream),
+                   "MLA latent stage");
+        kernel_rms_norm_plain(repack, repack, w->kv_a_norm_w, lora, tokens, dims->rms_eps, stream);
         check_cuda(cudaGetLastError(), "MLA latent norm");
+        tap("mla_latent", repack, lora);
+        check_cuda(cudaMemcpy2DAsync(kv_a, (size_t)latent_width * sizeof(__nv_bfloat16),
+                                     repack, (size_t)lora * sizeof(__nv_bfloat16),
+                                     (size_t)lora * sizeof(__nv_bfloat16), (size_t)tokens,
+                                     cudaMemcpyDeviceToDevice, stream),
+                   "MLA latent copy back");
 
         {
             const int blocks_x = tokens;
@@ -219,6 +244,8 @@ int forward_mla_layer(cublasHandle_t cublas, cudaStream_t stream,
                 dims->rope_theta);
             check_cuda(cudaGetLastError(), "MLA rope");
         }
+        tap("mla_q", q, q_width);
+        tap("mla_kv", kv_a, latent_width);
 
         /* Append the new tokens to the latent cache, then decompress the whole
          * cached range (the naive path; weight absorption would avoid it). */
@@ -233,13 +260,19 @@ int forward_mla_layer(cublasHandle_t cublas, cudaStream_t stream,
         status = gemm_bf16(cublas, decompressed, repack, w->kv_b_proj_w, seq_len,
                            kv_row_dec, lora);
         if (status != 0) return status;
+        tap("mla_knope_v", decompressed + (size_t)(seq_len - tokens) * kv_row_dec, kv_row_dec);
 
         const int kv_len = seq_len;
-        const int threads = std::min(256, ((kv_len + 31) / 32) * 32);
+        /* The halving tree reduction inside the kernel is only correct for
+         * power-of-two block sizes (rounding to multiples of 32 drops whole
+         * lane groups for 96/160/192); idle lanes carry identity values. */
+        int threads = 32;
+        while (threads < kv_len && threads < 256) threads <<= 1;
         mla_attention_kernel<<<dim3(tokens, heads), threads, kv_len * sizeof(float), stream>>>(
             q, decompressed, decompressed, latent_cache + lora, latent_width,
             seq_len - tokens, heads, nope, rope, vdim, scale, attn);
         check_cuda(cudaGetLastError(), "MLA attention");
+        tap("mla_attn", attn, heads * vdim);
 
         status = gemm_bf16(cublas, layer_out, attn, w->o_proj_w, tokens, hidden, heads * vdim);
         if (status != 0) return status;

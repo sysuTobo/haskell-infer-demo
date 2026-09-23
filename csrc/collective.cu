@@ -13,7 +13,97 @@
 #include "layers.h"
 #include "kernels.h"
 
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cstdio>
+
+namespace {
+
+/* Element conversions for the reduction. Every type accumulates in FP32 and
+ * rounds once when storing, so a transfer's precision follows from the buffer's
+ * own element type rather than from a fixed choice of the transport. */
+template <typename T>
+struct ElementTraits;
+
+template <>
+struct ElementTraits<float> {
+    static __device__ float to_float(float value) { return value; }
+    static __device__ float from_float(float value) { return value; }
+};
+
+template <>
+struct ElementTraits<__half> {
+    static __device__ float to_float(__half value) { return __half2float(value); }
+    static __device__ __half from_float(float value) { return __float2half_rn(value); }
+};
+
+template <>
+struct ElementTraits<__nv_bfloat16> {
+    static __device__ float to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
+    static __device__ __nv_bfloat16 from_float(float value) {
+        return __float2bfloat16_rn(value);
+    }
+};
+
+template <>
+struct ElementTraits<__nv_fp8_e4m3> {
+    static __device__ float to_float(__nv_fp8_e4m3 value) { return (float)value; }
+    static __device__ __nv_fp8_e4m3 from_float(float value) {
+        return __nv_fp8_e4m3(value);
+    }
+};
+
+template <>
+struct ElementTraits<__nv_fp8_e5m2> {
+    static __device__ float to_float(__nv_fp8_e5m2 value) { return (float)value; }
+    static __device__ __nv_fp8_e5m2 from_float(float value) {
+        return __nv_fp8_e5m2(value);
+    }
+};
+
+/* dst += src, one element per thread. */
+template <typename T>
+__global__ void collective_add_kernel(T *__restrict__ dst, const T *__restrict__ src,
+                                      size_t count) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    dst[i] = ElementTraits<T>::from_float(ElementTraits<T>::to_float(dst[i]) +
+                                          ElementTraits<T>::to_float(src[i]));
+}
+
+/* Run the elementwise add for whichever type the caller's buffer holds. */
+int launch_add(void *dst, const void *src, size_t elements, CollectiveDtype dtype,
+               cudaStream_t stream) {
+    const unsigned block = 256;
+    const unsigned grid = (unsigned)((elements + block - 1) / block);
+    switch (dtype) {
+    case COLLECTIVE_F32:
+        collective_add_kernel<float><<<grid, block, 0, stream>>>(
+            (float *)dst, (const float *)src, elements);
+        break;
+    case COLLECTIVE_F16:
+        collective_add_kernel<__half><<<grid, block, 0, stream>>>(
+            (__half *)dst, (const __half *)src, elements);
+        break;
+    case COLLECTIVE_BF16:
+        collective_add_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+            (__nv_bfloat16 *)dst, (const __nv_bfloat16 *)src, elements);
+        break;
+    case COLLECTIVE_FP8_E4M3:
+        collective_add_kernel<__nv_fp8_e4m3><<<grid, block, 0, stream>>>(
+            (__nv_fp8_e4m3 *)dst, (const __nv_fp8_e4m3 *)src, elements);
+        break;
+    case COLLECTIVE_FP8_E5M2:
+        collective_add_kernel<__nv_fp8_e5m2><<<grid, block, 0, stream>>>(
+            (__nv_fp8_e5m2 *)dst, (const __nv_fp8_e5m2 *)src, elements);
+        break;
+    default:
+        return (int)cudaErrorInvalidValue;
+    }
+    return (int)cudaGetLastError();
+}
+
+}  // namespace
 
 int peer_probe_all(const int *devices, int count, int enable) {
     int reachable = 0;
@@ -75,11 +165,17 @@ int copy_across_devices(int from_device, cudaStream_t from_stream, cudaEvent_t *
     return (int)cudaMemcpyPeerAsync(dst, to_device, src, from_device, bytes, to_stream);
 }
 
-int allreduce_sum_bf16(const int *devices, cudaStream_t *streams, cudaEvent_t *events,
-                       cudaEvent_t *done_events, int count, __nv_bfloat16 **buffers,
-                       __nv_bfloat16 *leader_staging, size_t elements) {
-    if (count < 2) return 0;
-    const size_t bytes = elements * sizeof(__nv_bfloat16);
+int allreduce_sum(const int *devices, cudaStream_t *streams, cudaEvent_t *events,
+                  cudaEvent_t *done_events, int count, void *const *buffers,
+                  void *leader_staging, size_t elements, CollectiveDtype dtype) {
+    if (count < 2 || elements == 0) return 0;
+    const size_t element = collective_element_bytes(dtype);
+    if (element == 0) {
+        fprintf(stderr, "[engine] allreduce_sum: unknown element type %d\n", (int)dtype);
+        return (int)cudaErrorInvalidValue;
+    }
+    if (buffers == nullptr || leader_staging == nullptr) return (int)cudaErrorInvalidValue;
+    const size_t bytes = elements * element;
 
     /* Reduce: each rank's buffer is read on the leader stream, ordered by the
      * event its own stream recorded when it produced the data. */
@@ -91,9 +187,8 @@ int allreduce_sum_bf16(const int *devices, cudaStream_t *streams, cudaEvent_t *e
         /* Runs on the leader stream, ordered after the copy by the event above. */
         cudaError_t error = cudaSetDevice(devices[0]);
         if (error != cudaSuccess) return (int)error;
-        kernel_residual_add(buffers[0], leader_staging, (int)elements, streams[0]);
-        error = cudaGetLastError();
-        if (error != cudaSuccess) return (int)error;
+        status = launch_add(buffers[0], leader_staging, elements, dtype, streams[0]);
+        if (status != 0) return status;
     }
 
     /* Broadcast: every rank copies the leader's buffer. The copy is enqueued on

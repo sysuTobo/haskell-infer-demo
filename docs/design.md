@@ -64,9 +64,14 @@ communicator and the demo stays dependency-free. Two rules:
 
 The all-reduce used by tensor/expert parallel placement is leader-based: every
 follower copies its partial into the leader's staging buffer, the leader adds it
-(elementwise bf16) and broadcasts the result. It is exercised by
-`test_collective`, which also checks that a copy issued without host
-synchronization still observes data produced asynchronously on the source stream.
+elementwise and broadcasts the result. The element type is a property of the
+data rather than of the transport: the caller states what its buffer holds
+(F32, F16, BF16 or either FP8 flavour), every copy is sized from it, and the
+reduction accumulates in FP32 and rounds once when storing. Placement reduces
+BF16 activations, so that is the type it passes. It is exercised by
+`test_collective`, which runs the same reduction once per element type and also
+checks that a copy issued without host synchronization still observes data
+produced asynchronously on the source stream.
 
 Verification status per target: sm_86 and sm_89 are verified at runtime (sm_89
 through the operator suite on an L20, which exercises the sm_89 Triton cubins);
@@ -137,7 +142,7 @@ output (leader reduce + broadcast, `collective.cu`) before the residual add, so
 the residual stream stays identical across ranks.
 
 The TP logits are *not* bit-identical to the layer-wise split: split-K GEMM sums
-and the BF16 all-reduce reorder additions. The gate for the equivalence test
+and the all-reduce (which carries BF16 activations) reorder additions. The gate for the equivalence test
 (`tests/test_tp.py`) is identical greedy tokens plus logit RMS ≤ 0.05, comparable
 to the engine-vs-PyTorch RMS (0.02–0.04 for this family), not stricter than it.
 The historical layer-wise refactor gate is separate from a still-needed test of

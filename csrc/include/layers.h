@@ -239,18 +239,44 @@ int copy_across_devices(int from_device, cudaStream_t from_stream, cudaEvent_t *
                         int to_device, cudaStream_t to_stream,
                         void *dst, const void *src, size_t bytes);
 
-/* In-place sum of one bf16 buffer per device (elementwise, bf16 arithmetic), via
- * leader staging on devices[0].
+/* Element type of the buffers a cross-device primitive moves. The type belongs
+ * to the *data*, not to the transport: the caller states what its buffer holds
+ * and every copy is sized from it. The reduction accumulates in FP32 and rounds
+ * once when storing, whatever the element type is. */
+typedef enum {
+    COLLECTIVE_F32 = 0,       /* float */
+    COLLECTIVE_F16 = 1,       /* __half */
+    COLLECTIVE_BF16 = 2,      /* __nv_bfloat16 */
+    COLLECTIVE_FP8_E4M3 = 3,  /* __nv_fp8_e4m3 */
+    COLLECTIVE_FP8_E5M2 = 4,  /* __nv_fp8_e5m2 */
+} CollectiveDtype;
+
+/* Bytes per element of @dtype, or 0 when the tag is unknown. */
+static inline size_t collective_element_bytes(CollectiveDtype dtype) {
+    switch (dtype) {
+    case COLLECTIVE_F32: return sizeof(float);
+    case COLLECTIVE_F16:
+    case COLLECTIVE_BF16: return 2;
+    case COLLECTIVE_FP8_E4M3:
+    case COLLECTIVE_FP8_E5M2: return 1;
+    default: return 0;
+    }
+}
+
+/* In-place sum of one buffer per device (elementwise), via leader staging on
+ * devices[0]. `buffers[i]` and `leader_staging` each hold @elements values of
+ * @dtype, which is what every cross-device copy is sized from.
  *
  * events[i] is the producer event of stream i: it orders rank i's data before
  * the leader reads it. done_events[i] is recorded on stream i once its incoming
  * broadcast copy has finished reading devices[0]'s buffer; the leader waits on
  * all of them, so any later reuse of that buffer is ordered after every read.
  * Both arrays and streams are index-aligned with devices. The caller
- * synchronizes afterwards. */
-int allreduce_sum_bf16(const int *devices, cudaStream_t *streams, cudaEvent_t *events,
-                       cudaEvent_t *done_events, int count, __nv_bfloat16 **buffers,
-                       __nv_bfloat16 *leader_staging, size_t elements);
+ * synchronizes afterwards. Returns 0, an unknown-type error, or a transport
+ * status. */
+int allreduce_sum(const int *devices, cudaStream_t *streams, cudaEvent_t *events,
+                  cudaEvent_t *done_events, int count, void *const *buffers,
+                  void *leader_staging, size_t elements, CollectiveDtype dtype);
 
 /* Bytes for reusable attention/GDN/MLP workspace; excludes FLA scratch and
  * the independent residual/layer_out buffers. tokens must be in [1, max_chunk]. */

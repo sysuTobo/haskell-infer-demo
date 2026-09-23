@@ -980,7 +980,9 @@ static void residual_add_device(EngineHandle *eng, int dev_idx, size_t elements)
 
 /* Sum every rank's layer_out in place (leader reduce + broadcast). */
 static int allreduce_layer_out(EngineHandle *eng, size_t elements) {
-    std::vector<__nv_bfloat16 *> buffers(eng->num_devices);
+    /* The activations this reduces are BF16, so that is the element type the
+     * collective is told to move; the transport itself is type-agnostic. */
+    std::vector<void *> buffers(eng->num_devices);
     std::vector<cudaStream_t> streams(eng->num_devices);
     std::vector<cudaEvent_t> events(eng->num_devices);
     std::vector<cudaEvent_t> done_events(eng->num_devices);
@@ -990,9 +992,9 @@ static int allreduce_layer_out(EngineHandle *eng, size_t elements) {
         events[d] = eng->ctx[d].copy_event;
         done_events[d] = eng->ctx[d].read_done_event;
     }
-    return allreduce_sum_bf16(eng->devices.data(), streams.data(), events.data(),
-                              done_events.data(), eng->num_devices, buffers.data(),
-                              eng->ctx[0].reduce_staging, elements);
+    return allreduce_sum(eng->devices.data(), streams.data(), events.data(),
+                         done_events.data(), eng->num_devices, buffers.data(),
+                         eng->ctx[0].reduce_staging, elements, COLLECTIVE_BF16);
 }
 
 /* LayerContext hook for sublayers whose parts live on different ranks (expert

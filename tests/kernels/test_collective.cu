@@ -10,10 +10,113 @@
 #include "layers.h"
 #include "test_utils.h"
 
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <string>
 
 using test::Bf16;
 using test::DeviceBuffer;
+
+namespace {
+
+/* Conversions and names for the element types the collective accepts. The
+ * reduction accumulates in FP32 and rounds once, so a buffer of any of these
+ * types must come back holding the exact elementwise sum of what was put in. */
+template <typename T> struct ElementKind;
+
+template <> struct ElementKind<float> {
+    static const char *name() { return "F32"; }
+    static CollectiveDtype dtype() { return COLLECTIVE_F32; }
+    static float to_float(float value) { return value; }
+    static float from_float(float value) { return value; }
+};
+
+template <> struct ElementKind<__half> {
+    static const char *name() { return "F16"; }
+    static CollectiveDtype dtype() { return COLLECTIVE_F16; }
+    static float to_float(__half value) { return __half2float(value); }
+    static __half from_float(float value) { return __float2half_rn(value); }
+};
+
+template <> struct ElementKind<__nv_bfloat16> {
+    static const char *name() { return "BF16"; }
+    static CollectiveDtype dtype() { return COLLECTIVE_BF16; }
+    static float to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
+    static __nv_bfloat16 from_float(float value) { return __float2bfloat16_rn(value); }
+};
+
+template <> struct ElementKind<__nv_fp8_e4m3> {
+    static const char *name() { return "FP8_E4M3"; }
+    static CollectiveDtype dtype() { return COLLECTIVE_FP8_E4M3; }
+    static float to_float(__nv_fp8_e4m3 value) { return (float)value; }
+    static __nv_fp8_e4m3 from_float(float value) { return __nv_fp8_e4m3(value); }
+};
+
+template <> struct ElementKind<__nv_fp8_e5m2> {
+    static const char *name() { return "FP8_E5M2"; }
+    static CollectiveDtype dtype() { return COLLECTIVE_FP8_E5M2; }
+    static float to_float(__nv_fp8_e5m2 value) { return (float)value; }
+    static __nv_fp8_e5m2 from_float(float value) { return __nv_fp8_e5m2(value); }
+};
+
+/* Report a plain boolean check in the same style as test::compare. */
+bool report(const char *name, bool ok) {
+    std::printf("%s: %s\n", name, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+/* Sum one buffer per rank for a single element type. Values stay inside what the
+ * narrowest type here represents exactly (1..8, sums 2..16), so the comparison
+ * is exact rather than tolerance-based. */
+template <typename T>
+bool typed_allreduce_case(const int devices[2], cudaStream_t streams[2], cudaEvent_t events[2],
+                          cudaEvent_t done[2], int elements) {
+    using Kind = ElementKind<T>;
+    std::vector<T> left((size_t)elements), right((size_t)elements), expected((size_t)elements);
+    for (int i = 0; i < elements; ++i) {
+        const float value = static_cast<float>(1 + (i % 8));
+        left[i] = Kind::from_float(value);
+        right[i] = Kind::from_float(2.0f * value);
+        expected[i] = Kind::from_float(3.0f * value);
+    }
+    /* Each buffer must live on its rank's device; DeviceBuffer allocates on
+     * whatever device is current when it is constructed. */
+    CUDA_CHECK(cudaSetDevice(devices[0]));
+    DeviceBuffer<T> a((size_t)elements);
+    DeviceBuffer<T> staging((size_t)elements);
+    CUDA_CHECK(cudaSetDevice(devices[1]));
+    DeviceBuffer<T> b((size_t)elements);
+    a.upload(left, streams[0]);
+    b.upload(right, streams[1]);
+
+    void *buffers[2] = {a.get(), b.get()};
+    const int status = allreduce_sum(devices, streams, events, done, 2, buffers,
+                                     staging.get(), (size_t)elements, Kind::dtype());
+    if (status != 0) {
+        std::fprintf(stderr, "%s allreduce failed: %s\n", Kind::name(),
+                     cudaGetErrorString((cudaError_t)status));
+        return false;
+    }
+    const std::vector<T> got_a = a.download(streams[0]);
+    const std::vector<T> got_b = b.download(streams[1]);
+    std::string name = std::string("allreduce with ") + Kind::name() + " buffers";
+    bool ok = true;
+    for (int i = 0; i < elements; ++i) {
+        if (Kind::to_float(got_a[i]) != Kind::to_float(expected[i]) ||
+            Kind::to_float(got_b[i]) != Kind::to_float(expected[i])) {
+            if (ok) {
+                std::fprintf(stderr, "%s[%d]: rank0 %.9g, rank1 %.9g, expected %.9g\n",
+                             name.c_str(), i, Kind::to_float(got_a[i]),
+                             Kind::to_float(got_b[i]), Kind::to_float(expected[i]));
+            }
+            ok = false;
+        }
+    }
+    std::printf("%s: %s (elements=%d, exact)\n", name.c_str(), ok ? "PASS" : "FAIL", elements);
+    return ok;
+}
+
+}  // namespace
 
 int main() {
     int device_count = 0;
@@ -74,18 +177,34 @@ int main() {
     }
     a.upload(left, s0);
     b.upload(right, s1);
-    __nv_bfloat16 *buffers[2] = {a.get(), b.get()};
+    void *buffers[2] = {a.get(), b.get()};
     cudaStream_t streams[2] = {s0, s1};
     cudaEvent_t events[2] = {e0, e1};
     cudaEvent_t done[2] = {d0, d1};
-    status = allreduce_sum_bf16((const int[]){0, 1}, streams, events, done, 2, buffers,
-                                staging.get(), elements);
+    const int devices[2] = {0, 1};
+    status = allreduce_sum(devices, streams, events, done, 2, buffers, staging.get(),
+                           elements, COLLECTIVE_BF16);
     if (status != 0) {
-        std::fprintf(stderr, "allreduce_sum_bf16 failed: %s\n", cudaGetErrorString((cudaError_t)status));
+        std::fprintf(stderr, "allreduce_sum failed: %s\n", cudaGetErrorString((cudaError_t)status));
         return EXIT_FAILURE;
     }
     ok &= test::compare("allreduce on device 0", a.download(s0), expected, 1e-3, 1e-3);
     ok &= test::compare("allreduce on device 1", b.download(s1), expected, 1e-3, 1e-3);
+
+    // --- 2b) The element type follows the buffer the caller passes: the same
+    //         reduction, once per element type the collective accepts.
+    ok &= typed_allreduce_case<float>(devices, streams, events, done, elements);
+    ok &= typed_allreduce_case<__half>(devices, streams, events, done, elements);
+    ok &= typed_allreduce_case<__nv_bfloat16>(devices, streams, events, done, elements);
+    ok &= typed_allreduce_case<__nv_fp8_e4m3>(devices, streams, events, done, elements);
+    ok &= typed_allreduce_case<__nv_fp8_e5m2>(devices, streams, events, done, elements);
+    ok &= report("element sizes follow the dtype tag",
+                 collective_element_bytes(COLLECTIVE_F32) == 4 &&
+                     collective_element_bytes(COLLECTIVE_F16) == 2 &&
+                     collective_element_bytes(COLLECTIVE_BF16) == 2 &&
+                     collective_element_bytes(COLLECTIVE_FP8_E4M3) == 1 &&
+                     collective_element_bytes(COLLECTIVE_FP8_E5M2) == 1 &&
+                     collective_element_bytes((CollectiveDtype)99) == 0);
 
     // --- 3) Back-to-back rounds with the leader reusing its buffer immediately.
     //        The transfers are issued with cudaMemcpyAsync (DeviceBuffer's
@@ -103,7 +222,7 @@ int main() {
         DeviceBuffer<Bf16> wide_b(wide);
         std::vector<Bf16> host_left(wide), host_right(wide), host_sum(wide), host_reuse(wide);
         std::vector<Bf16> got_left(wide), got_right(wide);
-        __nv_bfloat16 *wide_buffers[2] = {wide_a.get(), wide_b.get()};
+        void *wide_buffers[2] = {wide_a.get(), wide_b.get()};
 
         for (int round = 0; round < 8; ++round) {
             for (int i = 0; i < wide; ++i) {
@@ -119,8 +238,8 @@ int main() {
             CUDA_CHECK(cudaSetDevice(1));
             CUDA_CHECK(cudaMemcpyAsync(wide_b.get(), host_right.data(), wide_bytes,
                                        cudaMemcpyHostToDevice, s1));
-            status = allreduce_sum_bf16((const int[]){0, 1}, streams, events, done, 2,
-                                        wide_buffers, wide_staging.get(), wide);
+            status = allreduce_sum(devices, streams, events, done, 2, wide_buffers,
+                                   wide_staging.get(), wide, COLLECTIVE_BF16);
             if (status != 0) {
                 std::fprintf(stderr, "round %d: allreduce failed: %s\n", round,
                              cudaGetErrorString((cudaError_t)status));

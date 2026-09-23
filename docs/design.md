@@ -248,7 +248,7 @@ Qwen3-4B and Qwen3-30B-A3B (every greedy token matching, logit rms 0.1-0.4, the
 spread coming from BF16 reassociation: the reference accumulates expert outputs
 in BF16, this engine accumulates in FP32 and rounds once), Qwen3-Next (16/16
 greedy tokens against a synthetic checkpoint) and DeepSeek-V2-Lite MLA (16/16
-greedy tokens at 0.04-0.20 logit rms, with the engine-internal chunking check
+greedy tokens at 0.04-0.57 logit rms, with the engine-internal chunking check
 agreeing to 0.07 and a matching top-1). All of these were recorded on 2x A40
 (sm_86); runtime coverage must be listed separately for each target.
 

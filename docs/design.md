@@ -239,14 +239,18 @@ one kernel:
 | attention output gate | yes | no | no |
 | RMSNorm | Gemma (weight + 1) | plain | plain |
 | RoPE | partial (64 of 256) | full (128 of 128) | full (128 of 128) |
-| FFN | dense | dense | routed experts + `mlp.gate` router |
+| FFN | dense | Qwen3: dense; Mixtral: routed experts | routed experts + `mlp.gate` router |
 | token embeddings | untied | tied (Qwen3-4B) | untied |
 
-Two families are verified end to end against independent PyTorch references
-(Qwen3.8-27B bitwise against its own baseline plus a 0.02-0.04 logit rms;
-Qwen3-4B and Qwen3-30B-A3B with every greedy token matching and a logit rms of
-0.1-0.4, the spread coming from BF16 reassociation: the reference accumulates
-expert outputs in BF16, this engine accumulates in FP32 and rounds once).
+Recorded end-to-end comparisons against independent PyTorch references include
+Qwen3.8-27B (bitwise against its own baseline plus a 0.02-0.04 logit rms),
+Qwen3-4B and Qwen3-30B-A3B (every greedy token matching, logit rms 0.1-0.4, the
+spread coming from BF16 reassociation: the reference accumulates expert outputs
+in BF16, this engine accumulates in FP32 and rounds once), Qwen3-Next (16/16
+greedy tokens against a synthetic checkpoint) and DeepSeek-V2-Lite MLA (16/16
+greedy tokens at 0.04-0.20 logit rms, with the engine-internal chunking check
+agreeing to 0.07 and a matching top-1). All of these were recorded on 2x A40
+(sm_86); runtime coverage must be listed separately for each target.
 
 ### Prefill batching
 

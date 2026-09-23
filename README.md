@@ -147,7 +147,9 @@ equal highest BF16 reference logits are treated as ties.
   cross-device all-reduce on 2 GPUs, skipped with fewer devices) plus the
   operator-level GPU regressions:
   `test_attention` (causal GQA, KV write, output gate), `test_gdn` (FLA recurrent
-  decode, causal-conv1d, gated norm), `test_library_ops` (FLA chunk pipeline
+  decode, causal-conv1d, gated norm), `test_moe` (router, permute, expert GEMMs,
+  combine, EP shards), `test_mla` (MLA chunking self-consistency and the
+  attention block-size boundary), `test_library_ops` (FLA chunk pipeline
   T=1..128 vs PyTorch recurrent on both GPUs, GemmaRMSNorm, partial RoPE).
 - `tests/test_engine.py` — full 27B vs independently generated reference logits
   (20/20 argmax), state reset, invalid-input/capacity checks, chunk-split
@@ -208,7 +210,7 @@ migrated from handwritten CUDA to FlashInfer + FLA + causal-conv1d.
 | 6 | Multi-GPU engine, batched chunked prefill (≤128 tokens/chunk) | ✅ 2× A40 |
 | 7 | Tokenizer + CLI + greedy generation + streaming | ✅ coherent text |
 | 8 | End-to-end validation (27B logits, 433-token long sequence) | ✅ 20/20 argmax |
-| 9 | Descriptor-driven families (dense + MoE + Qwen3-Next), multi-arch SASS/PTX, placement policies | ✅ verified on sm_86 (A40); sm_89 operator suite on L20 |
+| 9 | Descriptor-driven families (dense + MoE + Qwen3-Next + DeepSeek-V2 MLA), multi-arch SASS/PTX, placement policies (layer split, TP, EP) | ✅ verified on sm_86 (A40); sm_89 operator suite on L20 |
 
 ## Design Decisions
 

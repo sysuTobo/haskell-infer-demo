@@ -8,9 +8,12 @@ Qwen3.8-27B (hybrid Full-Attention + GatedDeltaNet, 64 layers, ~50 GiB BF16).
 
 ## Constraints
 
-- Single request at a time (no batching)
-- Greedy decoding only (no sampling)
-- 2–8 GPUs, layer-wise partitioning (verified on 2× A40 46 GB, sm_86)
+These describe the current inference engine, not the proposed trainer in
+[plan-numeric-contract.md](plan-numeric-contract.md).
+
+- Single request at a time (chunked prefill, no multi-request batching)
+- Greedy decoding only; stochastic rollout sampling is planned, not implemented
+- 1–8 GPUs; layer-wise placement and separate TP/EP policies (verified on 2× A40 46 GB, sm_86); combined TP+EP is rejected
 - Pure text (no vision/multimodal)
 - CLI interface with streaming output
 - Correctness over performance
@@ -83,12 +86,14 @@ JSON document, the model descriptor, produced by a family adapter in Haskell
 - `role_templates`: the weight-name template for each role (`%d` = layer,
   `%e` = expert), which replaces the string-building loop that used to live in C.
 
-The C side (`csrc/model_desc.c`) parses it strictly: unknown keys, missing keys,
-wrong types and inconsistent dimensions are hard errors. Roles and their expected
-tensor shapes are compiled into C; which tensors a family has is data. Committed
-snapshots live in `descriptors/`, and a test re-derives them from the model
-directory so a transformers upgrade shows up as a failing test rather than wrong
-logits after a ten-minute load.
+The C side (`csrc/model_desc.c`) parses it strictly: unknown keys, missing required
+keys, wrong types and inconsistent dimensions are hard errors. Roles and their
+expected tensor shapes are compiled into C; which tensors a family has is data.
+Committed snapshots live in `descriptors/`. The model-directory round-trip test
+in `tests/Spec.hs` currently re-derives only `qwen38-27b.json`, conditional on
+`INFER_MODEL_DIR`; it is not an all-family snapshot gate. Other adapters have
+structural tests, and each new training target needs an explicit snapshot and
+runtime compatibility check.
 
 The descriptor is deliberately *not* a C struct: it spans variable-length
 per-layer data, and a struct had to be mirrored field-for-field in Haskell, C and
@@ -124,18 +129,19 @@ KV cache and GDN state are device-local — no cross-device state sharing.
 descriptor marks as shardable (the per-role rules a family adapter derives):
 attention q/k/v by head blocks (`out_heads`), o_proj and the MLP down projection
 by input columns (`in_dim`), gate/up by output rows (`out_dim`). Roles without a
-rule — norms, embeddings, GDN, MoE — stay whole: GDN keeps the head counts its
-AOT cubins were compiled with, and MoE keeps complete experts until expert
-parallelism lands. Every rank runs the full forward pass on replicated
+TP rule — norms, embeddings, GDN — stay whole: GDN keeps the head counts its AOT
+cubins were compiled with. MoE layers under TP are rejected and directed to the
+existing EP policy. Every rank runs the full forward pass on replicated
 activations and a sublayer whose weights were split all-reduces its partial
 output (leader reduce + broadcast, `collective.cu`) before the residual add, so
 the residual stream stays identical across ranks.
 
 The TP logits are *not* bit-identical to the layer-wise split: split-K GEMM sums
 and the BF16 all-reduce reorder additions. The gate for the equivalence test
-(`tests/test_tp.py`) is identical greedy tokens plus logit RMS ≤ 0.05, well
-inside the engine-vs-PyTorch RMS (0.02–0.04 for this family); the layer-wise
-path itself stays bit-identical to the historical baseline.
+(`tests/test_tp.py`) is identical greedy tokens plus logit RMS ≤ 0.05, comparable
+to the engine-vs-PyTorch RMS (0.02–0.04 for this family), not stricter than it.
+The historical layer-wise refactor gate is separate from a still-needed test of
+bitwise invariance across different layer-wise placements.
 
 ### Expert-parallel placement
 
@@ -174,35 +180,45 @@ on Qwen3-30B-A3B (see the README gate list).
 
 ### GDN (GatedDeltaNet) layer
 
-The most complex component. Per-layer forward:
+The most complex component. Per-layer forward for this family's separate
+projection layout (the Qwen3-Next adapter also supports fused projections):
 
 ```
-x → in_proj_qkvz [5120→16384] → split q(2048), k(2048), v(6144), z(6144)
-x → in_proj_ba   [5120→96]    → split b(48), a(48)
+x → in_proj_qkv [5120→10240] → q(2048), k(2048), v(6144)
+x → in_proj_z   [5120→6144]  → z
+x → in_proj_b / in_proj_a   → b(48), a(48)
 
-[q,k,v] → causal_conv1d(k=4, state) → conv_out
-conv_out → l2norm + gating(b,a) → prepared
+[q,k,v] → causal_conv1d(k=4, state) → BF16 → SiLU → conv_out
+conv_out → Q/K L2 normalization + head expansion + gating(b,a) → prepared
 
 prepared → gated_delta_rule(q,k,v, ssm_state) → delta_out
-           (decode: recurrent; prefill: per-token recurrent)
+           (tokens == 1: recurrent; tokens > 1: chunkwise pipeline)
 
 delta_out → RMSNormGated(z) → normed
 normed → out_proj [6144→5120] → layer_output
 ```
 
-**Delta rule (per v-head h, k-head kh = h/3):**
+**Delta rule (per v-head h, k-head kh = floor(h/3)):**
 ```
-delta = v[h] - k[kh] @ S[h]
-S[h] = alpha[h] * S[h] + beta[h] * outer(k[kh], delta)
-o[h] = q[kh] @ S[h]
+D = alpha[h] * S[h]
+delta = v[h] - k[kh] @ D
+S[h] = D + outer(k[kh], beta[h] * delta)
+o[h] = (q[kh] / sqrt(128)) @ S[h]
 ```
 
-State S is [48, 128, 128] F32 = 3 MiB per layer, 147 MiB total.
+Here q/k are the L2-normalized vectors; `alpha = exp(g)` and
+`g = -exp(A_log) * softplus(a + dt_bias)`. The implementation rounds sigmoid(b)
+through BF16 before using it as FP32 beta. State S is [48, 128, 128] FP32 = 3 MiB
+per layer, 144 MiB across 48 layers. `tests/kernels/test_gdn.cu::delta_reference`
+records the decay-before-prediction and Q-scale convention. The equations specify
+the mathematical function; kernel reductions and dtype boundaries additionally
+specify its numerical execution.
 
-**First version simplification:** prefill processes tokens one at a time
-(same recurrent kernel as decode). This is O(n) kernel launches for n prompt
-tokens but guarantees correctness and code reuse. Chunked prefill is a
-future optimization.
+Chunked prefill already exists. `max_chunk` bounds each engine call internally,
+while the GDN pipeline groups work in 64-token chunks. A one-token tail takes the
+recurrent path. Different decompositions are not assumed bitwise equivalent;
+the numerical-contract plan separates state-correctness tests from invariance
+claims. Any new CPR forward must be paired with a revalidated backward.
 
 ### Mixture-of-experts feed-forward
 
@@ -227,30 +243,64 @@ The expert's per-slice layout is `[gate; up]` because the activation kernel
 consumes that adjacency, which in turn requires the expert width to be a multiple
 of 8; unsupported widths are rejected with an explicit error.
 
+### MLA (multi-head latent attention) layer
+
+A layer whose mixer is `mla` follows DeepSeek-V2. The KV cache holds the
+compressed latent plus the shared rope key — `kv_lora_rank + qk_rope_head_dim`
+values per token, 1152 bytes for V2-Lite against roughly 8 KiB for the
+equivalent GQA cache, which is the point of the design. `kv_b_proj` decompresses
+latent to per-head `k_nope`/`v` for the whole cached range on every step (the
+naive path; absorbing `kv_b` into `q` and `o` is the optimization that avoids
+it). Scores scale by `1 / sqrt(qk_nope_head_dim + qk_rope_head_dim)`, which is
+`1 / sqrt(192)` for V2-Lite.
+
+Three details are load-bearing, and each was settled against the oracle rather
+than from the reference source:
+
+- The latent is normalized by an ordinary RMSNorm over the first `kv_lora_rank`
+  channels of a wider row. The library norm kernel assumes both operands are
+  contiguous `[rows, cols]` blocks, so the slice is staged through a repack block
+  (copy out, normalize, copy back); normalizing in place corrupts every row after
+  the first.
+- RoPE is interleaved, not split-half: the rope slice reads as complex pairs
+  `(x[2i], x[2i+1])` whose frequencies are built from `dim = qk_rope_head_dim`,
+  applied to the query's rope slice and to the shared key alike.
+- The attention kernel is one block per (query token, head) with the scores in
+  shared memory and an in-block tree reduction. That reduction is exact only for
+  power-of-two block sizes, so the launch rounds up to the next power of two with
+  idle lanes carrying identity values. Rounding to multiples of 32 instead
+  silently dropped lane groups from the softmax denominator at 96/160/192
+  threads — a defect that only fires past 64 cached tokens and is therefore
+  invisible to short-prompt gates; `test_mla` covers it by re-cutting the same
+  token sequence so the two runs land in different block-size bands.
+
 ### What differs between families
 
 The layer kinds share one path, so a new family is descriptor data plus, at most,
 one kernel:
 
-| | Qwen3.8-27B | Qwen3 / Mixtral | Qwen3-MoE |
-|---|---|---|---|
-| mixer | GDN + full attention | full attention | full attention |
-| q/k norm | yes | yes (Mixtral: no) | yes |
-| attention output gate | yes | no | no |
-| RMSNorm | Gemma (weight + 1) | plain | plain |
-| RoPE | partial (64 of 256) | full (128 of 128) | full (128 of 128) |
-| FFN | dense | Qwen3: dense; Mixtral: routed experts | routed experts + `mlp.gate` router |
-| token embeddings | untied | tied (Qwen3-4B) | untied |
+| | Qwen3.8-27B | Qwen3 / Mixtral | Qwen3-MoE | DeepSeek-V2-Lite |
+|---|---|---|---|---|
+| mixer | GDN + full attention | full attention | full attention | MLA |
+| q/k norm | yes | yes (Mixtral: no) | yes | no (the latent norm plays that role) |
+| attention output gate | yes | no | no | no |
+| RMSNorm | Gemma (weight + 1) | plain | plain | plain |
+| RoPE | partial (64 of 256) | full (128 of 128) | full (128 of 128) | decoupled partial (64 of 192) |
+| FFN | dense | Qwen3: dense; Mixtral: routed experts | routed experts + `mlp.gate` router | layer 0 dense; elsewhere routed experts plus one shared MLP |
+| token embeddings | untied | tied (Qwen3-4B) | untied | untied |
 
-Recorded end-to-end comparisons against independent PyTorch references include
-Qwen3.8-27B (bitwise against its own baseline plus a 0.02-0.04 logit rms),
-Qwen3-4B and Qwen3-30B-A3B (every greedy token matching, logit rms 0.1-0.4, the
-spread coming from BF16 reassociation: the reference accumulates expert outputs
-in BF16, this engine accumulates in FP32 and rounds once), Qwen3-Next (16/16
-greedy tokens against a synthetic checkpoint) and DeepSeek-V2-Lite MLA (16/16
-greedy tokens at 0.04-0.57 logit rms, with the engine-internal chunking check
-agreeing to 0.07 and a matching top-1). All of these were recorded on 2x A40
-(sm_86); runtime coverage must be listed separately for each target.
+Recorded end-to-end comparisons include Qwen3.8-27B (bitwise against its own
+baseline and 0.02–0.04 logit RMS against an independent PyTorch reference), plus
+Qwen3-4B and Qwen3-30B-A3B (matching greedy tokens, logit RMS 0.1–0.4). These
+numbers are not universal gates. One known MoE difference is expert-output
+accumulation in BF16 in the reference versus FP32 followed by one rounding in the
+engine; it does not explain dense-model differences by itself. Additional
+implemented families include Qwen3-Next (verified on a synthetic checkpoint:
+16/16 greedy tokens) and DeepSeek-V2 MLA (V2-Lite verified end-to-end against
+transformers: 16/16 greedy tokens at 0.04–0.57 logit RMS, and the engine-internal
+chunking check agrees to 0.07 with matching top-1). All of these numbers come
+from the same 2× A40 sm_86 box; runtime coverage and training support must be
+listed separately for each target.
 
 ### Prefill batching
 
@@ -262,12 +312,13 @@ more than 128 tokens per call regardless of the descriptor.
 
 ### Layer kinds
 
-A layer is `norm -> mixer -> residual -> norm -> ffn -> residual`. The mixer
-(`full_attn`, `gdn`, later `mla`) and the feed-forward kind (`dense`, later `moe`)
-come from the descriptor and select a row in the dispatch tables in
+A layer is `norm -> mixer -> residual -> norm -> ffn -> residual`. The implemented
+mixers (`full_attn`, `gdn`, `mla`) and feed-forward kinds (`dense`, `moe`) come
+from the descriptor and select a row in the dispatch tables in
 `csrc/layer_dispatch.cu`. The engine's layer loop calls `forward_layer` and knows
 nothing about kinds, so a new kind is a descriptor field plus a kernel file plus
-a table row -- not a change to the loop.
+a table row -- not a change to the loop. Inference support does not imply that a
+kind has a backward implementation or belongs to the initial trainer scope.
 
 Buffers are registered while loading (`LayerWeights::owned` for allocation,
 `reset_zero` for per-sequence state), which makes `engine_destroy` and
@@ -290,59 +341,74 @@ With the template scheme, the Qwen3.5 layout (`model.language_model.` prefix,
 `lm_head` unprefixed, `linear_attn.*` for GDN layers) is data in the descriptor
 rather than code in the engine.
 
-Derived weights computed on-device after loading:
-- `weight_p1 = float(norm_weight) + 1.0` (GemmaRMSNorm)
-- the GDN gated-norm weight cast to F32 (raw weight: this variant does *not* add 1)
-- RoPE cos/sin tables (generated from theta and max_position)
+The GDN gated-norm weight has an FP32 derived copy created after loading; it uses
+the raw weight, without `+1`. Current GemmaRMSNorm passes the raw BF16 weight to
+FlashInfer, which applies the Gemma convention, and RoPE uses FlashInfer's
+position-ID kernel rather than engine-owned precomputed cos/sin tables.
+
+These are inference-only weights today. A trainer must establish parameter
+identity, sum gradients for tied embedding/LM-head roles (currently loaded into
+separate allocations), and refresh derived copies after every update before a
+new rollout version becomes visible. See the training-runtime stage in the plan.
 
 ### Memory budget (2× A40, 4096 context)
 
-Per device:
-- Weights: ~25 GiB (half of 50 GiB)
-- KV cache: 16 attn layers × 4096 tokens × 4 kv_heads × 256 dim × 2 (K+V) × 2 bytes = ~256 MiB
-- GDN state: 48 layers × (61 KB conv + 3 MiB SSM) = ~147 MiB
-- Activations + scratch: ~100 MiB
-- **Total: ~25.5 GiB** → fits in 46 GB with headroom
+Approximate per-device budget for a balanced 32-layer split:
+- Weights: roughly 25 GiB; embeddings/LM head can make the split uneven
+- KV cache: 8 local attention layers × 4096 × 4 kv_heads × 256 dim × 2 (K+V) × 2 bytes = 128 MiB
+- GDN state: 24 local layers × (60 KiB conv + 3 MiB SSM) ≈ 73.4 MiB
+- Activations, GDN intermediates, logits and other scratch: shape-dependent; measure allocations for the selected `max_chunk`
+
+The whole model, not each device, has 16 attention and 48 GDN layers. This
+inference configuration fits the two-card target; it is not a training budget.
+Optimizer states, saved activations and concurrent rollout snapshots require a
+separate per-device, per-phase calculation in `plan-numeric-contract.md`.
 
 ## Testing strategy
 
 | Level | Test | Pass criteria |
 |-------|------|---------------|
-| Descriptor | `ctest -R test_model_desc` (CPU) + Haskell spec | strict parse, reject bad/missing keys, adapter reproduces the snapshot |
-| Kernel | `ctest`: test_attention / test_gdn / test_library_ops | vs CPU/PyTorch reference, BF16 tolerances |
-| Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set, logit rms ≤ 0.1 |
+| Descriptor | `ctest -R test_model_desc` (CPU) + Haskell spec | strict parsing/structural checks; conditional Qwen3.8 model-directory snapshot round-trip |
+| Kernel | `ctest`: test_attention, test_gdn, test_collective, test_moe, test_norm, test_rope, test_mla, test_library_ops | vs CPU/PyTorch reference, BF16 tolerances; test_mla additionally re-cuts one sequence to catch block-shape-dependent defects |
+| Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set; configured `--rms-tolerance` (default 0.1, family-specific overrides) |
 | Chunking | same prompt, different prefill splits | top-1 equal, rms ≤ 5 (state-loss guard) |
-| Refactor | `tests/capture_logits.py --compare` | bitwise identical (same build, same prompt) |
+| Refactor | `tests/capture_logits.py --compare` | numeric arrays identical; caller must currently establish same-build/input provenance because metadata is skipped |
 | Long sequence | `tests/test_longseq.py` | chunk-split self-consistency + no repetition collapse |
 
-Note: we do NOT require bit-exact match with PyTorch. BF16 operator reassociation
-and cuBLAS algorithm selection move individual logits by ~1e-2, which can flip a
-near-tie argmax; the reference's tied maxima are therefore accepted as a set.
+We do not require bit-exact match with PyTorch. BF16 reassociation and algorithm
+selection can move logits; exact reference ties are accepted as a set, while a
+near-tie top-1 disagreement is not silently accepted. Different prefill splits
+can also change GDN grouping and attention execution; whole-model RMS alone does
+not attribute the difference to cuBLAS. Training gradient checks, cross-case
+bitwise admission and provenance enforcement are planned gates, not current
+coverage; see `plan-numeric-contract.md`.
 
 ## What this demo is NOT
 
 - Not a production inference engine
-- Not optimized (naive attention, per-token prefill, no CUDA graphs)
+- Not throughput-optimized (FlashInfer attention and chunked prefill exist; CUDA graphs and multi-request scheduling do not)
 - Not quantized (BF16 only)
-- Not batched (single request)
+- Not multi-request batched
 - Not multimodal (text only)
 - Not a Haskell GPU compute framework (Haskell orchestrates, CUDA computes)
+- Not yet a trainer or an asynchronous rollout service
 
 ## Future work
 
-1. More model families (MoE, MLA) through new layer kinds in the descriptor
-2. More GPU targets (sm_89/sm_90a) via multi-arch SASS plus runtime cubin choice
-3. Expert parallel placement (shard whole experts across ranks) on top of the two
-   policies that exist today: layer-wise partitioning and replicated tensor
-   parallel. Note the numeric contract: layer-wise placement does not split
-   intra-layer reductions, while tensor parallel splits the contraction dimension
-   across ranks (measured equivalent within the documented RMS gate) and expert
-   parallel changes how expert outputs are combined.
-4. CUDA graph capture for decode, vocab-parallel argmax
-5. Sampling (temperature, top-p), HTTP API, streaming SSE
-6. A training framework (SFT, PPO, GRPO, DAPO, on-policy distillation) on small
-   models, orchestrated in Haskell over the same region library as inference, and
-   the numerical execution contract that makes train/inference bitwise agreement
-   structural rather than disciplinary — see `plan-numeric-contract.md` for the
-   staged plan, the audit of what the descriptor already pins versus what is
-   still implicit, and what does not exist yet
+1. Extend model coverage and per-family snapshot/runtime gates; MoE and MLA
+   inference already exist, but their backward paths do not.
+2. Runtime validation on sm_90a hardware; multi-arch artifacts and sm_89 operator
+   validation already exist.
+3. Combined TP+EP with subgroup collectives, if justified. Separate TP and EP
+   already exist and alter reduction order; initial training will instead use
+   single-device or layer-wise placement with explicitly scoped invariance tests.
+4. CUDA graph capture for decode, vocab-parallel argmax.
+5. Sampling (temperature, top-p), HTTP API, streaming SSE.
+6. Haskell-orchestrated SFT, OPD, GRPO, DAPO, GSPO and PPO over a shared region
+   library. This first requires trainable parameter ownership, saved-activation
+   lifetimes, backward kernels and independently checked loss/optimizer regions.
+7. Bounded-staleness asynchronous RL, after a synchronous baseline. Sharing an
+   implementation is not sharing mutable weights: concurrent actors need stable
+   versions, cache ownership, recorded behavior logprobs and a validated
+   off-policy objective. See [plan-numeric-contract.md](plan-numeric-contract.md)
+   for the contract, GSPO objective, resource trade-offs and phased proposal.

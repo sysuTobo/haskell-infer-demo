@@ -312,6 +312,26 @@ static void test_identity_matrix(void) {
     CHECK(strcmp(base.deployment, variant.deployment) == 0, "max_chunk moved deployment_id");
     g_desc.max_chunk = 64;
 
+    /* Numerical change: the sampler's transform. The concrete temperature and seed
+     * are per-request replay data, but which transform and arithmetic ran is
+     * numerical policy, so a capture taken under a different one must not compare
+     * equal. */
+    {
+        const struct ManifestSampling *saved = g_in.sampling;
+        struct ManifestSampling edited;
+        memcpy(&edited, manifest_default_sampling(), sizeof(edited));
+        edited.transform = "categorical_softmax_cdf";
+        g_in.sampling = &edited;
+        format_manifest(&g_in, variant_text, sizeof(variant_text));
+        read_identities(variant_text, &variant);
+        CHECK(strcmp(base.semantic, variant.semantic) == 0, "a sampler change moved semantic_id");
+        CHECK(strcmp(base.numerical, variant.numerical) != 0,
+              "a sampler change did not move numerical_policy_id");
+        CHECK(strcmp(base.deployment, variant.deployment) == 0,
+              "a sampler change moved deployment_id");
+        g_in.sampling = saved;
+    }
+
     /* Numerical change: the region binding table. */
     {
         int count = 0;
@@ -427,6 +447,13 @@ static int apply_variant(const char *name) {
     if (strcmp(name, "semantic") == 0) { g_desc.hidden_size = 320; return 0; }
     if (strcmp(name, "projected_constant") == 0) { g_desc.rms_eps = 1e-05; return 0; }
     if (strcmp(name, "numerical") == 0) { g_desc.max_chunk = 32; return 0; }
+    if (strcmp(name, "sampling") == 0) {
+        static struct ManifestSampling edited;
+        memcpy(&edited, manifest_default_sampling(), sizeof(edited));
+        edited.transform = "categorical_softmax_cdf";
+        g_in.sampling = &edited;
+        return 0;
+    }
     if (strcmp(name, "regions") == 0) return 1;   /* needs the copied registry */
     if (strcmp(name, "deployment") == 0) {
         g_device_ordinals[0] = 4;

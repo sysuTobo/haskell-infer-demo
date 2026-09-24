@@ -18,8 +18,8 @@ otherwise. No GPU result here is implied by a document edit alone.
 |---|---|
 | `cargo test --locked --offline` | 11/11 |
 | `ctest --test-dir csrc/build-libs` | 13/13 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_library_ops` |
-| `cabal test all --enable-tests` | `infer-tests` 64/64, `infer-generation-tests` 15/15 |
-| `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12131-byte canonical document carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, and every digest re-derived independently by `tests/manifest_check.py` |
+| `cabal test all --enable-tests` | `infer-tests` 66/66, `infer-generation-tests` 15/15 |
+| `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12216-byte canonical document carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, and every digest re-derived independently by `tests/manifest_check.py` |
 | Two independent 27B captures, strict comparison | bitwise identical (`max_abs == 0`) and verdict `admitted` |
 | Pre-refactor golden vs a fresh 27B capture | bitwise identical (`max_abs == 0`) with verdict `legacy/unverified` (exit 2) — the older capture's numeric arrays are compared, but nothing about its identity is invented |
 | Qwen3.8-27B golden capture | bitwise identical to the pre-refactor baseline (`max_abs == 0`) |
@@ -28,9 +28,10 @@ otherwise. No GPU result here is implied by a document edit alone.
 | `tests/test_tp.py --devices 0,1` (TP2) | identical greedy tokens, per-step logit RMS ≤ 0.05 |
 
 The manifest rows ran on the real 27B with `semantic_id`
-`890c5472…fabde`, `numerical_policy_id` `25245738…c9592`, `deployment_id`
+`890c5472…fabde`, `numerical_policy_id` `b0da2057…d1c551`, `deployment_id`
 `56f6e4aa…d6f4d` and `parameter_manifest_sha256` `4cb768d4…bbcc` over 1199
-tensors (device ordinals 0,1; 32 layers each; layer-split placement).
+tensors (device ordinals 0,1; 32 layers each; layer-split placement), from a build
+whose own revision the manifest reports as `1f23880`.
 
 ## Supported model families
 
@@ -75,11 +76,11 @@ under:
 - `engine_manifest` / `haskell-infer-demo manifest` report `semantic_id` (dimensions,
   layer/role semantics, tied-role relations, the mathematical conventions),
   `numerical_policy_id` (the region/case → implementation binding table with its own
-  digest, the effective constants, dtype/rounding and reduction choices — the GEMM
-  algorithm policy is recorded as *unpinned*, not as a default),
-  `deployment_id` (placement, devices, the per-layer owner, the shard plan) and the
-  immutable parameter identity (a canonical tensor index over 1199 tensors; the raw
-  content hash is `null` unless a caller pays for it).
+  digest, the effective constants, dtype/rounding and reduction choices, and the
+  sampler's transform — the GEMM algorithm policy is recorded as *unpinned*, not as
+  a default), `deployment_id` (placement, devices, the per-layer owner, the shard
+  plan) and the immutable parameter identity (a canonical tensor index over 1199
+  tensors; the raw content hash is `null` unless a caller pays for it).
 - Build provenance comes from a header the build step generates over its own
   artefacts (git revision, CUDA toolkit and target lists, the Triton/FLA versions the
   AOT generator asserted, hashes of the generated kernels and of the FlashInfer
@@ -104,10 +105,13 @@ under:
   GPU, `test_manifest_hashes` re-derives every digest with `hashlib`, and the Haskell
   side parses the same documents.
 
-Two contract violations were caught by the engine's own document rather than by the
-unit tests: a missing top-level `manifest_version` (which made the manifest
-unparseable) and a region flag emitted as an integer where the contract fixes a
-boolean. Both now have CPU gates, including a type check in the Python verifier.
+Two contract violations and one classification gap were caught by the engine's own
+document and by re-reading the plan, rather than by the unit tests: a missing
+top-level `manifest_version` (which made the manifest unparseable), a region flag
+emitted as an integer where the contract fixes a boolean, and the sampler's
+transform/arithmetic not being part of the numerical policy. All three now have
+gates, including a type check in the Python verifier and a variant in the identity
+matrix that requires a sampler change to move `numerical_policy_id`.
 
 **Resource safety and regression gates** (finished and verified 2026-09-23;
 commits `6d6e306`, `6417c72`, `fe2c2d4`). This closed the issues raised in the

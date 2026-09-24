@@ -25,6 +25,7 @@ MATRIX = {
     "projected_constant": {"semantic_id", "numerical_policy_id"},
     "numerical": {"numerical_policy_id"},
     "regions": {"numerical_policy_id"},
+    "sampling": {"numerical_policy_id"},
     "deployment": {"deployment_id"},
     "provenance": set(),
     "weights": set(),

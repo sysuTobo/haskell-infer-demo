@@ -191,6 +191,19 @@ manifestSpec = describe "Manifest" $ do
       compareFixture StrictAdmission False changed changed
         `shouldSatisfy` isRejectedWithPath "sampling.mode"
 
+    it "rejects a sampler-policy change, which is numerical policy and not request data" $ do
+      let changed = withField ["sampling", "transform"] (String "categorical_softmax_cdf")
+      compareFixture StrictAdmission False changed fixture
+        `shouldSatisfy` isRejectedWithPath "sampling.transform"
+
+    it "rejects two content hashes that disagree but not one that is missing" $ do
+      let hashed = withField ["weights", "content_sha256"] (String "content-1")
+          rehashed = withField ["weights", "content_sha256"] (String "content-2")
+      compareFixture StrictAdmission False hashed rehashed
+        `shouldSatisfy` isRejectedWithPath "weights.content_sha256"
+      -- The fixture has no content hash: "not hashed" must not read as "different".
+      compareFixture StrictAdmission False hashed fixture `shouldBe` Admitted
+
   describe "deployment scope" $ do
     it "rejects a placement-only change when no scope is declared" $ do
       let changed = withField ["deployment", "deployment_id"] (String "deployment-2")

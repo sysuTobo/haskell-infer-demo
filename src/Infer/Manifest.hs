@@ -462,7 +462,21 @@ compareManifests mode deploymentScoped left right
       , "numerical_policy.numerical_policy_id"
       , "weights.parameter_manifest_sha256"
       ]
-    identityDiffs = [ diff | diff <- diffs, fdPath diff `elem` identityPaths ]
+    identityDiffs =
+      [ diff | diff <- diffs
+             , fdPath diff `elem` identityPaths
+               -- The sampler's transform and arithmetic are numerical-policy
+               -- fields, so a difference there is identity-class even when a
+               -- document's blocks were not re-hashed consistently.
+               || "sampling." `T.isPrefixOf` fdPath diff ]
+      ++ contentMismatch
+    -- Two content hashes that disagree are two weight contents. One side having no
+    -- content hash is *not* a mismatch: "not hashed" is not "different".
+    contentMismatch = case (wrContentSha256 (mWeights left), wrContentSha256 (mWeights right)) of
+      (Just leftHash, Just rightHash)
+        | leftHash /= rightHash ->
+            [ FieldDiff "weights.content_sha256" (Just leftHash) (Just rightHash) ]
+      _ -> []
     scopedDiffs =
       [ diff | diff <- diffs
              , "deployment." `T.isPrefixOf` fdPath diff

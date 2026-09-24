@@ -361,7 +361,7 @@ static void emit_semantic(struct MjBuf *b, const struct ModelDesc *d) {
 
 /* numerical_policy: how the semantics are realized. */
 static void emit_numerical(struct MjBuf *b, const struct ManifestInputs *in,
-                           const char *regions_sha256) {
+                           const char *regions_sha256, const char *sampling_sha256) {
     const struct ModelDesc *d = in->desc;
     const int has_gdn = desc_has_layer(d, 0, ENGINE_MIXER_GDN);
     const int has_mla = desc_has_layer(d, 0, ENGINE_MIXER_MLA);
@@ -396,6 +396,10 @@ static void emit_numerical(struct MjBuf *b, const struct ManifestInputs *in,
               strcmp(d->norm_style, "gemma") == 0 ? "flashinfer_gemma_rmsnorm"
                                                  : "flashinfer_rmsnorm");
     mj_kv_str(b, &first, "regions_sha256", manifest_or_unknown(regions_sha256));
+    /* The sampler's transform and arithmetic are numerical-policy fields (the
+     * concrete temperature and seed of one request are replay data and live in the
+     * capture, so changing only them moves nothing here). */
+    mj_kv_str(b, &first, "sampling_sha256", manifest_or_unknown(sampling_sha256));
     mj_put(b, "}");
 }
 
@@ -553,12 +557,15 @@ int manifest_format(const struct ManifestInputs *in, char *buf, int buf_len) {
     char *numerical = (char *)malloc(MJ_BLOCK_MAX);
     char *deployment = (char *)malloc(MJ_BLOCK_MAX);
     char *region_text = (char *)malloc(MJ_BLOCK_MAX);
+    char *sampling_text = (char *)malloc(MJ_BLOCK_MAX);
     char err[256];
-    if (semantic == NULL || numerical == NULL || deployment == NULL || region_text == NULL) {
+    if (semantic == NULL || numerical == NULL || deployment == NULL || region_text == NULL ||
+        sampling_text == NULL) {
         free(semantic);
         free(numerical);
         free(deployment);
         free(region_text);
+        free(sampling_text);
         return -1;
     }
 
@@ -579,6 +586,15 @@ int manifest_format(const struct ManifestInputs *in, char *buf, int buf_len) {
     if (finish_block(&b, "regions", err, sizeof(err)) != 0) goto done;
     sha256_hex(region_text, (size_t)b.used, regions_sha256);
 
+    /* The sampling policy block is built next: its digest enters the numerical
+     * policy, so a change of sampler arithmetic is a different numerical policy
+     * rather than a difference a comparison could overlook. */
+    manifest_hex_t sampling_sha256;
+    mj_init(&b, sampling_text, MJ_BLOCK_MAX);
+    emit_sampling(&b, in->sampling);
+    if (finish_block(&b, "sampling", err, sizeof(err)) != 0) goto done;
+    sha256_hex(sampling_text, (size_t)b.used, sampling_sha256);
+
     manifest_hex_t semantic_id, numerical_id, deployment_id;
 
     mj_init(&b, semantic, MJ_BLOCK_MAX);
@@ -587,7 +603,7 @@ int manifest_format(const struct ManifestInputs *in, char *buf, int buf_len) {
     sha256_hex(semantic, (size_t)b.used, semantic_id);
 
     mj_init(&b, numerical, MJ_BLOCK_MAX);
-    emit_numerical(&b, in, regions_sha256);
+    emit_numerical(&b, in, regions_sha256, sampling_sha256);
     if (finish_block(&b, "numerical_policy", err, sizeof(err)) != 0) goto done;
     sha256_hex(numerical, (size_t)b.used, numerical_id);
 
@@ -645,14 +661,7 @@ int manifest_format(const struct ManifestInputs *in, char *buf, int buf_len) {
     mj_put(&b, "\"regions\":");
     mj_raw(&b, region_text);
     mj_put(&b, ",\"sampling\":");
-    {
-        char sampling_text[1024];
-        struct MjBuf sub;
-        mj_init(&sub, sampling_text, (int)sizeof(sampling_text));
-        emit_sampling(&sub, in->sampling);
-        if (finish_block(&sub, "sampling", err, sizeof(err)) != 0) goto done;
-        mj_raw(&b, sampling_text);
-    }
+    mj_raw(&b, sampling_text);
     mj_put(&b, ",\"semantic\":{\"fields\":");
     mj_raw(&b, semantic);
     mj_put(&b, ",\"semantic_id\":\"");
@@ -682,5 +691,6 @@ done:
     free(numerical);
     free(deployment);
     free(region_text);
+    free(sampling_text);
     return status;
 }

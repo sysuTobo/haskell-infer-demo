@@ -86,7 +86,7 @@ Not here, on purpose:
 `norm_impl`, `gemm_algorithm_policy` (`cublas_default_heuristic_unpinned`),
 `gemm_output_type`, `lm_head_output_type`, `cast_boundaries`,
 `gdn_recurrent_impl`, `mla_impl`, `moe_combine`, `moe_ep_merge`, `collective`,
-`fusion`, `backward` (`not_implemented`), `regions_sha256`.
+`fusion`, `backward` (`not_implemented`), `regions_sha256`, `sampling_sha256`.
 
 Two things are worth stating explicitly.
 
@@ -159,14 +159,17 @@ rather than assumed. Stage 2's experiments are what would establish the rest.
 
 ## Sampling
 
-The generation-only selection policy is a numerical-policy field: `mode`
-(`greedy`), `transform` (`argmax_lowest_token_id`), `transform_version`,
-`arithmetic`, `rng` (`none`). Greedy consumes no random word, so there is nothing
-to record per request. When the temperature sampler of
-[plan-numeric-contract.md](plan-numeric-contract.md) (T0–T4) lands, its transform
-and arithmetic join this block, while the resolved temperature and seed of one
-request belong to the capture's replay data — so **changing only the temperature
-changes no model, weight or policy identity**.
+The generation-only selection policy is a numerical-policy field: the `sampling`
+block carries `mode` (`greedy`), `transform` (`argmax_lowest_token_id`),
+`transform_version`, `arithmetic` and `rng` (`none`), and its digest
+(`numerical_policy.fields.sampling_sha256`) is part of the numerical identity — a
+capture taken under a different sampler arithmetic is a different numerical policy,
+and a comparison refuses it rather than overlooking the field. Greedy consumes no
+random word, so there is nothing to record per request. When the temperature
+sampler of [plan-numeric-contract.md](plan-numeric-contract.md) (T0–T4) lands, its
+transform and arithmetic join this block, while the resolved temperature and seed
+of one request belong to the capture's replay data — so **changing only the
+temperature changes no model, weight or policy identity**.
 
 ## Comparison modes
 

@@ -14,6 +14,18 @@ asynchronous RL. The first implementation target is a small dense or dense-hybri
 model, on one device or with layer-wise placement; not every existing inference
 family becomes trainable in the first release.
 
+A [temperature-sampling migration](#temperature-sampling-migration) changes the
+planned default generation policy from greedy to categorical sampling, while
+retaining explicit greedy regression. It can be implemented without training or
+CUDA changes and supplies the sampling foundation for Stage 5.
+
+A separate [inference optimization track](#inference-optimization-track) covers
+operator fusion, weight-only quantization and speculative decoding. It shares
+the contract and measurement infrastructure, but neither blocks the initial
+trainer nor inherits trainability or exactness from it. All sampling/optimization
+APIs, formats and milestones below are proposals; this revision changes
+documentation only and authorizes no implementation or GPU experiment.
+
 Sharing implementations reduces duplication but does **not** establish either
 bitwise agreement or shared parameter storage by construction:
 
@@ -53,6 +65,10 @@ debuggability and attributable experiments, not promised reward or speed gains.
 | Descriptor | Strict flat schema and canonical C formatting | Semantic/numerical digests and resolved execution manifest |
 | Artifacts | nvcc SASS `86;89;90a` plus `90-virtual`; Triton cubins `86;89;90` | Capture provenance identifying the actual selected kernels; Triton has no PTX fallback |
 | Weights | Engine-owned BF16; derived GDN norm FP32 copy | Shared trainable ownership, tied-gradient merging, derived-copy refresh |
+| Fusion | FlashInfer attention, SiLU-multiply and GDN gated norm; dense gate/up still separate GEMMs | Combined projection layouts, residual-add/norm fusion and measured end-to-end benefit |
+| Quantization | Weight-role loading requires BF16; GEMM uses BF16 inputs with FP32 compute | Packed low-bit weights, scales, format validation, quantized GEMM and quality gates |
+| Speculative decoding | Batched prefill internally, but only final-row logits; reset clears all sequence state | Draft/target orchestration, per-position verification, prefix rollback and GDN state snapshots |
+| Sampling | Four argmax call sites in streaming/non-streaming generation; host `[Float]` logits; no temperature/seed options or RNG dependency | Shared token selector, temperature categorical distribution, request-owned RNG, sampler logprobs and distribution/replay gates |
 | Training | No optimizer, objectives or saved-activation runtime | Full training path, checkpoint/resume and independent gradient tests |
 | Rollout | Greedy single-request inference | Stochastic sampling, behavior logprobs, groups, rewards, versioned queues |
 
@@ -104,6 +120,10 @@ gradient accumulation, RNG consumption and batch order need their own contracts.
 No day estimates are assigned before the relevant feasibility spikes. Stages
 0–2 preserve arithmetic; later stages deliberately introduce training interfaces
 and possibly new kernels. Passing a metadata gate is not passing a numeric gate.
+The sampling milestones use T0–T4 and the optimization milestones use F/Q/S
+labels rather than renumbering these stages. Sampling can start independently;
+optimization depends on the applicable Stage 0–2 evidence, not on completing all
+training or asynchronous-RL work.
 
 ### Stage 0 — Versioned contract and capture provenance
 
@@ -125,6 +145,11 @@ Some constants describe both the mathematical function and its numerical
 realization; the canonical schema must specify their projections into the two
 identities rather than silently omit or disagree on them. Unknown numerical
 settings are unsupported for an exact claim, not implicit defaults.
+
+Generation captures additionally record the resolved sampling configuration,
+PRNG/version, seed and draw mapping. Temperature transforms and sampler arithmetic
+are numerical-policy fields, while the concrete seed/state is per-request replay
+data; changing only temperature must not change model/weight identity.
 
 A capture also records checkpoint/parameter-version identity, token IDs, cases,
 shapes, mask/position convention and the full manifest. A runtime `PolicyVersion`
@@ -166,6 +191,10 @@ vocabulary covering the whole framework:
 - GDN conv1d, conv SiLU, prepare (Q/K L2 normalization, head expansion,
   a/b/A_log/dt_bias transforms), core and gated norm.
 - Dense MLP SiLU-multiply.
+
+Inventory the proposed host-FP64 temperature softmax/CDF and RNG mapping as a
+separate generation-only region when T0–T4 is implemented; do not equate it with
+the trainer's FP32 differentiable log-softmax/loss region.
 
 MLA, MoE routing/expert combine, TP and EP require additional regions and are
 explicitly outside the first trainer allowlist. Keep their inference regression
@@ -287,7 +316,11 @@ run-to-run determinism separately from numerical closeness to the reference.
 ### Stage 5 — Synchronous training/rollout baseline
 
 First bring up SFT after Stages 3–4; it does not wait for cross-case bitwise
-kernels. Then add phase-specific memory budgets and stochastic rollout:
+kernels. Then add phase-specific memory budgets and stochastic rollout. Reuse
+the [temperature-sampling migration](#temperature-sampling-migration) rather
+than adding another sampler here; ordinary CLI sampling does not wait for SFT.
+Before RL admission, bind its selection records to immutable policy versions
+and validate host-FP64 sampler versus trainer-FP32 logprob differences explicitly.
 
 - Synchronous rollout borrows a committed BF16 parameter version. No optimizer
   write overlaps readers. Release/reset KV and GDN state at the phase boundary;
@@ -296,7 +329,8 @@ kernels. Then add phase-specific memory budgets and stochastic rollout:
   reasons and version IDs at generation time. Never reconstruct an old denominator
   using updated weights. Distinguish frozen reference/teacher from behavior policy.
 - Begin RL tests with categorical sampling at temperature 1 and no top-k/top-p
-  truncation. This makes the sampling distribution equal to model softmax.
+  truncation. The mathematical sampling distribution is then model softmax;
+  finite-RNG/CDF and FP64/FP32 differences remain subject to the sampling gates.
   Adding transformations requires recording both raw model logprobs and actual
   sampler logprobs, the transform/version and RNG mapping, and specifying which
   distribution the objective optimizes and corrects. Top-p changes support;
@@ -601,6 +635,650 @@ for controlled replay tests.
    remains lag-zero until its separate objective gate is satisfied. A throughput
    improvement is an experiment outcome, not an acceptance assumption.
 
+## Temperature-sampling migration
+
+### Target behavior and scope
+
+The current implementation is **greedy decoding**, not stochastic sampling:
+`src/Infer/Generation.hs::generate` and `generateStreaming` select argmax at
+prefill and every decode step. `src/Infer/Config.hs` and `src/Main.hs` have no
+temperature or seed fields. `src/Infer/FFI/Engine.hs` already returns host FP32
+logits as `[Float]`; the first sampler therefore belongs in Haskell and needs no
+C ABI, CUDA kernel, weight format or architecture-descriptor change.
+
+Proposed end state, after T0–T4 gates pass:
+
+| Input | Behavior |
+|---|---|
+| No sampling options | `temperature=1.0`; categorical sampling over the full vocabulary with a newly resolved request seed |
+| `--temperature T`, finite T>0 | Sample from `softmax(logits/T)`; T<1 sharpens and T>1 flattens the same logits, without a promised text-quality gain |
+| `--temperature 0` | Explicit greedy mode, lowest token ID wins exact ties; no division by zero, softmax sampling or random-word consumption |
+| `--seed S` | Unsigned decimal Word64 in [0, 2^64-1]; fixes the request's random stream, not arbitrary GPU/kernel nondeterminism |
+| Negative/nonfinite temperature, malformed/out-of-range seed | Configuration error before loading model/tokenizer or acquiring entropy |
+
+Use the same default values and validation in the CLI and `defaultRuntimeConfig`.
+Parse finite decimal temperature with sign/range validation before converting to
+Double; reject a nonzero value that underflows to zero, or overflows to infinity.
+Negative nonzero input is invalid even if its magnitude would round to zero.
+Canonicalize literal negative zero temperature to greedy zero. A seed provided
+with T=0 is accepted but reported as unused. Do not silently switch a small positive
+T to greedy, read hidden model-specific sampling defaults, or add top-k/top-p,
+repetition penalties, logit bias or beam search in this migration. Retaining
+explicit greedy is a supported evaluation mode, not a compatibility workaround.
+Default-changing CLI examples and release notes must state the behavior change;
+existing greedy golden/reference tests must select T=0 explicitly, not acquire
+a new stochastic expected output.
+
+### Distribution, validation and selected-token record
+
+First implementation: convert each input Float logit to Double **before**
+subtraction/division; do softmax exponentials, normalization and CDF accumulation
+on the CPU in binary64, traversing increasing token IDs. This is a deliberate
+sampler numerical policy, distinct from the CUDA FP32 logit output and the
+trainer's FP32 loss/logprob reductions. No sort is needed. A later FP32/GPU
+sampler is a new implementation requiring its own distribution and replay gates.
+
+For finite logits z and temperature tau>0, define:
+
+```text
+m = max_i Double(z_i)
+a_i = (Double(z_i) - m) / tau
+w_i = exp(a_i)
+Z = left_fold_add_token_order(w_i)
+p_tau(i) = w_i / Z
+ell_sampler(i) = a_i - log(Z)
+ell_model(i) = (Double(z_i) - m) - log(sum_j exp(Double(z_j) - m))
+```
+
+Subtracting m before division avoids positive overflow from `z/tau`; at least
+one a_i is zero, so Z must be finite and >=1 for an admitted vocabulary. A very
+small positive tau can produce negative infinity in a_i or underflow w_i to
+zero: treat it as zero numerical mass, not a reason to reroute to argmax. Equal
+maxima retain equal weights even in this limit. Record this finite-precision
+support limitation rather than claiming mathematical full support at every T.
+
+At the selection boundary reject empty/wrong-length logits and any input NaN
+or infinity, including -infinity in this initial unmasked sampler. Failures
+propagate through the existing generation error path; do not return token 0,
+clamp corrupt logits, silently retry with another seed or report a short success.
+The exported legacy argmax need not be redesigned, but production selection
+validates before invoking it. Validation occurs before consuming a random word;
+check for invalid normalization/CDF results as errors, not hidden fallbacks.
+
+Define inverse-CDF selection precisely: obtain u in [0,1), set r=u*Z, and choose
+the first **positive-weight** token whose ordered cumulative weight is strictly
+greater than r. Exact CDF boundary hits belong to the following positive bin;
+u=0 must not select a zero-mass leading token. Compute Z and the selection scan
+in the same order. If floating multiplication rounds r up to Z, select the
+last positive-weight token as the specified endpoint correction, never an
+arbitrary final vocabulary entry; larger inconsistencies are errors. Unit tests
+exercise that correction separately from normal draws.
+
+The mathematical temperature distribution, its binary64 implementation and the
+finite uniform-grid/CDF selection probabilities are not literally identical.
+Version the arithmetic and endpoint rules, compare their error on fixtures, and
+label `ell_sampler` as the implemented softmax logprob rather than pretending it
+is an exact count of finite-RNG intervals. Distributional admission requires a
+predeclared error budget; an exact stochastic claim needs stronger analysis.
+
+The proposed selector returns token ID plus optional selected-token metadata:
+raw-model `ell_model`, temperature `ell_sampler`, sampling config/version,
+effective seed and draw index. Compute probabilities/logprobs from the original
+logits in log space, not by taking `log` of a rounded-to-zero probability. At
+T=1 share the same normalization for both logprob fields; at T=0 the selected
+sampler probability is one (`ell_sampler=0`), not the model softmax probability.
+Only compute the raw-model normalization when its record is requested. Full
+vocabulary logits need not be retained after selection, and normal CLI output
+need not collect a training trajectory. Stage 5 must explicitly request and
+persist this record before any learner update; it cannot reconstruct it later.
+
+### RNG ownership and reproducibility
+
+Use one explicit request-local PRNG state, initialized once, not a process-global
+RNG and not a seed reset on every token. Start with a version-pinned `splitmix`
+dependency and an explicit Word64-seed initialization/Word64-output API; freeze
+known seed→word test vectors and the package/version before implementation
+admission. This RNG is for sampling, not cryptographic use.
+
+Map each output Word64 x to `u = Double(x >> 11) * 2^-53`. A positive-temperature
+selection consumes exactly one word, including a singleton vocabulary or a row
+whose numerical mass lies in one bin. Greedy mode consumes none. Draw 0 selects
+the first generated token from prefill logits, not a prompt token; subsequent
+draws advance once per selected output token, including terminal EOS. Never draw
+after EOS/budget exhaustion or for an engine call that failed to return valid
+logits. An error after a successful draw aborts the request, not resampling.
+
+If seed is omitted, obtain entropy once for a positive-budget stochastic request
+and report the resolved seed, temperature and sampler version on stderr before
+generation; keep metadata out of generated stdout text. With an explicit seed,
+record that seed and do not acquire entropy. Nonpositive API budget touches
+neither engine nor RNG/entropy; the CLI retains its existing rejection of
+negative budgets. For the same seed and admitted logits, streaming and
+non-streaming paths must consume the same words and select the same IDs.
+
+RNG lifetime is independent of `engine_reset`: every new generation request
+starts from its chosen seed; a future in-request continuation must carry its RNG
+state/draw index alongside token/cache state rather than silently reinitialize.
+The present CLI does not promise resumable generation. Reproducibility means
+same prompt IDs, weights, execution/sampler manifests and seed, not just the
+same text prompt and numeric seed across devices/builds. Different seeds may
+legitimately produce the same response; do not test otherwise as a guarantee.
+
+For Stage 5 groups, assign each response a distinct, reproducibly derived stream
+from a documented run/group/response mapping before parallel dispatch, and log
+its resolved seed; do not initialize all G responses with the same seed or rely
+on thread completion order. Exact retry reuses the response seed under the same
+version, while a new sampling attempt has a new recorded attempt/stream identity.
+Freeze that derivation and RNG checkpoint format before async admission; the
+single-request migration does not implement a group scheduler.
+
+### T0–T4 implementation milestones
+
+**Files:** add `src/Infer/Sampling.hs` for the pure distribution/inverse-CDF
+functions and the small explicit-state RNG adapter; add `tests/SamplingSpec.hs`
+as a module invoked by the existing generation test suite. Modify
+`src/Infer/Config.hs`, `src/Main.hs`, `src/Infer/Generation.hs`,
+`tests/GenerationSpec.hs`, `tests/generation_engine_stub.c` and
+`haskell-infer-demo.cabal`; update `README.md` and `docs/design.md` only when the
+feature actually ships. Add a small proposed `tests/test_sampling_cli.py` runner
+for real executable option/seed/stream checks and `tests/SamplingEngineSpec.hs`
+for direct real-engine returned-token comparisons. Register the latter as an
+opt-in `infer-sampling-engine-tests` suite linked to the actual engine/tokenizer,
+not the C stub; absent model/runtime prerequisites mean skipped/unverified, not
+a passing GPU gate. These new modules/options/tests are planned, not implemented
+by this document edit.
+
+- [ ] **T0 — Lock configuration and greedy baseline.** Write tests for default
+  temperature, T=0/T>0, invalid numeric inputs, seed range and configuration
+  parity; extend greedy tests for exact ties. Define a shared `SamplingConfig`
+  with validated Double temperature and optional Word64 seed, used by Main and
+  generation rather than duplicated defaults. Audit greedy examples/scripts
+  before changing the default; use explicit greedy in regression fixtures.
+  Invalid configuration must fail before any model allocation.
+- [ ] **T1 — Implement and test the pure selector.** Separate preparing weights
+  from choosing with a supplied u, so deterministic CDF/normalization tests do
+  not depend on PRNG behavior. Add independent softmax/logprob reference values
+  and boundary tests before implementation. Initially consume the existing
+  `[Float]` FFI output with bounded per-row scratch and strict folds; avoid
+  retaining lazy chains across decode steps. No FFI/vector rewrite or GPU
+  kernel is necessary. Register `Infer.Sampling` and `SamplingSpec` in affected
+  Cabal components; do not inadvertently make unrelated config-only tests
+  depend on random IO.
+- [ ] **T2 — Add request RNG and unify token selection.** Pin the RNG dependency
+  in the executable and generation-test component, add fixed word/uniform test
+  vectors, then pass one state through all four current argmax call sites.
+  Both generation entry points use the same selector and next-state contract.
+  Resolve options once in Main and pass the validated configuration instead of
+  reading globals/environment per token. Extend the C stub to supply arbitrary
+  per-step vocabulary rows, not only one +1 winner with all other logits -1.
+- [ ] **T3 — Verify generation lifecycle and real CLI behavior.** Preserve
+  first-token budget counting, returned EOS, pending-token consumption, engine
+  error propagation and stream flushing/cleanup. A sampled EOS is handled by
+  the same stop path as a greedy EOS. Characterize the existing first-EOS versus
+  later-EOS text-feed asymmetry in tests; do not change special-token rendering
+  as an unrelated sampling fix. Check new request/seed behavior, capacity errors,
+  arbitrary logits, prefill/decode failures and zero-budget no-RNG behavior.
+  The current `infer-generation-tests` does not compile CLI Main: use the
+  executable runner for option/default/help and stderr-seed checks, including
+  invalid arguments with a nonexistent model path to prove early validation.
+- [ ] **T4 — Admit default change and document boundaries.** First run CPU
+  distribution/RNG/lifecycle tests, then real-model greedy regression and
+  fixed-seed temperature smoke tests. Compare stream/non-stream returned IDs,
+  rerun the same seed under the same manifest, and measure host selection time,
+  allocations/GC, TTFT and tokens/s. Switch CLI/config default to T=1 only in the
+  change that passes these gates; publish T=0 reproducibility instructions and
+  T=1/0.7 fixed-seed examples together. Retain engine logits/golden checks
+  unchanged. Do not claim temperature sampling is a speed optimization or that
+  higher diversity automatically improves quality.
+
+### Sampling gates and commands
+
+1. **Pure math and boundary gates:** singleton/equal logits; two-token logits
+   `[0, log(3)]` give approximately `[1/4,3/4]` at T=1 and `[1/10,9/10] at
+   T=0.5, accounting for the supplied FP32 inputs. Test representable constant
+   shifts, low/high positive T, negative logits, underflow, exact CDF hits,
+   u=0 and the largest admitted u<1, zero-weight bins and endpoint correction.
+   Reject empty/mismatched/nonfinite input, invalid T and invalid injected u.
+   Compare selected logprobs with an independent log-sum-exp calculation.
+2. **Statistical gate, distinct from seed replay:** on a small fixed vocabulary
+   use fixed seed sets and an a-priori draw count/error criterion against an
+   independent target distribution. For example N=200,000, at most four bins,
+   and absolute frequency tolerance 0.01 gives a conservative Hoeffding/union
+   bound under ideal independent draws; this is a sampler smoke gate, not a
+   proof of PRNG independence. Do not require rare tokens to appear or change
+   seeds/tolerances until a test passes. Check that lower T concentrates this
+   fixed-logit distribution and higher T flattens it, not a whole generation's
+   entropy after its prefix has changed.
+3. **Replay/lifecycle gate:** known RNG vectors, exactly one draw per stochastic
+   selected token and zero for greedy; same-seed stream/non-stream ID parity,
+   EOS at first/later steps, budgets 0/1/several, repeat requests, error cleanup
+   and no extra draw/engine call after stop. Exact replay is scoped to the same
+   admitted runtime; GPU numerical differences can change CDF decisions.
+4. **Engine integration gate:** T=0 matches existing greedy behavior/goldens for
+   valid inputs; changing only sampling config leaves same-prefix engine logits
+   unchanged. Real T>0 smoke tests confirm valid tokens, bounded lengths and
+   request success but do not replace statistical tests. Report host overhead
+   for the large vocabulary instead of assuming existing logit transfer is free.
+
+Existing CPU command after implementing these modules, using the installed
+Haskell dependencies (no CUDA execution required):
+
+```bash
+cabal test infer-generation-tests infer-tests --enable-tests
+```
+
+Proposed real-application smoke commands after implementation/build, in the
+configured CUDA environment; the flags below do **not** exist today:
+
+```bash
+cabal run exe:haskell-infer-demo -- generate --model-dir "$MODEL_DIR" \
+  --descriptor "$DESC" --gpus "$DEVICES" --prompt "Hello" \
+  --max-tokens 16 --temperature 0
+cabal run exe:haskell-infer-demo -- generate --model-dir "$MODEL_DIR" \
+  --descriptor "$DESC" --gpus "$DEVICES" --prompt "Hello" \
+  --max-tokens 16 --temperature 1.0 --seed 42
+```
+
+Repeat the second invocation with the same seed and with `--stream`; the CLI
+runner checks option behavior, reported seed, success and rendered text.
+`tests/SamplingEngineSpec.hs` calls both generation functions with the real
+runtime and compares their returned `[Int64]` values across reset requests;
+rendered text alone is not a token-ID gate. An omitted-seed CLI smoke run must
+print a seed that can replay the request when supplied explicitly. Neither
+commands nor tests are executed by this planning-only revision.
+
+### Interaction with training and speculative decoding
+
+Stage 5 starts at T=1 without truncation, so the mathematical behavior policy is
+the model softmax. The host-FP64 versus trainer-FP32 realization still needs a
+same-prefix logprob comparison; same weights do not imply bitwise ratio=1.
+Retain the sampler/logprob precision in the numerical manifest. At T!=1, using
+raw-model logprobs as the behavior denominator is wrong: the selected
+`ell_sampler` and transform define that distribution. Keep the raw logprob as
+separate metadata; before training at T!=1, specify whether the learner objective
+uses the transformed policy or an explicit off-policy correction. The initial
+RL gate does not silently inherit arbitrary CLI temperatures, and T=0 cannot
+serve as its stochastic on-policy baseline.
+
+The initial S0–S3 speculative path remains an **explicit T=0 experiment**.
+Ordinary T>0 requests use target-only sampling until a separately validated
+stochastic speculative algorithm exists; an explicitly requested unsupported
+T>0-plus-speculation combination must fail before running. Applying temperature
+to the draft and accepting only target argmax matches does not sample from the
+target distribution. The later p/q acceptance and residual-resampling extension
+must use both actual temperature distributions, separate proposal/acceptance/
+correction RNG streams and compatible rollback semantics. Distributional parity,
+not identical seed-to-token paths, is its first stochastic gate. Adding a CPU
+sampler alone does not satisfy that extension or Stage 5's trajectory ledger.
+
+## Inference optimization track
+
+### Scope, dependencies and numerical identities
+
+Recommended implementation order: **baseline/provenance → fusion → weight-only
+quantization → speculative decoding → measured combinations**. This is a
+prioritization, not a hard dependency: speculative decoding can use a BF16 target
+and does not require quantization. Start each optimization against an unchanged
+BF16 baseline before combining it with another change. The initial deployment
+target is the verified A40/sm_86 inference configuration; other architectures
+need their own kernel and runtime admission.
+
+Stages 0–1 supply provenance and region fixtures; Stage 2's applicable GEMM,
+attention and GDN experiments identify execution-case differences. The trainer's
+attention-backward experiment is not a prerequisite for inference optimization.
+Stage 6 becomes relevant when an optimization needs a stronger cross-case
+numerical guarantee than the existing kernels provide.
+
+| Change | Contract treatment | Required comparison |
+|---|---|---|
+| Fusion with intended unchanged arithmetic | Preserve logical operation/parameter identities; record fused implementation, layouts and retained casts in `numerical_policy_id` and build provenance | Diagnostic old/new comparison, yielding scoped bitwise-equivalence evidence only if outputs and mutable state pass; this is distinct from matching-identity strict admission |
+| W4A16 weight-only quantization | Keep architecture semantics but assign a distinct packed-weight identity and numerical policy, including quantizer, scales and dequantization rules | Independent quantized-math reference plus a separately budgeted quality comparison against BF16; not a BF16 bitwise refactor |
+| Speculative verification | Record draft and target identities, verification shapes, rollback/replay case, tie rule and generation/RNG policy | Compare against target-only generation under the same target weights/policy; batching and state recovery need independent numerical admission |
+
+Extend the Stage 0 capture with these fields rather than disguising an
+optimization as a placement-only change. An explicit BF16 execution request must
+remain reproducible; unsupported optimized cases fail clearly rather than
+silently selecting a different precision. A deliberate alternate kernel choice
+must appear in the resolved manifest. No general runtime plugin/graph compiler
+is required for these bounded paths.
+
+### F — Operator fusion
+
+**Current anchors:** `csrc/kernels/layers.cu::forward_mlp` issues separate gate
+and up GEMMs; `forward_attention_layer` issues Q/K/V projections separately;
+`forward_gdn_layer` issues QKV/Z/A/B projections separately.
+`csrc/kernels/silu.cu` already implements fused SiLU-multiply, and FlashInfer
+attention and `csrc/kernels/gdn_norm.cu` already fuse parts of their computation.
+A fused checkpoint name is not evidence of fused execution: GDN QKVZ/BA rows are
+currently unpacked into separate weight views at load time.
+
+**Files:** modify `csrc/include/layers.h`, `csrc/kernels/layers.cu`,
+`csrc/kernels/silu.cu`, `csrc/kernels/flashinfer_norm.cu`,
+`csrc/layer_dispatch.cu` and the relevant loading/execution sites in
+`csrc/engine.cu`; keep `csrc/kernels/gemm.cu` as the BF16 comparison path.
+Extend `tests/test_library_ops.py`, its `tests/kernels/kernel_bridge.cu`, and
+existing norm/GDN/engine tests. The model-level Haskell FFI remains unchanged.
+
+- [ ] **F0 — Establish a costed baseline before choosing fusions.** Record
+  per-region CUDA time, launch count, host synchronization and memory traffic for
+  decode M=1 and representative prefill M=2/64/128, within each descriptor's
+  limits. Include layer placement and full request wall time. Run timing with
+  taps disabled, after warm-up, and synchronize only at measurement boundaries;
+  keep diagnostic captures separate. Weight traffic, MoE host-offset sync and
+  device transfers may dominate launch savings.
+- [ ] **F1 — Merge dense gate/up projections.** First add fixtures for existing
+  separate GEMMs and SiLU output; then concatenate weight rows once during
+  loading and compute `[T,2I]` in one GEMM. Existing scratch is
+  `[gate[T,I]; up[T,I]]`, while row-major `[T,2I]` interleaves gate/up per token:
+  update the activation kernel's explicit row/stride contract, not just its
+  pointer offsets. Include T>1 tests because T=1 hides this layout defect.
+  Own the packed buffer through the existing allocation registry, avoiding
+  permanent duplicate BF16 weights. GEMM N changes from I to 2I and may select a
+  different reduction; compare pre-activation outputs before attributing any
+  difference to SiLU. Do not claim a GEMM+SwiGLU epilogue exists in current cuBLAS.
+- [ ] **F2 — Fuse residual addition with the following norm.** First specify
+  two outputs: the updated BF16 residual and the normalized activation.
+  The fused kernel must compute `r = BF16(old_r + sublayer_out)` and normalize
+  that rounded r, not an unrounded FP32 sum. Retain plain versus Gemma weight
+  conventions and FP32 reduction behavior. Start at mixer→post-norm within a
+  layer; change dispatch so the FFN consumes the prepared activation rather than
+  normalizing twice. Sublayer kernels still do not privately add residuals.
+  The replicated path in `forward_replicated` is a separate caller: all-reduce
+  must finish before this fused boundary, with residual addition exactly once.
+  Cross-layer fusion is deferred until ownership and placement boundaries pass.
+- [ ] **F3 — Expand only where F0 shows a bottleneck.** Candidates are merged
+  Q/K/V projections, compatible GDN projections, Q/gate split plus per-head
+  norm/RoPE/cache write, and conv+SiLU. Preserve the Q/gate interleave, head
+  expansion and checkpoint row ordering. GDN convolution explicitly rounds to
+  BF16 before SiLU today; a fused kernel must retain that conversion if it claims
+  unchanged arithmetic. Do not absorb MLA projections or replace FLA recurrence
+  as incidental fusion cleanup: those are distinct algorithm/numerical changes.
+
+**F gates:** compare intermediate outputs and persistent state against the
+unfused path and an independent reference; include nonzero residual/state,
+plain/Gemma norms, T=1 and multi-row tails, supported GQA/head shapes and lengths
+crossing 64/128. Any shared-memory tree reduction must handle its launch shape,
+including inactive lanes, rather than assuming multiples of 32 are powers of
+two. Preserve legacy bitwise captures for paths claimed unchanged; otherwise
+record a new policy and a quantified exception, not a weakened old golden.
+Run PP and applicable TP/EP regression when their callers are touched. Admit a
+fusion only when the intended workload improves without an unbudgeted memory or
+prefill regression; kernel timing alone is insufficient. Training reuse later
+requires saved-rounded-value and backward/gradient revalidation from Stage 4.
+
+### Q — Weight-only quantization
+
+**Initial scope:** dense FFN gate/up/down only, first on one device or PP, with
+BF16 activations, BF16 region outputs and the defined FP32 accumulation policy.
+Keep embeddings, LM head, norms, routers, attention/MLA/GDN projections, GDN
+convolution/decay parameters and recurrent state at their current precision.
+Quantized KV cache, activation quantization, QAT and quantized optimizers are
+separate work. A40/sm_86 must use a compatible weight-only kernel; dependency
+`ENABLE_FP8` settings are not evidence of a native FP8 inference path.
+
+**Files:** extend `csrc/include/safetensors.h`, `csrc/safetensors.cpp`,
+`csrc/safetensors_loader.cu`, `csrc/engine.cu`, `csrc/include/layers.h` and
+`csrc/kernels/layers.cu`. Introduce a bounded weight-format/linear-weight module
+(`csrc/include/linear_weight.h`, `csrc/weight_manifest.cpp`) and a separate
+`csrc/kernels/gemm_quant.cu` implementation, rather than casting packed data to
+`__nv_bfloat16 *`. Add the offline converter `scripts/quantize_weights.py`,
+format tests `tests/test_quantization_format.py`, kernel tests
+`tests/kernels/test_quant_gemm.cu` and model-quality runner
+`tests/test_quantization.py`; register compiled targets in `csrc/CMakeLists.txt`.
+These are proposed new files, not current capabilities.
+
+- [ ] **Q0 — Freeze a versioned format and independent reference.** Start with
+  symmetric signed INT4, K-axis groups of 128 and BF16 scales, subject to a
+  sm_86 kernel feasibility check before fixing the wire format. A concrete
+  baseline quantizer uses FP32 source values, scale
+  `s = BF16(max(abs(group))/7)`, round-to-nearest-even `q = round(w/s)` clipped
+  to [-7,7], and zero-point 0; all-zero groups use s=1. Reject nonfinite inputs
+  and nonpositive/nonfinite rounded scales. Pack two two's-complement nibbles
+  per U8 byte, lower K index in the low nibble; reserve -8 as invalid in this
+  format. Define dequantization multiplication and BF16 conversion explicitly
+  and require the chosen kernel to match that reference. Initially require
+  K/group and backend tile alignment; reject unsupported shapes instead of
+  inventing hidden padding. Better calibration/AWQ/GPTQ is a later named
+  quantizer, not an unrecorded improvement to the same artifact.
+- [ ] **Q1 — Implement converter, manifest validation and ownership.** Write
+  quantized artifacts to a separate output directory without modifying the BF16
+  checkpoint. Use a strict, versioned `weights.manifest.json` sidecar resolved
+  from the model directory; keep the architecture descriptor portable and
+  unchanged. Record source checkpoint/checksum, converter/config version,
+  per-layer/role mapping, logical `[N,K]`, packed layout/shape/dtype, group axis
+  and size, scale tensor/shape/dtype, zero-point convention and artifact hashes.
+  Quantized and retained-BF16 roles form an explicit precision map. Validate
+  role shapes against the descriptor plus packed byte counts, scale values,
+  missing/duplicate/unknown entries and overflow before GPU use. Integer storage
+  support in safetensors does not authorize arbitrary integer model weights.
+  Represent each linear weight with format, logical/local dimensions, packed
+  pointer and scales; register every allocation for partial-load cleanup.
+- [ ] **Q2 — Add real weight-only execution, then model gates.** Start from
+  pack/unpack and synthetic GEMM fixtures, then route only admitted FFN roles to
+  a kernel that unpacks/scales inside its register/shared-memory tiles. Reject
+  full-weight dequantization into a BF16 temporary on every forward: it restores
+  weight traffic and can erase the optimization. A one-time full BF16 expansion
+  also does not retain device-weight compression. Measure M=1 and batched M
+  separately before choosing specializations. If F1 is active, concatenate
+  packed rows and scale rows consistently and preserve its activation layout.
+  Unsupported kernels/shapes fail during creation, not midway through a request.
+- [ ] **Q3 — Add sharding and additional roles as separate admissions.** TP
+  output-row/head splits slice corresponding scale rows; input-column splits
+  must align with group and packing boundaries and retain global quantization
+  scales. Do not requantize independently per rank. EP slices packed experts
+  and scales together and preserves router/shared-expert precision and combine
+  order; revise BF16-specific expert offsets in `load_moe_weights`/`csrc/moe.cu`.
+  Future GDN row gathering must also gather scales. Until these gates exist,
+  reject quantized TP/EP or excluded roles explicitly while retaining ordinary
+  BF16 TP/EP support.
+
+**Q gates:** first verify the kernel against an independent dequantized-weight
+reference, then assess the quantizer against the original BF16 model. These are
+different comparisons. Cover signed extrema, zero groups, group/tile boundaries,
+M=1/multi-row, malformed/truncated artifacts, scale mismatch and failure cleanup
+in `tests/safetensors_test.cpp` and the new tests. Fix evaluation prompts and
+teacher-forced prefixes before running: report logits RMS/max error, top-1
+agreement, held-out NLL/perplexity and a defined task-quality score. Free-running
+outputs alone confound weight error with different prefixes. Set explicit
+per-model quality budgets before admission; token identity with BF16 is not a
+universal quantization requirement. Retain the existing BF16 reference/token
+gates unchanged. Long-context, reset, chunk and later TP/EP gates compare against
+the same quantized artifact/policy, not an independently requantized baseline.
+
+Report converter/load time, peak host/device loading memory, persistent bytes,
+workspace, TTFT and decode latency/throughput. Ideal aligned weight storage is
+`N*K/2 + 2*N*(K/128)` bytes before headers/backend packing, not a fourfold
+reduction of whole-model memory; excluded roles, state and scratch remain.
+Choose W8A16 or narrower role coverage only as a separately specified experiment
+if W4A16 misses quality/performance gates, never as a silent precision fallback.
+
+### S — Speculative decoding
+
+S0–S3 remains greedy-only even after the ordinary CLI migrates to temperature
+sampling: explicitly select T=0 and reject unsupported stochastic speculation.
+See [temperature-sampling migration](#temperature-sampling-migration) for the
+separate target-only sampler and its Stage 5 integration.
+
+**Current anchors:** `src/Infer/Generation.hs::generate` performs greedy argmax
+with lowest-ID tie breaking; its last emitted token has not yet been consumed by
+`engine_decode`. `csrc/engine.cu::compute_logits` computes only the final row,
+although `engine_prefill` already executes batched chunks. `engine_reset` clears
+all state, not an arbitrary suffix. Attention/MLA caches append by position;
+GDN updates both BF16 convolution history and FP32 SSM state in place.
+
+**Files:** extend `src/Infer/Generation.hs`, `src/Infer/Runtime.hs`,
+`src/Infer/Config.hs`, `src/Main.hs`, `src/Infer/FFI/Engine.hs`,
+`csrc/include/engine.h`, `csrc/engine.cu` and `csrc/include/layers.h`.
+Extend `tests/GenerationSpec.hs`, `tests/generation_engine_stub.c`,
+`tests/engine_bindings.py` and `tests/test_engine_resources.py`; add
+`tests/test_speculative.py` for engine/state/target-only comparison. Reuse
+`tests/kernels/test_gdn.cu` and `tests/kernels/test_mla.cu` for state fixtures.
+Any additional test target/module must be registered in the existing Cabal or
+CMake configuration. No CUDA pointers cross the Haskell boundary.
+
+- [ ] **S0 — Build a sequential correctness prototype first.** Own two
+  independent runtimes, prefilling the identical token prefix. Validate complete
+  tokenizer/token-ID and special-token compatibility, not just vocabulary size;
+  use the same prompt/template encoding and check both context capacities.
+  Draft and target may have different architectures. Start with a fixed small
+  proposal count, e.g. 2–4, and greedy generation only. Verify candidates with
+  target `decode` calls in the original sequential order; never feed a rejected
+  candidate to this target baseline. Recover draft by reset plus sequential
+  prefix replay. This validates acceptance, pending-token and lifetime logic,
+  but is explicitly not a speedup. Keep the normal target-only path available.
+- [ ] **S1 — Add bounded all-position verification and append-cache rollback.**
+  Introduce a proposed `engine_verify_rows` API that consumes n token IDs and
+  returns n FP32 vocabulary rows, with explicit output capacity and checked
+  sizes. Apply final norm and LM head to every input row, respecting `max_chunk`;
+  keep ordinary prefill/decode final-row behavior intact. Start with the small
+  window's bounded `[n,V]` host result and existing Haskell argmax semantics;
+  tiled output or GPU top-1 is a later measured extension, not an implicit FFI
+  contract change. Add append-only cache truncation restricted to the current
+  sequence and an available prefix. Initially admit pure full-attention targets
+  and drafts; MLA needs its own admission, and any GDN model waits for S2.
+- [ ] **S2 — Add hybrid state checkpoints and restore/replay.** Introduce
+  opaque, engine-owned checkpoint handles and explicit save/restore/release
+  operations; at most one round checkpoint per engine initially. Save all GDN
+  conv/SSM buffers on every owning device, plus sequence length, engine/reset
+  generation and weight/policy identity. KV/MLA entries before the checkpoint
+  are immutable, so their logical length suffices under the current append-only
+  cache design. `reset_zero` is a cleanup registry, not by itself a rollback
+  protocol. On rejection restore the round-start state, then replay exactly the
+  retained inputs in the admitted execution case. A single final SSM state
+  cannot be inverted into an intermediate one, and one pre-round snapshot does
+  not make acceptance-prefix restoration O(1). Restore draft state too.
+- [ ] **S3 — Admit acceleration only after cross-case and continuation gates.**
+  Compare every target verification row against serial execution with identical
+  prefixes, including nearly tied logits; compare retained cache/state and
+  several subsequent decode steps after each rejection. Stage 2 already warns
+  that chunked and recurrent execution differ. Exact speculative decoding in
+  mathematical arithmetic does not establish exact parity with this finite-
+  precision serial engine. If the scoped greedy-equivalence gate fails, retain
+  S0 or narrow support/fix numerical alignment under Stage 6; do not hide changed
+  tokens behind a logit RMS tolerance or certify only near-tie positions without
+  a justified error bound. Quantized targets get their own target-only baseline.
+
+#### Round protocol and failure semantics
+
+Let both engines have consumed prefix P of length L, and let x be the already
+emitted, target-confirmed token that is still pending consumption. This invariant
+must hold at each nonterminal round boundary:
+
+1. Draft consumes x and its own proposals to produce `y1 ... yk`. Its ordinary
+   loop has consumed only through `y(k-1)`, not yk. Target verifies the inputs
+   `[x, y1, ..., yk]` in a single bounded batch. With zero-based output rows,
+   row 0 predicts y1, row i predicts `y(i+1)`, and row k predicts the bonus token.
+2. Accept the longest prefix of r proposals whose IDs match the corresponding
+   target argmax. If r<k, correction is `argmax(row r)`; if r=k, bonus is
+   `argmax(row k)`. Stop checking at the first rejection; later rows condition
+   on a rejected token and are unusable as continued generation.
+3. Retain exactly `P + [x] + y[1:r]`, length `L+1+r`, in both engines. Truncate
+   append-only caches; for a rejected GDN round restore and replay those inputs.
+   On full acceptance draft must additionally consume its missing yk before
+   the next round. The correction/bonus becomes the new unconsumed pending
+   token. Do not pre-consume it and then accidentally decode it twice.
+4. Emit only target-confirmed tokens, in order, stopping at the first confirmed
+   EOS; no later speculative token may enter the text decoder. EOS terminates
+   the round without a bonus or continuation. Nonpositive budget performs no
+   engine work, and the first prefill token still counts toward the budget.
+   For the initial protocol choose k so `k+1` fits remaining output budget,
+   both engines' available context and the target's `max_chunk`; with only one
+   output slot left, use one normal target step rather than overproducing a
+   batch. If context capacity or `max_chunk` leaves no positive legal k but
+   target decoding is still possible, finish target-only from its current
+   committed prefix without further draft calls. If the target cannot consume
+   the pending token, propagate the existing sequence-capacity error rather
+   than silently truncating a successful response. Assert consumed versus
+   emitted lengths explicitly in tests.
+
+Checkpoints are valid only for their originating engine, sequence generation,
+weight version and numerical policy; disallow nesting, cross-engine restore,
+reuse after reset and truncation before the retained prefix. Save/restore/copy
+must finish on all relevant streams before reporting success or releasing
+buffers. Validation errors leave state unchanged. A failed device forward may
+have partially mutated state: retain the current invalid-state/reset requirement
+unless a complete, tested restoration succeeds; do not merely set `state_valid`.
+Failure, cancellation or second-model initialization failure cleans up both
+runtimes/checkpoints without swallowing the error or freeing in-flight memory.
+Keep calls on the owning bound OS thread; two engines do not justify concurrent
+access to either engine. Streaming cannot retract already confirmed text, but
+must never expose unverified proposals or report a failed request as success.
+
+**S gates:** extend the CPU scripted engine to distinguish two handles and
+inspect their consumed histories; test k=1, full acceptance, rejection at every
+position, repeated rejection, lowest-ID ties, first/accepted/correction/bonus
+EOS, budgets 0/1/window boundaries, capacity exhaustion and UTF-8 streaming.
+GPU tests cover nonzero GDN initial state, snapshot/reset lifetime, invalid
+handles, failure injection, multi-device ownership, cache lengths crossing
+64/128, and several rounds after rollback. Test target-only versus speculative
+output independently from snapshot-copy exactness and cross-case state error.
+If only a finite fixture set passes, report that scope rather than universal
+bitwise invariance.
+
+**S performance gate:** measure draft generation, target verification including
+all-row LM head/D2H, draft catch-up, snapshot copies, rejection replay and host
+orchestration separately. For each round compare their total time with serial
+target time for the same number of newly committed tokens, then measure complete
+requests. Report acceptance histogram, useful tokens per verification, TTFT,
+inter-token latency/tail latency, useful tokens/s and peak per-device memory.
+Select a fixed k from measured results before considering adaptive windows;
+low acceptance or expensive GDN replay may make the method slower. Shared GPU
+resources and the draft's weights/cache are part of the cost, not free work.
+
+#### Later sampling and training/rollout integration
+
+Ordinary temperature sampling is specified in T0–T4 and need not wait for this
+extension. Greedy acceptance is not stochastic speculative sampling. A later
+stochastic speculative path must define target p and draft q after their
+declared sampling transforms, accept with `min(1, p(y)/q(y))`, and on rejection
+sample from normalized `max(p-q,0)` under the same prefix, with support/zero-mass handling and separate
+RNG streams. This needs distributions, not just greedy IDs or selected logits.
+Validate frequencies against target-only sampling on toy distributions; different
+RNG consumption does not promise the same sequence for the same seed.
+
+For RL, log the actual emitted target-policy/sampler logprob, not the draft
+proposal probability or acceptance probability, and retain both model identities
+for replay. Quantizing the target changes the behavior policy even if it derives
+from the learner's checkpoint: it is not a deployment-only identity change or
+proof of on-policy BF16 rollout. Greedy decoding itself cannot substitute for
+Stage 5's stochastic behavior-policy baseline. Quantized actor artifacts must
+be fully converted, packed and published under an immutable version before use;
+account for conversion time and never refresh scales in a live response/group.
+Fusion intended for training still needs paired backward admission; this track
+does not implicitly add QAT or low-bit backward.
+
+### Combined validation and implementation checkpoints
+
+Each F/Q/S milestone starts with a failing fixture for its new contract, then
+the smallest implementation, targeted tests and full affected-path regression.
+Keep the same checkpoint, prompt set, placement, clocks/runtime provenance and
+measurement method for baseline comparisons; state any unavoidable difference.
+Test fusion-only, quantization-only and speculation-only before combinations,
+then re-run numerical/state/quality gates for each combined policy. Individual
+speedups do not multiply automatically, especially when quantization reduces the
+target-only latency that speculation is trying to amortize.
+
+Existing regression entry points, to run after implementation in a configured
+CUDA environment (not executed by this documentation change):
+
+```bash
+ctest --test-dir csrc/build-libs --output-on-failure
+cabal test infer-tests infer-generation-tests --enable-tests
+python tests/test_engine.py --library csrc/build-libs/libengine.so \
+  --desc "$DESC" --model-dir "$MODEL_DIR" --reference "$REFERENCE" \
+  --rms-tolerance "$RMS_TOLERANCE" --devices "$DEVICES"
+```
+
+Set the descriptor/reference/tolerance for the actual family; existing reference
+and legacy-capture checks remain BF16 gates. Register `test_quant_gemm` in CTest
+and give the proposed quantization/speculation runners explicit artifact and
+policy inputs rather than reusing a BF16 reference with looser flags. Add a
+reproducible inference benchmark entry point (`tests/benchmark_inference.py`)
+for the F0/Q/S metrics; record repeated warm runs and dispersion, not only the
+best timing. These future tests/benchmark are not evidence until implemented
+and run. Do not advertise an optimization by default until its supported
+family/shape/placement matrix and quality/resource/performance gates pass.
+
 ## Memory and target selection
 
 All model-state numbers below use decimal GB and the same illustrative AdamW
@@ -629,6 +1307,25 @@ PP assigns layers by count, not training-memory balance. For choice B, the learn
 must fit on its own device and the actor must fit its active/staging copies and
 cache on its device. If staging does not fit, stop/drain before replacing the
 actor snapshot and count the lost overlap.
+
+Sampling and inference optimizations add their own phase budget rather than
+changing the 16-byte training-state assumption:
+
+- Temperature sampling: existing host FP32 logits plus per-row binary64
+  weights/CDF scratch and PRNG state. Measure boxed-list/GC overhead; do not
+  retain a vocabulary-sized buffer for every generated token merely to record
+  the selected token's two logprobs.
+- Fusion: packed projection storage and temporary load-time copies, plus any
+  saved rounded intermediates required if the fused path later becomes trainable.
+- Quantization: packed weights, scales, excluded BF16 roles, backend workspace
+  and peak converter/loading memory; W4 inference does not shrink FP32 master
+  weights or AdamW slots in the proposed full-parameter trainer.
+- Speculation: both models' weights, caches and scratch, target verification
+  logits (`4*(k+1)*vocab_size` bytes for an FP32 host or device matrix), and
+  checkpoints for each hybrid model. One GDN checkpoint stores, per local layer,
+  `2*conv_dim*(conv_kernel-1) + 4*num_v_heads*head_dim*head_dim` bytes, plus
+  metadata; multiply by the actual per-device layer/replica ownership. Count
+  both host and device logits and replay workspace, not just compressed KV.
 
 PPO's critic adds trainable states; reference/teacher/reward models add frozen
 weights and forward workspace. Verifiable rewards need no reward model. OPD is
@@ -685,6 +1382,14 @@ Before positive-lag async experiments, resolve:
   policy switching, arbitrary replay buffer or combined TP+EP in the first trainer.
 - GSPO is included with a precise synchronous objective. Async RL is a staged
   proposal, not a declaration that stale-policy GSPO is solved.
+- Ordinary temperature sampling is a separate T0–T4 migration: planned default
+  T=1 with explicit greedy T=0, without top-k/top-p, GPU sampling or stochastic
+  speculation. Seed replay, distributional correctness and model quality are
+  separate claims. This plan does not change today's greedy implementation.
+- Fusion, W4A16 and greedy speculative decoding are independent inference
+  proposals, not implemented features or prerequisites for SFT. Their first
+  admissions exclude quantized training/KV state and stochastic speculation;
+  exactness and quality are separate gates, and combined policies need re-testing.
 - No guaranteed reward improvement, universal determinism, zero-copy concurrent
   weights or speedup. Report results separately for fixed-step quality, wall-clock
   efficiency, numerical agreement and resource use.

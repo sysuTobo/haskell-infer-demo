@@ -3,16 +3,24 @@
 A running snapshot of what this project can do today, what has been verified and
 where it is knowingly incomplete. [README.md](../README.md) describes the
 component layout and how to build and test; [design.md](design.md) holds the
-architecture rationale; [plan-numeric-contract.md](plan-numeric-contract.md) is
-the proposal for the trainer, RL and inference-optimization work that is **not**
-implemented here.
+architecture rationale; [plan-numeric-contract.md](plan-numeric-contract.md) is the
+proposal for the trainer, RL and inference-optimization work — of which only
+**Stage 0 (the execution manifest and capture provenance) is implemented here**, as
+described below and specified in [manifest-contract.md](manifest-contract.md).
 
 Last updated: 2026-09-25.
 
-## Verified today
+## Verified
 
 Everything below was run and passed on 2× A40 46 GB (sm_86) unless a line says
 otherwise. No GPU result here is implied by a document edit alone.
+
+The manifest, ctest, cargo and cabal rows, the golden capture and the two
+capture-comparison rows were run on 2026-09-25. The `test_engine.py`,
+`test_longseq.py` and `test_tp.py` rows were last run on 2026-09-24: the forward
+arithmetic they exercise was re-confirmed bitwise identical on 2026-09-25 by the
+golden-capture row below, but those three suites were not re-executed in that
+session.
 
 | Gate | Result |
 |---|---|

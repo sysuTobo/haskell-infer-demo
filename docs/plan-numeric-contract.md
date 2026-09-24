@@ -130,6 +130,23 @@ training or asynchronous-RL work.
 
 ### Stage 0 — Versioned contract and capture provenance
 
+**Status: implemented and verified, 2026-09-25.** The manifest, its canonical
+encoding, the field ownership and projection rules and the comparison modes are
+specified in [manifest-contract.md](manifest-contract.md); [worklog.md](worklog.md)
+records the gates. The gate below is met:
+
+- canonical round-trip and hash tests run without a GPU (`ctest test_manifest`,
+  `ctest test_manifest_hashes`, `tests/ManifestSpec.hs`), and the identity matrix
+  requires a semantic or numerical change to move the matching id only, a
+  placement-only change to move `deployment_id` only (and to need a declared scope
+  before it is admitted), and a provenance or weight change to move no identity;
+- missing, mismatched or unestablished provenance fails strict admission; the
+  engine's own document reports an unknown fact as such instead of defaulting it;
+- on the real 27B the pre-refactor golden still passes the legacy numeric gate
+  (bitwise identical) alongside a fresh strict comparison of two independent
+  captures (`admitted`), and a manifest-less capture yields `legacy/unverified`
+  rather than a pass.
+
 Keep the architecture descriptor portable. Add a separate versioned execution
 manifest/query rather than injecting runtime GPU facts into committed family
 snapshots. It references the canonical descriptor and is resolved from actual

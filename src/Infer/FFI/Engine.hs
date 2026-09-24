@@ -26,6 +26,8 @@ module Infer.FFI.Engine
   , engineSeqLen
   , engineDescVersion
   , engineDescribe
+  , engineManifestVersion
+  , engineManifest
     -- * Errors
   , engineLastError
     -- * Hello-world (Phase 1)
@@ -74,6 +76,12 @@ foreign import ccall unsafe "engine.h engine_desc_version"
 
 foreign import ccall unsafe "engine.h engine_describe"
   c_engine_describe :: Ptr EngineHandle -> CString -> CInt -> IO CInt
+
+foreign import ccall unsafe "engine.h engine_manifest_version"
+  c_engine_manifest_version :: IO CInt
+
+foreign import ccall unsafe "engine.h engine_manifest"
+  c_engine_manifest :: Ptr EngineHandle -> CString -> CInt -> IO CInt
 
 foreign import ccall unsafe "engine.h engine_last_error"
   c_engine_last_error :: IO CString
@@ -157,6 +165,26 @@ engineDescribe h =
 
 engineLastError :: IO String
 engineLastError = c_engine_last_error >>= peekCString
+
+-- | Execution-manifest wire version supported by the linked engine.
+engineManifestVersion :: IO Int
+engineManifestVersion = fromIntegral <$> c_engine_manifest_version
+
+-- | The canonical execution manifest for this engine: the three content
+-- identities, the parameter identity, the region bindings and the build/runtime
+-- provenance. The buffer is sized to ENGINE_MANIFEST_MAX; the engine refuses a
+-- manifest that does not fit instead of truncating one.
+engineManifest :: Ptr EngineHandle -> IO (Either String ByteString)
+engineManifest h =
+  allocaBytes bufSize $ \buf -> do
+    written <- c_engine_manifest h buf (fromIntegral bufSize)
+    if written < 0
+      then do
+        err <- engineLastError
+        return (Left err)
+      else Right <$> BSC.packCStringLen (buf, fromIntegral written)
+  where
+    bufSize = 256 * 1024
 
 -- | Phase 1 FFI verification: round-trip an integer through the GPU.
 engineHelloGpu :: Int -> Int -> IO Int

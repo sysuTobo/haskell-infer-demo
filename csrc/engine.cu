@@ -2,14 +2,18 @@
 #include "engine.h"
 #include "kernels.h"
 #include "layers.h"
+#include "manifest.h"
 #include "model_desc.h"
 #include "moe.h"
+#include "sha256.h"
 #include "flashinfer_ops.h"
 #include "fla_ops.h"
+#include "build_info.h"
 
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <new>
@@ -260,6 +264,12 @@ struct EngineHandle {
                                         // when replicated (layer-major)
     int seq_len = 0;
     bool state_valid = true;
+    /* Execution manifest inputs that are facts about *this* load: the canonical
+     * descriptor digest (the descriptor itself stays portable) and the immutable
+     * parameter identity, both computed once at create. */
+    manifest_hex_t desc_sha256{};
+    long long desc_bytes = 0;
+    struct ManifestWeights weights{};
     /* Debug taps: INFER_TAP_LAYERS / INFER_TAP_DIR, see tap.cu. */
     TapConfig taps;
 };
@@ -624,6 +634,181 @@ static void fill_local_dims(ModelDims &dims, const ModelDims &global, int tp) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Execution manifest inputs                                          */
+/* ------------------------------------------------------------------ */
+
+/* Last path component, so the shard-set identity does not depend on where the
+ * checkpoint happens to be mounted. */
+static std::string path_basename(const std::string &path) {
+    const size_t slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+/* The immutable parameter identity: for every tensor in sorted name order (the
+ * index is a std::map, so iteration is by name) its name, dtype, shape and byte
+ * count, plus the set of shard basenames. Cheap enough to compute at load. The
+ * raw-content hash is deliberately *not* computed here: hashing a 50 GiB
+ * checkpoint is minutes of I/O, and a caller that wants it has to ask. */
+static void compute_weights_identity(const std::map<std::string, TensorInfo> &index,
+                                     struct ManifestWeights *out) {
+    std::memset(out, 0, sizeof(*out));
+    struct sha256_ctx ctx;
+    sha256_init(&ctx);
+    std::vector<std::string> shards;
+    char line[1024];
+    for (std::map<std::string, TensorInfo>::const_iterator it = index.begin();
+         it != index.end(); ++it) {
+        const TensorInfo &ti = it->second;
+        int used = snprintf(line, sizeof(line), "%s|%d|", ti.name.c_str(), ti.dtype);
+        for (int d = 0; d < ti.ndim && used > 0 && used < (int)sizeof(line); ++d)
+            used += snprintf(line + used, sizeof(line) - (size_t)used, "%lld,",
+                             (long long)ti.shape[d]);
+        const int tail = snprintf(line + (used > 0 ? used : 0),
+                                  sizeof(line) - (size_t)(used > 0 ? used : 0), "|%lld\n",
+                                  (long long)ti.data_bytes());
+        if (used <= 0 || tail <= 0 || used + tail >= (int)sizeof(line)) {
+            /* A name that cannot be represented canonically must not be silently
+             * truncated into someone else's identity. */
+            out->parameter_manifest_sha256[0] = '\0';
+            return;
+        }
+        sha256_update(&ctx, line, (size_t)(used + tail));
+        const std::string base = path_basename(ti.file_path);
+        if (std::find(shards.begin(), shards.end(), base) == shards.end())
+            shards.push_back(base);
+    }
+    unsigned char digest[32];
+    sha256_final(&ctx, digest);
+    sha256_to_hex(digest, out->parameter_manifest_sha256);
+    std::sort(shards.begin(), shards.end());
+    struct sha256_ctx shard_ctx;
+    sha256_init(&shard_ctx);
+    for (size_t i = 0; i < shards.size(); ++i) {
+        sha256_update(&shard_ctx, shards[i].c_str(), shards[i].size());
+        sha256_update(&shard_ctx, "\n", 1);
+    }
+    sha256_final(&shard_ctx, digest);
+    sha256_to_hex(digest, out->shards_sha256);
+    out->tensor_count = (long long)index.size();
+    out->content_hash_present = 0;
+    out->content_sha256[0] = '\0';
+}
+
+/* Does a ';'-separated target list contain @sm@ as SASS (want_virtual 0) or as
+ * PTX (want_virtual 1)? "90a" counts as 90 and "90-virtual" as PTX for 90. */
+static int arch_list_has(const char *list, int sm, int want_virtual) {
+    const char *cursor = list;
+    while (cursor != NULL && *cursor != '\0') {
+        const char *end = strchr(cursor, ';');
+        const size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+        char entry[32];
+        if (len > 0 && len < sizeof(entry)) {
+            std::memcpy(entry, cursor, len);
+            entry[len] = '\0';
+            const int is_virtual = strstr(entry, "virtual") != NULL;
+            if (atoi(entry) == sm && is_virtual == (want_virtual != 0)) return 1;
+        }
+        if (end == NULL) break;
+        cursor = end + 1;
+    }
+    return 0;
+}
+
+/* The build facts come from the header the build step generated, not from a
+ * caller-supplied label (csrc/gen_build_info.cmake). */
+static void fill_build_info(struct ManifestBuildInfo *out) {
+    std::memset(out, 0, sizeof(*out));
+    snprintf(out->engine_version, sizeof(out->engine_version), "%s", ENGINE_BUILD_ENGINE_VERSION);
+    snprintf(out->git_commit, sizeof(out->git_commit), "%s", ENGINE_BUILD_GIT_COMMIT);
+    snprintf(out->cuda_toolkit, sizeof(out->cuda_toolkit), "%s", ENGINE_BUILD_CUDA_TOOLKIT);
+    snprintf(out->cuda_archs, sizeof(out->cuda_archs), "%s", ENGINE_BUILD_CUDA_ARCHS);
+    snprintf(out->triton_archs, sizeof(out->triton_archs), "%s", ENGINE_BUILD_TRITON_ARCHS);
+    snprintf(out->triton_version, sizeof(out->triton_version), "%s", ENGINE_BUILD_TRITON_VERSION);
+    snprintf(out->fla_version, sizeof(out->fla_version), "%s", ENGINE_BUILD_FLA_VERSION);
+    snprintf(out->flashinfer_header_sha256, sizeof(out->flashinfer_header_sha256), "%s",
+             ENGINE_BUILD_FLASHINFER_HEADER_SHA256);
+    snprintf(out->nvcc_flags_sha256, sizeof(out->nvcc_flags_sha256), "%s",
+             ENGINE_BUILD_NVCC_FLAGS_SHA256);
+    snprintf(out->generated_kernels_sha256, sizeof(out->generated_kernels_sha256), "%s",
+             ENGINE_BUILD_GENERATED_KERNELS_SHA256);
+}
+
+/* The runtime device facts. kernel_path and triton_cubin_arch are the *selection
+ * rule* applied to the build's target lists, because which binary the driver
+ * actually launched is not queryable per kernel; the field names say "selected"
+ * for that reason. */
+static void fill_runtime_devices(const EngineHandle *eng, struct ManifestDevice *out) {
+    for (int d = 0; d < eng->num_devices; ++d) {
+        std::memset(&out[d], 0, sizeof(out[d]));
+        out[d].cuda_ordinal = eng->devices[d];
+        int sm = 0;
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, eng->devices[d]) == cudaSuccess) {
+            snprintf(out[d].name, sizeof(out[d].name), "%s", prop.name);
+            snprintf(out[d].compute_capability, sizeof(out[d].compute_capability), "%d.%d",
+                     prop.major, prop.minor);
+            snprintf(out[d].uuid, sizeof(out[d].uuid),
+                     "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                     prop.uuid.bytes[0], prop.uuid.bytes[1], prop.uuid.bytes[2],
+                     prop.uuid.bytes[3], prop.uuid.bytes[4], prop.uuid.bytes[5],
+                     prop.uuid.bytes[6], prop.uuid.bytes[7], prop.uuid.bytes[8],
+                     prop.uuid.bytes[9], prop.uuid.bytes[10], prop.uuid.bytes[11],
+                     prop.uuid.bytes[12], prop.uuid.bytes[13], prop.uuid.bytes[14],
+                     prop.uuid.bytes[15]);
+            sm = prop.major * 10 + prop.minor;
+        } else {
+            snprintf(out[d].name, sizeof(out[d].name), "%s", MANIFEST_UNAVAILABLE);
+            snprintf(out[d].compute_capability, sizeof(out[d].compute_capability), "%s",
+                     MANIFEST_UNAVAILABLE);
+            snprintf(out[d].uuid, sizeof(out[d].uuid), "%s", MANIFEST_UNAVAILABLE);
+        }
+        if (sm <= 0) {
+            snprintf(out[d].kernel_path, sizeof(out[d].kernel_path), "%s", MANIFEST_UNAVAILABLE);
+            snprintf(out[d].triton_cubin_arch, sizeof(out[d].triton_cubin_arch), "%s",
+                     MANIFEST_UNAVAILABLE);
+        } else {
+            const char *path = arch_list_has(ENGINE_BUILD_CUDA_ARCHS, sm, 0) ? "sass"
+                             : arch_list_has(ENGINE_BUILD_CUDA_ARCHS, 90, 1) && sm >= 90
+                                   ? "ptx-jit"
+                                   : MANIFEST_UNSUPPORTED;
+            snprintf(out[d].kernel_path, sizeof(out[d].kernel_path), "%s", path);
+            if (arch_list_has(ENGINE_BUILD_TRITON_ARCHS, sm, 0))
+                snprintf(out[d].triton_cubin_arch, sizeof(out[d].triton_cubin_arch), "%d", sm);
+            else
+                snprintf(out[d].triton_cubin_arch, sizeof(out[d].triton_cubin_arch), "%s",
+                         MANIFEST_UNSUPPORTED);
+        }
+    }
+}
+
+/* CUDA/cuBLAS report their version as major*1000+minor*10+patch; cuBLAS packs it
+ * as major*10000+minor*100+patch. An unavailable query is reported as such
+ * rather than as a zero version. */
+static void format_version_1000(int version, char *out, size_t out_len) {
+    snprintf(out, out_len, "%d.%d.%d", version / 1000, (version % 1000) / 10, version % 10);
+}
+
+static void fill_runtime_versions(cublasHandle_t cublas_handle, char *runtime,
+                                  size_t runtime_len, char *driver, size_t driver_len,
+                                  char *cublas, size_t cublas_len) {
+    int version = 0;
+    if (cudaRuntimeGetVersion(&version) == cudaSuccess)
+        format_version_1000(version, runtime, runtime_len);
+    else
+        snprintf(runtime, runtime_len, "%s", MANIFEST_UNAVAILABLE);
+    if (cudaDriverGetVersion(&version) == cudaSuccess)
+        format_version_1000(version, driver, driver_len);
+    else
+        snprintf(driver, driver_len, "%s", MANIFEST_UNAVAILABLE);
+    if (cublas_handle != nullptr && cublasGetVersion(cublas_handle, &version) ==
+                                        CUBLAS_STATUS_SUCCESS && version > 0)
+        snprintf(cublas, cublas_len, "%d.%d.%d", version / 10000, (version % 10000) / 100,
+                 version % 100);
+    else
+        snprintf(cublas, cublas_len, "%s", MANIFEST_UNAVAILABLE);
+}
+
 EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                             int num_devices, const int *devices,
                             const int *layer_devices) {
@@ -644,6 +829,23 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                               std::string("Unsupported descriptor: ") + desc_error);
         fill_dims(eng->dims, eng->desc);
         eng->num_layers = eng->desc.num_layers;
+
+        /* The canonical descriptor digest is what the manifest references. It is
+         * taken from the canonical echo, not from the caller's wire text, so two
+         * spellings of the same descriptor share one identity. */
+        {
+            char *desc_text = (char *)::malloc(ENGINE_MANIFEST_MAX);
+            if (desc_text == nullptr)
+                throw EngineError(ENGINE_ERR_ALLOC, "Cannot allocate the descriptor buffer");
+            const int formatted = model_desc_format(&eng->desc, desc_text, ENGINE_MANIFEST_MAX);
+            if (formatted < 0) {
+                ::free(desc_text);
+                throw EngineError(ENGINE_ERR_CONFIG, "Cannot format the descriptor canonically");
+            }
+            eng->desc_bytes = formatted;
+            sha256_hex(desc_text, (size_t)formatted, eng->desc_sha256);
+            ::free(desc_text);
+        }
 
         int device_count = 0;
         check_cuda(cudaGetDeviceCount(&device_count), "Get device count");
@@ -726,6 +928,7 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                               std::string("Cannot read weights from ") + model_dir + ": " +
                                   safetensors_last_error());
         fprintf(stderr, "[engine] Scanned %zu tensors from %s\n", index.size(), model_dir);
+        compute_weights_identity(index, &eng->weights);
 
         const int hidden = eng->dims.hidden_size;
         eng->ctx = new DeviceCtx[eng->num_devices]();
@@ -946,6 +1149,65 @@ int engine_describe(const EngineHandle *eng, char *buf, int buf_len) {
         return ENGINE_ERR_CONFIG;
     }
     return model_desc_format(&eng->desc, buf, buf_len);
+}
+
+int engine_manifest_version(void) { return ENGINE_MANIFEST_VERSION; }
+
+int engine_manifest(const EngineHandle *eng, char *buf, int buf_len) {
+    if (!eng || !buf || buf_len <= 0) {
+        set_error("engine_manifest: invalid arguments");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (eng->num_devices <= 0 || (size_t)eng->num_devices > (size_t)ENGINE_MANIFEST_MAX_DEVICES) {
+        set_error("engine_manifest: the engine holds %d devices, the manifest covers at most %d",
+                  eng->num_devices, ENGINE_MANIFEST_MAX_DEVICES);
+        return ENGINE_ERR_CONFIG;
+    }
+
+    struct ManifestBuildInfo build;
+    fill_build_info(&build);
+    struct ManifestDevice devices[ENGINE_MANIFEST_MAX_DEVICES];
+    fill_runtime_devices(eng, devices);
+
+    char runtime_version[32], driver_version[32], cublas_version[32];
+    cublasHandle_t cublas_handle = eng->ctx != nullptr ? eng->ctx[0].cublas : nullptr;
+    fill_runtime_versions(cublas_handle, runtime_version, sizeof(runtime_version),
+                          driver_version, sizeof(driver_version), cublas_version,
+                          sizeof(cublas_version));
+
+    struct ManifestInputs in;
+    std::memset(&in, 0, sizeof(in));
+    in.desc = &eng->desc;
+    in.descriptor_sha256 = eng->desc_sha256;
+    in.descriptor_bytes = eng->desc_bytes;
+    in.build = &build;
+    in.cuda_runtime_version = runtime_version;
+    in.cuda_driver_version = driver_version;
+    in.cublas_version = cublas_version;
+    in.devices = devices;
+    in.device_count = eng->num_devices;
+    in.weights = &eng->weights;
+    in.replicated = eng->replicated ? 1 : 0;
+    in.ep_size = eng->ep_size;
+    in.declared_tp_rank = eng->desc.tp_rank;
+    in.declared_ep_rank = eng->desc.ep_rank;
+    in.device_ordinals = eng->devices.data();
+    in.layer_device = eng->layer_device.empty() ? nullptr : eng->layer_device.data();
+    in.num_layers = eng->num_layers;
+    in.regions = nullptr;      /* the committed registry */
+    in.region_count = 0;
+    in.sampling = manifest_default_sampling();
+
+    const int written = manifest_format(&in, buf, buf_len);
+    if (written == -2) {
+        set_error("engine_manifest: the manifest needs more than %d bytes", buf_len);
+        return ENGINE_ERR_CONFIG;
+    }
+    if (written < 0) {
+        set_error("engine_manifest: cannot format the execution manifest");
+        return ENGINE_ERR_CONFIG;
+    }
+    return written;
 }
 
 static __nv_bfloat16 *move_activation(EngineHandle *eng, int from, int to, int tokens) {

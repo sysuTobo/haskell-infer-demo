@@ -112,6 +112,10 @@ static int key_id(const char *name) {
 static const char *kShardNames[] = {"none", "out_heads", "out_dim", "in_dim", "out_experts"};
 #define SHARD_KIND_COUNT ((int)(sizeof(kShardNames) / sizeof(kShardNames[0])))
 
+/* Mixer and feed-forward kinds, in enum order. */
+static const char *kMixerNames[] = {"full_attn", "gdn", "mla"};
+static const char *kFfnNames[] = {"dense", "moe"};
+
 /* Role names, in the same order as the Haskell Role enum. */
 static const char *kRoleNames[ROLE_COUNT] = {
     "embed", "lmHead", "finalNorm", "inputNorm", "postNorm",
@@ -1036,20 +1040,20 @@ int model_desc_format(const struct ModelDesc *d, char *buf, int buf_len) {
     if (append(buf, buf_len, &used, "],") != 0) return -1;
     if (append(buf, buf_len, &used, "\"layer_mixers\":[") != 0) return -1;
     for (int i = 0; i < d->num_layers; ++i) {
-        const char *name = d->layer_mixers[i] == ENGINE_MIXER_FULL_ATTN ? "full_attn"
-                         : d->layer_mixers[i] == ENGINE_MIXER_GDN ? "gdn" : "mla";
+        const char *name = model_desc_mixer_name(d->layer_mixers[i]);
         if (append(buf, buf_len, &used, "%s\"%s\"", i ? "," : "", name) != 0) return -1;
     }
     if (append(buf, buf_len, &used, "],") != 0) return -1;
     if (append(buf, buf_len, &used, "\"layer_ffns\":[") != 0) return -1;
     for (int i = 0; i < d->num_layers; ++i) {
-        const char *name = d->layer_ffns[i] == ENGINE_FFN_DENSE ? "dense" : "moe";
+        const char *name = model_desc_ffn_name(d->layer_ffns[i]);
         if (append(buf, buf_len, &used, "%s\"%s\"", i ? "," : "", name) != 0) return -1;
     }
     if (append(buf, buf_len, &used, "],") != 0) return -1;
     if (append(buf, buf_len, &used, "\"role_names\":[") != 0) return -1;
     for (int i = 0; i < d->role_count; ++i) {
-        if (append(buf, buf_len, &used, "%s\"%s\"", i ? "," : "", kRoleNames[d->role_ids[i]]) != 0) return -1;
+        if (append(buf, buf_len, &used, "%s\"%s\"", i ? "," : "",
+                   model_desc_role_name(d->role_ids[i])) != 0) return -1;
     }
     if (append(buf, buf_len, &used, "],") != 0) return -1;
     if (append(buf, buf_len, &used, "\"role_templates\":[") != 0) return -1;
@@ -1060,10 +1064,30 @@ int model_desc_format(const struct ModelDesc *d, char *buf, int buf_len) {
     if (append(buf, buf_len, &used, "\"role_shards\":[") != 0) return -1;
     for (int i = 0; i < d->role_shard_count; ++i) {
         if (append(buf, buf_len, &used, "%s\"%s\"", i ? "," : "",
-                   kShardNames[d->role_shards[i]]) != 0) return -1;
+                   model_desc_shard_name(d->role_shards[i])) != 0) return -1;
     }
     if (append(buf, buf_len, &used, "]}") != 0) return -1;
     return used;
+}
+
+const char *model_desc_mixer_name(int kind) {
+    if (kind < 0 || kind >= (int)(sizeof(kMixerNames) / sizeof(kMixerNames[0]))) return NULL;
+    return kMixerNames[kind];
+}
+
+const char *model_desc_ffn_name(int kind) {
+    if (kind < 0 || kind >= (int)(sizeof(kFfnNames) / sizeof(kFfnNames[0]))) return NULL;
+    return kFfnNames[kind];
+}
+
+const char *model_desc_role_name(int role) {
+    if (role < 0 || role >= ROLE_COUNT) return NULL;
+    return kRoleNames[role];
+}
+
+const char *model_desc_shard_name(int rule) {
+    if (rule < 0 || rule >= SHARD_KIND_COUNT) return NULL;
+    return kShardNames[rule];
 }
 
 void model_desc_expand(const char *templ, int layer, int expert, char *out, size_t out_len) {

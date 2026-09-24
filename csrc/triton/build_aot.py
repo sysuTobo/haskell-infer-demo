@@ -195,6 +195,11 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     (output / "aot_kernels.h").write_text("".join(declarations))
     (output / "aot_kernels.cpp").write_text("\n".join(sources))
+    # Record the versions this build step actually asserted, next to the kernels
+    # it generated. The execution manifest reads this file rather than a
+    # caller-supplied label, so its Triton/FLA provenance comes from the build.
+    (output / "aot_versions.txt").write_text(
+        f"triton={triton.__version__}\nfla={importlib.metadata.version('fla-core')}\n")
 
 
 if __name__ == "__main__":

@@ -133,6 +133,27 @@ committed snapshot; the C engine stays family-agnostic. `--descriptor FILE` work
 for `generate` too, and `--check-descriptor` makes the engine echo back the
 descriptor it parsed and fails the run if the two sides disagree.
 
+### Execution manifest
+
+The descriptor is portable architecture; it carries no runtime facts and it mixes
+placement into its text. The **execution manifest** is the separate, versioned
+answer to *which numerical execution did this run observe*, as three content
+identities (`semantic_id`, `numerical_policy_id`, `deployment_id`) plus the
+build/runtime provenance and the immutable parameter identity a bitwise capture
+comparison has to agree on. Field ownership, the canonical encoding and the
+admission rules are specified in [docs/manifest-contract.md](docs/manifest-contract.md).
+
+```bash
+# Report the manifest for a model, device set and placement
+cabal run haskell-infer-demo -- manifest --model-dir "$MODEL_DIR" --gpus 0,1 --check --write /tmp/m.json
+# Admit or reject a comparison of two captures' manifests
+cabal run haskell-infer-demo -- manifest-compare old.json new.json [--mode strict|diagnostic] [--deployment-scoped]
+```
+
+An unestablished fact (an unknown toolkit version, an unavailable cuBLAS query, an
+unspecified sampling policy) is reported as such and makes a strict comparison
+refuse — it is never defaulted into looking comparable.
+
 Placement is chosen on the command line: the default is the layer-wise split over
 `--gpus`, `--tp N` switches to replicated tensor parallel (every device holds the
 whole model with its weight shards) and `--ep N` splits whole MoE experts across
@@ -159,11 +180,17 @@ equal highest BF16 reference logits are treated as ties.
 
 ## Tests
 
-- `ctest --test-dir csrc/build-libs` runs two suites that need no GPU at all:
+- `ctest --test-dir csrc/build-libs` runs four suites that need no GPU at all:
   `test_model_desc` (descriptor parsing, structural validation, the
   engine-capability gate for the AOT GDN layout, canonical echo and the tp-role
-  coverage rule) and `test_safetensors` (malformed headers, offsets, shapes and
-  dtypes, higher-rank tensors, row/slice capacity arithmetic). The rest of ctest
+  coverage rule), `test_safetensors` (malformed headers, offsets, shapes and
+  dtypes, higher-rank tensors, row/slice capacity arithmetic), `test_manifest`
+  (SHA-256 against the FIPS vectors, canonical format determinism, and the
+  identity matrix: a semantic or numerical change moves the matching id only, a
+  deployment-only change moves `deployment_id` only, a provenance or weight change
+  moves no identity) and `test_manifest_hashes`, which re-derives every digest from
+  the emitted document with `hashlib` so the emitter cannot certify itself. The
+  rest of ctest
   needs a GPU: `test_engine_resources` (repeated failing initializations leave no
   handle and no device memory; skips itself when no device is visible),
   `test_collective` (event-ordered copies and the cross-device all-reduce on 2
@@ -183,10 +210,18 @@ equal highest BF16 reference logits are treated as ties.
   against replicated tensor parallel (`--tp 2`) or expert parallel (`--ep 2`,
   with `--desc` and the MoE model), requiring identical greedy tokens and a
   per-step logit RMS within `--rms-gate` (default 0.05).
-- `tests/capture_logits.py` — records greedy logits for fixed prompts and compares
-  two captures bitwise; the gate for refactors that must not change numerics. The
-  comparison also fails on non-finite captures and on a metadata mismatch
-  (prompt, descriptor, devices), since those make the two runs incomparable.
+- `tests/capture_logits.py` — records greedy logits for fixed prompts together
+  with the execution manifest the capture was taken under, and compares two
+  captures bitwise. The manifest decides the admission: identities and provenance
+  must agree (`strict`), a placement-only difference needs `--deployment-scoped`
+  and is reported as scoped, `--compare-mode diagnostic` reports a deliberate
+  difference without calling it a pass (exit 3), and a capture without a manifest
+  is legacy/unverified (exit 2) with its numeric arrays still comparable. The
+  numeric gate is unchanged: every array has to be bitwise identical, non-finite
+  values fail, and a manifest verdict never loosens it.
+- `tests/test_manifest_compare_cli.py` — drives the real executable's
+  `manifest-compare` over built manifests and checks the exit codes the contract
+  fixes (0 admitted, 1 rejected, 2 legacy/unverified, 3 diagnostic-only).
 - `cabal test all --enable-tests` — two suites, neither needing a GPU:
   `infer-tests` (descriptor round-trip, layer plan and placement; with
   `INFER_MODEL_DIR` set it also checks the adapter still reproduces
@@ -208,6 +243,9 @@ cabal run haskell-infer-demo -- hello-gpu --device 0 --value 42
 
 # Show model configuration (descriptor + placement; no weights needed)
 cabal run haskell-infer-demo -- show-config --descriptor descriptors/qwen38-27b.json
+
+# Report the execution manifest (identities + build/runtime provenance)
+cabal run haskell-infer-demo -- manifest --model-dir /path/to/model --gpus 0,1 --check
 
 # Generate text (requires model weights)
 cabal run haskell-infer-demo -- generate \
@@ -245,6 +283,7 @@ migrated from handwritten CUDA to FlashInfer + FLA + causal-conv1d.
 | 8 | End-to-end validation (27B logits, 433-token long sequence) | ✅ 20/20 argmax |
 | 9 | Descriptor-driven families (dense + MoE + Qwen3-Next + DeepSeek-V2 MLA), multi-arch SASS/PTX, placement policies (layer split, TP, EP) | ✅ verified on sm_86 (A40); sm_89 operator suite on L20 |
 | 10 | Resource safety and regression gates: buffer ownership at allocation, cross-device read-completion ordering, bounded safetensors parsing, tokenizer capacity/streaming protocol, generation budget/EOS/error semantics, MLA shared-memory bound, TP shard-coverage rule, FP32 expert-parallel merge | ✅ verified on sm_86 (A40): ctest 11/11, cargo 11/11, hspec 41 + 14, Qwen3.8 golden bitwise identical, TP2 rms ≤ 0.05 with identical tokens |
+| 11 | Execution manifest and capture provenance (plan Stage 0): content identities `semantic_id`/`numerical_policy_id`/`deployment_id` over canonical blocks, build-time provenance generation, parameter identity, region/case determinism registry, and strict/diagnostic/legacy capture comparison | ✅ CPU gates (ctest `test_manifest` + `test_manifest_hashes`, hspec manifest specs, CLI runner); engine query verified on sm_86 |
 
 Known gaps, stated rather than implied:
 

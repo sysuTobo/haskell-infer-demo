@@ -7,8 +7,14 @@ come from the engine itself.
 
 import ctypes
 import json
+import os
+import sys
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import manifest_check  # noqa: E402
 
 
 def bind(lib):
@@ -24,6 +30,11 @@ def bind(lib):
     lib.engine_prefill.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
     lib.engine_decode.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p]
     lib.engine_last_error.restype = ctypes.c_char_p
+    if hasattr(lib, "engine_manifest"):
+        lib.engine_manifest.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        lib.engine_manifest.restype = ctypes.c_int
+    if hasattr(lib, "engine_manifest_version"):
+        lib.engine_manifest_version.restype = ctypes.c_int
     if hasattr(lib, "engine_describe"):
         lib.engine_describe.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
         lib.engine_describe.restype = ctypes.c_int
@@ -72,3 +83,23 @@ def describe(lib, engine, capacity=64 * 1024):
     written = lib.engine_describe(engine, buf, capacity)
     assert written >= 0, lib.engine_last_error().decode()
     return json.loads(buf.value.decode())
+
+
+# ENGINE_MANIFEST_MAX: the engine refuses a manifest that does not fit rather than
+# truncating one, so the buffer is sized to the contract, not to a guess.
+MANIFEST_CAPACITY = 256 * 1024
+
+
+def manifest(lib, engine, capacity=MANIFEST_CAPACITY):
+    """The engine's canonical execution manifest, verified before it is used.
+
+    A capture must not record a manifest whose own digests do not re-derive in a
+    second implementation, so the verification happens here, at the boundary.
+    """
+    buf = ctypes.create_string_buffer(capacity)
+    written = lib.engine_manifest(engine, buf, capacity)
+    assert written >= 0, lib.engine_last_error().decode()
+    text = buf.raw[:written].decode("utf-8")
+    problems = manifest_check.verify(text)
+    assert not problems, "the engine's manifest does not verify: " + "; ".join(problems)
+    return text

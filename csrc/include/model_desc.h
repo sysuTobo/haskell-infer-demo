@@ -215,6 +215,14 @@ int model_desc_shard_view(const struct ModelDesc *desc, int role,
  * written (excluding the terminator) or -1 when the buffer is too small. */
 int model_desc_format(const struct ModelDesc *desc, char *buf, int buf_len);
 
+/* Canonical wire spellings for the mixer/ffn/role/shard vocabularies. They are
+ * shared by the parser, the echo and the execution manifest so the three cannot
+ * drift apart. Return NULL for a value outside the vocabulary. */
+const char *model_desc_mixer_name(int kind);
+const char *model_desc_ffn_name(int kind);
+const char *model_desc_role_name(int role);
+const char *model_desc_shard_name(int rule);
+
 /* Expand a role template: %d -> layer index, %e -> expert index. */
 void model_desc_expand(const char *templ, int layer, int expert, char *out, size_t out_len);
 

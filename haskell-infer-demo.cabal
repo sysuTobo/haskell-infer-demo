@@ -35,6 +35,7 @@ executable haskell-infer-demo
                       Infer.Placement
                       Infer.Runtime
                       Infer.Generation
+                      Infer.Manifest
                       Infer.Tokenizer
                       Infer.FFI.Engine
   build-depends:
@@ -83,6 +84,7 @@ test-suite infer-generation-tests
                       Infer.Placement
                       Infer.Runtime
                       Infer.Generation
+                      Infer.Manifest
                       Infer.Tokenizer
                       Infer.FFI.Engine
   build-depends:
@@ -111,11 +113,14 @@ test-suite infer-tests
                       Infer.Descriptor.Adapter.DeepseekV2
                       Infer.Descriptor.Adapter.Qwen3Next
                       Infer.Model
+                      Infer.Manifest
                       Infer.Placement
+                      ManifestSpec
   build-depends:
                       base
                     , aeson
                     , bytestring
+                    , containers
                     , directory
                     , scientific >=0.3
                     , text

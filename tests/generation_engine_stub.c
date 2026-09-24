@@ -163,6 +163,20 @@ int engine_describe(const EngineHandle *engine, char *buf, int buf_len) {
     return 0;
 }
 
+int engine_manifest_version(void) { return 1; }
+
+/* There is no execution to describe: the stub reports the manifest as
+ * unavailable rather than inventing identities a caller would then treat as a
+ * real capture. The generation loop never asks for one. */
+int engine_manifest(const EngineHandle *engine, char *buf, int buf_len) {
+    (void)engine;
+    (void)buf;
+    (void)buf_len;
+    snprintf(g_last_error, sizeof(g_last_error),
+             "engine_manifest: the generation stub has no execution manifest");
+    return ENGINE_ERR_CONFIG;
+}
+
 const char *engine_last_error(void) { return g_last_error; }
 
 int engine_hello_gpu(int device, int value) {

@@ -1,6 +1,9 @@
 # Plan: Numerical Execution Contract, Haskell Training, and Asynchronous RL
 
-Status: proposed, not implemented. Revised after the design review, 2026-09-23.
+Status: Stages 1–8 proposed, not implemented; **Stage 0 is implemented** (the
+versioned execution manifest and capture provenance, see
+[manifest-contract.md](manifest-contract.md) and [worklog.md](worklog.md)).
+Revised after the design review, 2026-09-23.
 Extends [design.md](design.md). This document separates current capabilities,
 proposed interfaces, measured observations and hypotheses requiring experiments.
 No GPU result is implied by this documentation revision.

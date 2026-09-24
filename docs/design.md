@@ -464,6 +464,61 @@ identity, sum gradients for tied embedding/LM-head roles (currently loaded into
 separate allocations), and refresh derived copies after every update before a
 new rollout version becomes visible. See the training-runtime stage in the plan.
 
+### Execution manifest and capture provenance
+
+The descriptor is portable architecture: it carries no runtime facts, and its text
+mixes placement into the architecture (`tp_size`/`ep_size`, the shard plan).
+Bitwise comparison needs a different object, so `engine_manifest` answers *which
+numerical execution did this run observe* as three separate content identities over
+canonical JSON blocks, plus the provenance a comparison has to agree on:
+
+- `semantic_id` — dimensions, layer/role semantics, the tied-role relations
+  (derived from identical role templates, so Qwen3-4B's `embed=lmHead` is recorded)
+  and the mathematical conventions;
+- `numerical_policy_id` — the region/case → implementation binding table with its
+  own digest, the effective constants (`effective_rms_eps`, `max_chunk`,
+  `fla_chunk_size`), dtype and rounding boundaries, the attention split-KV setting,
+  the GEMM algorithm policy (recorded as *unpinned*, not as a default) and the
+  cross-device collective;
+- `deployment_id` — placement, devices, the per-layer owner, the shard plan and the
+  allocation/transfer choices;
+- `weights.parameter_manifest_sha256` — the tensor index in sorted name order, an
+  identity separate from the architecture; the raw-content hash is reported as
+  `null` unless a caller pays the minutes of I/O for it, which is a different
+  statement from "the content differs";
+- provenance — the build facts (from a header the build step generates over its own
+  artefacts, never a caller-supplied label) and the runtime facts (CUDA/driver/
+  cuBLAS versions, per-device capability and UUID, and the kernel path the build's
+  target lists select for that capability).
+
+Constants that describe both the function and its realization are projected into
+both identities rather than omitted from one: the declared `rms_eps` is semantic,
+the FP32 value the kernels actually read is numerical. Enabling TP/EP moves the
+numerical policy as well as the placement, which is consistent with placement
+equivalence being gated on tokens plus an RMS band rather than bitwise equality. An
+unestablished fact is reported as `unknown`/`unavailable`/`unsupported`/
+`unspecified` and *refuses* strict admission: agreeing on an unknown is not
+establishing a fact.
+
+Comparison therefore has modes rather than a tolerance: strict (the identities, the
+parameter identity, the placement unless a scoped claim is declared, and the
+provenance all agree — and then the numeric arrays still have to be bitwise
+identical), diagnostic (a deliberate difference reported for attribution, never a
+contract pass) and legacy (a document without a manifest version stays numerically
+comparable with an explicit `legacy/unverified` result and no invented identity).
+The field ownership table, the projections and the region determinism registry are
+in [manifest-contract.md](manifest-contract.md).
+
+The canonical encoding is what makes the digests checkable by another
+implementation: keys sorted by byte value, no whitespace, integers bare,
+non-integer constants as decimal strings, printable ASCII only. `test_manifest`
+pins the identity matrix without a GPU, `test_manifest_hashes` re-derives every
+digest from the parsed document with `hashlib`, and the Haskell side parses the
+same documents (`tests/ManifestSpec.hs`, `haskell-infer-demo manifest-compare`).
+Two contract violations were caught this way by the engine's own document: a
+missing top-level `manifest_version` and a region flag emitted as an integer where
+the contract fixes a boolean.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:
@@ -492,7 +547,8 @@ stops at the first failure, so one command answers "is the tree green".
 | Resource safety | `ctest -R test_engine_resources` | repeated failing creations return no handle, explain the error and move no device memory; a valid checkpoint still builds afterwards |
 | Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set; configured `--rms-tolerance` (default 0.1, family-specific overrides) |
 | Chunking | same prompt, different prefill splits | top-1 equal, rms ≤ 5 (state-loss guard) |
-| Refactor | `tests/capture_logits.py --compare` | numeric arrays identical; caller must currently establish same-build/input provenance because metadata is skipped |
+| Manifest | `ctest -R test_manifest` (CPU, plus the Python re-derivation), `tests/ManifestSpec.hs` | canonical form re-serializes byte-for-byte in a second implementation; every digest re-derives; a semantic/numerical change moves its own id only, a deployment-only change moves `deployment_id` only, and an unestablished provenance value is refused rather than defaulted |
+| Refactor | `tests/capture_logits.py --compare` | numeric arrays bitwise identical in every mode; strict admission additionally requires matching identities and provenance, a placement-only difference needs `--deployment-scoped` and is reported as scoped, and a capture without a manifest reports `legacy/unverified` (exit 2) instead of a pass |
 | Long sequence | `tests/test_longseq.py` | chunk-split self-consistency + no repetition collapse |
 
 We do not require bit-exact match with PyTorch. BF16 reassociation and algorithm

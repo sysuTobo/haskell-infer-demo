@@ -7,7 +7,7 @@ architecture rationale; [plan-numeric-contract.md](plan-numeric-contract.md) is
 the proposal for the trainer, RL and inference-optimization work that is **not**
 implemented here.
 
-Last updated: 2026-09-24.
+Last updated: 2026-09-25.
 
 ## Verified today
 
@@ -17,12 +17,20 @@ otherwise. No GPU result here is implied by a document edit alone.
 | Gate | Result |
 |---|---|
 | `cargo test --locked --offline` | 11/11 |
-| `ctest --test-dir csrc/build-libs` | 11/11 — `test_model_desc`, `test_safetensors`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_library_ops` |
-| `cabal test all --enable-tests` | `infer-tests` 41/41, `infer-generation-tests` 14/14 |
+| `ctest --test-dir csrc/build-libs` | 13/13 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_library_ops` |
+| `cabal test all --enable-tests` | `infer-tests` 64/64, `infer-generation-tests` 15/15 |
+| `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12131-byte canonical document carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, and every digest re-derived independently by `tests/manifest_check.py` |
+| Two independent 27B captures, strict comparison | bitwise identical (`max_abs == 0`) and verdict `admitted` |
+| Pre-refactor golden vs a fresh 27B capture | bitwise identical (`max_abs == 0`) with verdict `legacy/unverified` (exit 2) — the older capture's numeric arrays are compared, but nothing about its identity is invented |
 | Qwen3.8-27B golden capture | bitwise identical to the pre-refactor baseline (`max_abs == 0`) |
 | `tests/test_engine.py` (27B vs independent PyTorch logits) | 20/20 greedy tokens; logit RMS 0.02–0.04 |
 | `tests/test_longseq.py` | 433-token chunk-split self-consistency (RMS 0.029) and 128-token generation coherence |
 | `tests/test_tp.py --devices 0,1` (TP2) | identical greedy tokens, per-step logit RMS ≤ 0.05 |
+
+The manifest rows ran on the real 27B with `semantic_id`
+`890c5472…fabde`, `numerical_policy_id` `25245738…c9592`, `deployment_id`
+`56f6e4aa…d6f4d` and `parameter_manifest_sha256` `4cb768d4…bbcc` over 1199
+tensors (device ordinals 0,1; 32 layers each; layer-split placement).
 
 ## Supported model families
 
@@ -58,6 +66,49 @@ greedy-token agreement — never a relaxation of the top-1 check.
 
 ## Recently completed
 
+**Execution manifest and capture provenance** (plan Stage 0, verified 2026-09-25).
+The engine can now answer *which numerical execution did this run observe*, as
+three content identities over canonical JSON blocks plus the provenance a bitwise
+comparison has to agree on — and a capture records the document it was taken
+under:
+
+- `engine_manifest` / `haskell-infer-demo manifest` report `semantic_id` (dimensions,
+  layer/role semantics, tied-role relations, the mathematical conventions),
+  `numerical_policy_id` (the region/case → implementation binding table with its own
+  digest, the effective constants, dtype/rounding and reduction choices — the GEMM
+  algorithm policy is recorded as *unpinned*, not as a default),
+  `deployment_id` (placement, devices, the per-layer owner, the shard plan) and the
+  immutable parameter identity (a canonical tensor index over 1199 tensors; the raw
+  content hash is `null` unless a caller pays for it).
+- Build provenance comes from a header the build step generates over its own
+  artefacts (git revision, CUDA toolkit and target lists, the Triton/FLA versions the
+  AOT generator asserted, hashes of the generated kernels and of the FlashInfer
+  header compiled against, the toolchain flag digest). Runtime provenance comes from
+  CUDA queries. An unestablished fact is reported as
+  `unknown`/`unavailable`/`unsupported`/`unspecified` and *refuses* strict admission
+  rather than being defaulted into looking comparable.
+- Comparisons have modes, not tolerances: `strict` (identities, parameter identity,
+  placement unless a scoped claim is declared, and provenance must all agree; the
+  numeric arrays must then still be bitwise identical), `--deployment-scoped`
+  (reported as a scoped exception, never an identity-level pass), `diagnostic`
+  (reported for attribution, never a pass, exit 3) and `legacy` (a document without a
+  manifest version stays numerically comparable with an explicit `legacy/unverified`
+  result and no invented identity, exit 2).
+- The committed region registry records the implementation each region ran and, per
+  region, determinism/mechanism/RNG-dependency separately (24 regions: 9
+  deterministic by construction, 13 unverified because a library or cross-device
+  reduction order is not established, 2 `not_implemented` — every backward region).
+- The canonical encoding is what makes the digests checkable elsewhere: keys sorted
+  by byte value, no whitespace, integers bare, non-integer constants as decimal
+  strings, printable ASCII only. `test_manifest` pins the identity matrix without a
+  GPU, `test_manifest_hashes` re-derives every digest with `hashlib`, and the Haskell
+  side parses the same documents.
+
+Two contract violations were caught by the engine's own document rather than by the
+unit tests: a missing top-level `manifest_version` (which made the manifest
+unparseable) and a region flag emitted as an integer where the contract fixes a
+boolean. Both now have CPU gates, including a type check in the Python verifier.
+
 **Resource safety and regression gates** (finished and verified 2026-09-23;
 commits `6d6e306`, `6417c72`, `fe2c2d4`). This closed the issues raised in the
 prior code review while keeping legal models numerically unchanged:
@@ -88,6 +139,20 @@ CPU case pinning the behaviour.
 
 ## Known gaps
 
+- **The manifest's per-device `kernel_path` and `triton_cubin_arch` are a
+  selection rule, not an observation.** Which binary the driver actually launched
+  is not queryable per kernel, so the manifest reports what the build's target
+  lists plus the device's compute capability select for it, and the field names say
+  `selected`.
+- **No region has an established reduction order beyond the elementwise ones.** The
+  registry marks 13 of 24 regions `unverified`, and the GEMM algorithm policy is
+  recorded as `cublas_default_heuristic_unpinned`: an exact claim about that region
+  is unsupported until the plan's Stage 2 pins or replaces it.
+- **`weights.content_sha256` is null** unless a caller chooses to hash 50 GiB of
+  tensor data; the parameter-manifest digest over the tensor index is what strict
+  admission compares.
+- **Backward regions do not exist**, so the registry records them as
+  `not_implemented` rather than assuming a determinism verdict for them.
 - **Expert-parallel equivalence re-run is pending.** The EP-vs-layer-split check
   after the FP32 merge landed was stopped before it finished. The gate is
   unchanged (`test_tp.py --ep 2`: identical greedy tokens, logit RMS ≤ 0.05).
@@ -107,5 +172,6 @@ CPU case pinning the behaviour.
 |---|---|
 | [README.md](../README.md) | Build, test entry points, usage, phase status, model weights |
 | [design.md](design.md) | Architecture rationale, per-family layout differences, testing strategy |
-| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
+| [manifest-contract.md](manifest-contract.md) | The execution manifest: canonical encoding, field ownership and projections, the region determinism registry, and the comparison modes |
+| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stage 0 is implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
 | [reference-output.json](reference-output.json) | Transformers reference tokens for the 27B debugging prompt |

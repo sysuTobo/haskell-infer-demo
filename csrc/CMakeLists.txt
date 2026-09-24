@@ -5,7 +5,7 @@ set(CMAKE_CUDA_ARCHITECTURES "86;89;90a;90-virtual" CACHE STRING "CUDA SASS/PTX 
 # Triton AOT cubins have no PTX fallback, so they are built per architecture and
 # selected at runtime by compute capability (see triton/build_aot.py).
 set(ENGINE_TRITON_ARCHS "86;89;90" CACHE STRING "Triton AOT targets")
-project(infer-engine LANGUAGES C CXX CUDA)
+project(infer-engine VERSION 0.1.0 LANGUAGES C CXX CUDA)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
@@ -17,8 +17,12 @@ find_path(CAUSAL_CONV1D_INCLUDE_DIR causal_conv1d_update.cu
     HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/causal_conv1d" REQUIRED)
 
 set(GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# aot_versions.txt is declared as an output too: the build-info step reads it, and
+# a file a custom command *writes* has to be listed as an output or a fresh build
+# directory has no rule for it (make fails with "no rule to make target").
 add_custom_command(
     OUTPUT "${GENERATED}/aot_kernels.cpp" "${GENERATED}/aot_kernels.h"
+           "${GENERATED}/aot_versions.txt"
     COMMAND ${CMAKE_COMMAND} -E env "TRITON_PTXAS_PATH=${CUDAToolkit_BIN_DIR}/ptxas"
             ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/triton/build_aot.py"
             --output "${GENERATED}" --arch "${ENGINE_TRITON_ARCHS}"
@@ -35,13 +39,44 @@ add_custom_command(
     VERBATIM
 )
 
+# Build provenance for the execution manifest. Generated at build time from the
+# artefacts and the tools that produced them (git revision, the Triton/FLA
+# versions the AOT generator asserted, the hashes of the generated kernels and of
+# the FlashInfer header compiled against, the toolkit/arch/flag configuration), so
+# engine_manifest() reports what this build actually is. List-valued arguments are
+# '|'-joined: a ';' or a space would be split by the command line.
+string(REPLACE ";" "|" ENGINE_CUDA_ARCHS_ARG "${CMAKE_CUDA_ARCHITECTURES}")
+string(REPLACE ";" "|" ENGINE_TRITON_ARCHS_ARG "${ENGINE_TRITON_ARCHS}")
+set(ENGINE_NVCC_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+string(REPLACE " " "|" ENGINE_NVCC_FLAGS_ARG "${ENGINE_NVCC_FLAGS}")
+set(BUILD_INFO_HEADER "${GENERATED}/build_info.h")
+add_custom_command(
+    OUTPUT "${BUILD_INFO_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+            "-DGENERATED=${GENERATED}"
+            "-DOUTPUT=${BUILD_INFO_HEADER}"
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/.."
+            "-DENGINE_VERSION=${PROJECT_VERSION}"
+            "-DCUDA_TOOLKIT=${CUDAToolkit_VERSION}"
+            "-DCUDA_ARCHS_ARG=${ENGINE_CUDA_ARCHS_ARG}"
+            "-DTRITON_ARCHS_ARG=${ENGINE_TRITON_ARCHS_ARG}"
+            "-DFLASHINFER_HEADER=${FLASHINFER_INCLUDE_DIR}/flashinfer/norm.cuh"
+            "-DNVCC_FLAGS_ARG=${ENGINE_NVCC_FLAGS_ARG}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/gen_build_info.cmake"
+    DEPENDS "${GENERATED}/aot_kernels.cpp" "${GENERATED}/aot_versions.txt"
+            "${GENERATED}/causal_conv1d_update.cuh" gen_build_info.cmake
+    VERBATIM
+)
+
 add_library(engine SHARED
-    engine.cu memory.cu safetensors_loader.cu safetensors.cpp model_desc.c layer_dispatch.cu collective.cu moe.cu tap.cu
+    engine.cu memory.cu safetensors_loader.cu safetensors.cpp model_desc.c manifest.c sha256.c
+    layer_dispatch.cu collective.cu moe.cu tap.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu kernels/mla.cu
     "${GENERATED}/aot_kernels.cpp" "${GENERATED}/aot_kernels.h"
     "${GENERATED}/causal_conv1d.h" "${GENERATED}/causal_conv1d_update.cuh"
+    "${BUILD_INFO_HEADER}"
 )
 target_include_directories(engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(engine PRIVATE "${GENERATED}")
@@ -64,6 +99,21 @@ add_test(NAME test_model_desc COMMAND test_model_desc)
 add_executable(test_safetensors ../tests/safetensors_test.cpp safetensors.cpp)
 target_include_directories(test_safetensors PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 add_test(NAME test_safetensors COMMAND test_safetensors)
+
+# CPU-only: the execution manifest. SHA-256 against the FIPS vectors, canonical
+# format determinism and the identity matrix (a semantic/numerical change moves
+# the matching id only, a deployment-only change moves deployment_id only, and a
+# provenance or weight change moves no identity). No GPU and no weights.
+add_executable(test_manifest ../tests/manifest_test.c manifest.c sha256.c model_desc.c)
+target_include_directories(test_manifest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME test_manifest COMMAND test_manifest)
+
+# The same gate checked by a second implementation: Python re-canonicalizes every
+# emitted document and re-derives each digest with hashlib, so the emitter cannot
+# certify itself.
+add_test(NAME test_manifest_hashes COMMAND ${Python3_EXECUTABLE}
+         "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_manifest_hashes.py"
+         --emitter $<TARGET_FILE:test_manifest>)
 
 option(BUILD_TESTS "Build GPU numerical tests" OFF)
 if(BUILD_TESTS)

@@ -4,14 +4,17 @@
 --   haskell-infer-demo generate --model-dir /path/to/Qwen3.8-27B --gpus 0,1 -p "Hello"
 --   haskell-infer-demo show-config --descriptor descriptors/qwen38-27b.json
 --   haskell-infer-demo descriptor --model-dir /path/to/model [--write FILE]
+--   haskell-infer-demo manifest --model-dir /path/to/model [--write FILE] [--check]
+--   haskell-infer-demo manifest-compare OLD.json NEW.json [--mode strict|diagnostic]
 --   haskell-infer-demo hello-gpu -d 0 -v 42
 module Main (main) where
 
 import Control.Exception (bracket)
 import qualified Data.ByteString as BS
 import Data.List (intercalate)
+import qualified Data.Text as T
 import Options.Applicative
-import System.Exit (exitFailure, exitSuccess)
+import System.Exit (ExitCode(..), exitFailure, exitSuccess, exitWith)
 import System.IO.Error (ioeGetErrorString, tryIOError)
 import Text.Read (readMaybe)
 
@@ -19,6 +22,7 @@ import Infer.Config
 import Infer.Descriptor
 import Infer.FFI.Engine
 import Infer.Generation
+import Infer.Manifest
 import Infer.Model
 import Infer.Placement
 import Infer.Runtime
@@ -37,6 +41,8 @@ data Command
   | HelloGpu Int Int
   | ShowConfig ConfigSource [Int]
   | DumpDescriptor FilePath (Maybe FilePath)
+  | ShowManifest ManifestOptions
+  | CompareManifestFiles CompareOptions
 
 -- | Where a descriptor comes from: an explicit JSON file, or a model directory
 -- whose config.json is read by the family adapter.
@@ -55,12 +61,36 @@ data GenOptions = GenOptions
   , genCheckDesc :: Bool
   }
 
+-- | The manifest has no request-level state, so there is no prompt or token
+-- budget: it describes the execution a capture would be taken under.
+data ManifestOptions = ManifestOptions
+  { manModelDir  :: FilePath
+  , manDesc      :: Maybe FilePath
+  , manGpus      :: [Int]
+  , manTp        :: Int
+  , manEp        :: Int
+  , manMaxSeqLen :: Int
+  , manWrite     :: Maybe FilePath
+  , manCheck     :: Bool
+  }
+
+data CompareOptions = CompareOptions
+  { cmpLeft             :: FilePath
+  , cmpRight            :: FilePath
+  , cmpMode             :: String
+  , cmpDeploymentScoped :: Bool
+  }
+
 optionsParser :: Parser Options
 optionsParser = Options <$> hsubparser
   ( command "generate" (info generateCmd (progDesc "Generate text from a prompt"))
  <> command "hello-gpu" (info helloGpuCmd (progDesc "Phase 1: FFI verification"))
  <> command "show-config" (info showConfigCmd (progDesc "Print the model descriptor"))
  <> command "descriptor" (info descriptorCmd (progDesc "Dump the canonical descriptor for a model dir"))
+ <> command "manifest" (info manifestCmd
+      (progDesc "Print the canonical execution manifest (identities + provenance)"))
+ <> command "manifest-compare" (info manifestCompareCmd
+      (progDesc "Compare two manifest JSON documents: strict admission / diagnostic"))
   )
 
 generateCmd :: Parser Command
@@ -179,6 +209,72 @@ configSource =
        <> help "Derive the descriptor from DIR/config.json"
         ))
 
+manifestCmd :: Parser Command
+manifestCmd = ShowManifest <$> (ManifestOptions
+  <$> strOption
+      ( long "model-dir"
+     <> metavar "DIR"
+     <> help "Path to model directory (required: the manifest reports the parameter identity)"
+      )
+  <*> optional (strOption
+      ( long "descriptor"
+     <> metavar "FILE"
+     <> help "Descriptor JSON overriding the model directory's config.json"
+      ))
+  <*> option parseGpuList
+      ( long "gpus"
+     <> metavar "0,1,..."
+     <> value [0, 1]
+     <> showDefault
+     <> help "Comma-separated CUDA device ordinals"
+      )
+  <*> option auto
+      ( long "tp"
+     <> metavar "N"
+     <> value 1
+     <> showDefault
+     <> help "Tensor-parallel ranks (changes the numerical policy, not just the placement)"
+      )
+  <*> option auto
+      ( long "ep"
+     <> metavar "N"
+     <> value 1
+     <> showDefault
+     <> help "Expert-parallel ranks"
+      )
+  <*> option auto
+      ( long "max-seq-len"
+     <> metavar "N"
+     <> value 4096
+     <> showDefault
+     <> help "Maximum context length"
+      )
+  <*> optional (strOption
+      ( long "write"
+     <> metavar "FILE"
+     <> help "Write the canonical manifest to FILE instead of stdout"
+      ))
+  <*> switch
+      ( long "check"
+     <> help "Re-query the manifest and verify it is byte-identical (and report unestablished facts)"
+      ))
+
+manifestCompareCmd :: Parser Command
+manifestCompareCmd = CompareManifestFiles <$> (CompareOptions
+  <$> argument str (metavar "LEFT")
+  <*> argument str (metavar "RIGHT")
+  <*> strOption
+      ( long "mode"
+     <> metavar "MODE"
+     <> value "strict"
+     <> showDefault
+     <> help "'strict' requires the identities and provenance to agree; 'diagnostic' reports a deliberate difference without calling it a pass"
+      )
+  <*> switch
+      ( long "deployment-scoped"
+     <> help "Declare that a scoped invariance claim covers a placement-only difference"
+      ))
+
 -- | A token budget: the CLI rejects a negative count instead of handing it to
 -- the generation loop (which treats <= 0 as "generate nothing").
 nonNegativeInt :: ReadM Int
@@ -273,6 +369,102 @@ loadFor source = loadDescriptor $ case source of
   FromFile path -> defaultRuntimeConfig { rcDescriptor = Just path }
   FromDir dir -> defaultRuntimeConfig { rcModelDir = dir }
 
+-- | Print the execution manifest for this model, device set and placement.
+--
+-- Unlike the descriptor (which is portable architecture) the manifest describes
+-- *this* execution, so it needs a load: the parameter identity and the runtime
+-- provenance come from the engine, and the build provenance from the header the
+-- build generated.
+runShowManifest :: ManifestOptions -> IO ()
+runShowManifest opts = do
+  let cfg = defaultRuntimeConfig
+        { rcModelDir   = manModelDir opts
+        , rcDescriptor = manDesc opts
+        , rcDevices    = manGpus opts
+        , rcTp         = manTp opts
+        , rcEp         = manEp opts
+        , rcMaxSeqLen  = manMaxSeqLen opts
+        }
+  bracket (initRuntime cfg) shutdownRuntime $ \rt -> do
+    let engine = runtimeEngine rt
+    queried <- engineManifest engine
+    text <- case queried of
+      Left err -> do
+        putStrLn $ "ERROR: engine_manifest failed: " ++ err
+        exitFailure
+      Right bytes -> return bytes
+    case parseManifest text of
+      Left err -> do
+        putStrLn $ "ERROR: the engine's manifest does not parse: " ++ err
+        exitFailure
+      Right manifest -> do
+        mapM_ putStrLn (manifestSummary manifest)
+        let unestablished = unestablishedPaths manifest
+        if null unestablished
+          then putStrLn "provenance: fully established"
+          else do
+            putStrLn $ "provenance: NOT established for " ++ show (length unestablished)
+                     ++ " field(s): " ++ intercalate ", " (map T.unpack unestablished)
+            putStrLn "  (strict admission will refuse this manifest until they are resolved)"
+        if manCheck opts
+          then do
+            again <- engineManifest engine
+            case again of
+              Right second
+                | second == text ->
+                    putStrLn "Manifest stability: OK (two queries are byte-identical)"
+                | otherwise -> do
+                    putStrLn "Manifest stability: MISMATCH (the manifest is not deterministic)"
+                    exitFailure
+              Left err -> do
+                putStrLn $ "ERROR: engine_manifest failed on the second query: " ++ err
+                exitFailure
+          else return ()
+    case manWrite opts of
+      Nothing -> BS.putStr text >> putStrLn ""
+      Just path -> do
+        BS.writeFile path text
+        putStrLn $ "Wrote " ++ path ++ " (" ++ show (BS.length text) ++ " bytes)"
+
+-- | Compare two manifest documents under one of the contract's modes.
+--
+-- Exit codes: 0 admitted (strict, or with a declared deployment scope), 1
+-- rejected, 2 legacy/unverified, 3 diagnostic-only. A legacy or diagnostic
+-- result is deliberately not 0, so neither can be mistaken for a contract pass.
+runCompareManifestFiles :: CompareOptions -> IO ()
+runCompareManifestFiles opts = do
+  mode <- case parseCompareMode (cmpMode opts) of
+    Left err -> putStrLn ("ERROR: " ++ err) >> exitFailure
+    Right parsed -> return parsed
+  left <- readDocument (cmpLeft opts)
+  right <- readDocument (cmpRight opts)
+  case compareDocuments mode (cmpDeploymentScoped opts) left right of
+    Left err -> do
+      putStrLn $ "ERROR: " ++ err
+      exitFailure
+    Right (verdict, _) -> do
+      putStrLn $ "mode: " ++ compareModeName mode
+              ++ ", deployment scope declared: " ++ show (cmpDeploymentScoped opts)
+      putStrLn $ "left:  " ++ cmpLeft opts ++ "  (" ++ documentLabel left ++ ")"
+      putStrLn $ "right: " ++ cmpRight opts ++ "  (" ++ documentLabel right ++ ")"
+      putStrLn $ "verdict: " ++ verdictKind verdict
+      putStrLn (renderVerdict verdict)
+      case verdictExitCode verdict of
+        0 -> exitSuccess
+        code -> exitWith (ExitFailure code)
+  where
+    readDocument path = do
+      outcome <- tryIOError (BS.readFile path)
+      case outcome of
+        Left err -> do
+          putStrLn $ "ERROR: cannot read " ++ path ++ ": " ++ ioeGetErrorString err
+          exitFailure
+        Right bytes -> return bytes
+    documentLabel bytes = case parseManifest bytes of
+      Left _ -> "no manifest version"
+      Right manifest -> "semantic " ++ T.unpack (ibSemanticId (mIdentities manifest))
+                        ++ ", numerical " ++ T.unpack (ibNumericalPolicyId (mIdentities manifest))
+
 runGenerate :: GenOptions -> IO ()
 runGenerate opts = do
   let cfg = RuntimeConfig
@@ -358,6 +550,8 @@ main = do
     HelloGpu device value -> runHelloGpu device value
     ShowConfig source devices -> runShowConfig source devices
     DumpDescriptor dir writeTo -> runDumpDescriptor dir writeTo
+    ShowManifest manifestOpts -> runShowManifest manifestOpts
+    CompareManifestFiles compareOpts -> runCompareManifestFiles compareOpts
     Generate genOpts -> runGenerate genOpts
   where
     optsInfo = info (optionsParser <**> helper)

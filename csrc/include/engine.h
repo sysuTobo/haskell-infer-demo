@@ -143,6 +143,31 @@ int engine_desc_version(void);
  */
 int engine_describe(const EngineHandle *engine, char *buf, int buf_len);
 
+/**
+ * Execution-manifest wire version supported by this library.
+ */
+int engine_manifest_version(void);
+
+/**
+ * Write the canonical execution manifest for this engine into buf (see
+ * csrc/include/manifest.h and docs/manifest-contract.md).
+ *
+ * The manifest references the canonical descriptor and reports the three
+ * content identities (semantic, numerical policy, deployment) plus the
+ * build/runtime provenance and parameter identity that a bitwise capture
+ * comparison has to agree on. Every fact is resolved from this build and this
+ * runtime; a fact that could not be established is reported as
+ * "unknown"/"unavailable"/"unsupported" instead of being defaulted, and a
+ * strict comparison must refuse it.
+ *
+ * @param engine   Engine handle.
+ * @param buf      Destination, at least ENGINE_MANIFEST_MAX bytes.
+ * @param buf_len  Capacity of buf.
+ * @return         Bytes written (excluding the NUL terminator), or a negative
+ *                 error code (ENGINE_ERR_CONFIG when the buffer is too small).
+ */
+int engine_manifest(const EngineHandle *engine, char *buf, int buf_len);
+
 /* ------------------------------------------------------------------ */
 /*  Error codes                                                       */
 /* ------------------------------------------------------------------ */

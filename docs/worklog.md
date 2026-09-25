@@ -4,10 +4,12 @@ A running snapshot of what this project can do today, what has been verified and
 where it is knowingly incomplete. [README.md](../README.md) describes the
 component layout and how to build and test; [design.md](design.md) holds the
 architecture rationale; [plan-numeric-contract.md](plan-numeric-contract.md) is the
-proposal for the trainer, RL and inference-optimization work — of which **Stages 0
-and 1 are implemented here**: the execution manifest with capture provenance
-(specified in [manifest-contract.md](manifest-contract.md)) and the region
-inventory with its cross-case harness (`csrc/regions.c`), both described below.
+proposal for the trainer, RL and inference-optimization work — of which **Stages 0,
+1 and 2 are implemented here**: the execution manifest with capture provenance
+(specified in [manifest-contract.md](manifest-contract.md)), the region inventory
+with its cross-case harness (`csrc/regions.c`), and the feasibility/invariance
+experiments that measured what those regions actually guarantee. All three are
+described below.
 
 Last updated: 2026-09-25.
 
@@ -22,7 +24,13 @@ sm_90a lines in "Placement and hardware" are the exceptions, and they say so.
 | Gate | Result |
 |---|---|
 | `cargo test --locked --offline` | 11/11 |
-| `ctest --test-dir csrc/build-libs` | 15/15 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_library_ops` |
+| `ctest --test-dir csrc/build-libs` | 19/19 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_library_ops` |
+| `ctest test_gdn_invariance` (claim B) | prepare **bitwise invariant 51/51** across lengths 2..128 and splits at L-1, L/2, 64; core output ≤ 9.2e-5 (7.2e-3 relative, ≈1 BF16 ULP), FP32 `ssm_state` ≤ 4.2e-4; a 64+64 split at L=128 is bitwise identical |
+| `ctest test_attention_invariance` (claim C) | 264 tilings (head_dim 128/256 x GQA 24x4/24x8/8x4 x kv_len 1..269 x single-query/split), **202 bitwise**, worst 2.0e-3 relative (≈half a BF16 ULP); split-KV disabled is recorded from code, not assumed |
+| `ctest test_gemm_invariance` (claim D) | 251 BF16-output measurements (33 bitwise), worst 5.4e-3 relative (**below one BF16 ULP**); 222 FP32-output measurements (22 bitwise), worst 3.0e-5 relative — invariance falsified and quantified |
+| `ctest test_attention_lse` (claim E forward) | the LSE is available: base-2 (`log2 SUM e^s`, identified by a 69x margin over the two misreadings), layout `[qo_len, num_heads]` f32, fully written, and requesting it leaves the output **bitwise unchanged** |
+| `tests/test_pp.py` (claim A) | Qwen3-4B on one device vs a two-device layer split: **324/324 taps byte-identical**, logits bitwise identical, identities a clean placement-only difference; the strict verdict is `rejected` because the device *set* differs in provenance |
+| `tests/attention_backward_feasibility.py` (claim E backward) | the analytic backward from `(q,k,v,LSE)` reproduces torch.autograd in float64 to 1.7e-16; consuming the LSE without the log2 conversion moves `dv` by 3.04; a paired library (torch SDPA bf16) differs by 3.2e-3 forward / 2.8e-2 on gradients |
 | `ctest -R test_region_inventory` (CPU) | the inventory covers the plan's 21 in-scope regions and nothing else, agrees with the manifest registry in both directions, and every `exact` pair is backed by that registry's `deterministic` |
 | `ctest -R test_region_cases` (2× A40) | 18/18 registered `exact`/`unverified` pairs adjudicated; 8 `exact` pairs bitwise (output and persistent state); 7 unsupported shapes/cases rejected with a named reason; no trainer case offered by any of the 21 regions |
 | `cabal test all --enable-tests` | `infer-tests` 66/66, `infer-generation-tests` 15/15 |
@@ -78,6 +86,73 @@ greedy-token agreement — never a relaxation of the top-1 check.
   (`cuobjdump`) only — there is no H200 here.
 
 ## Recently completed
+
+**Feasibility and invariance experiments** (plan Stage 2, verified 2026-09-25).
+Stage 1 measured region case pairs; Stage 2 asked what those measurements *mean*
+and where the guarantees stop. Six experiments, one per claim:
+
+- **A — pipeline-parallel inertness, scoped.** Qwen3-4B (a model that fits one A40;
+  the 27B does not) with all 36 layers on device 0 versus a two-device layer split:
+  bitwise identical logits and 324/324 byte-identical tap dumps covering every
+  layer's residual stream, mixer output and ffn output. The strict manifest verdict
+  is `rejected`, and that is the contract working: a one-device and a two-device run
+  differ in *runtime provenance* (the device list itself), and strict admission
+  requires provenance to agree. The identities confirm the difference is placement
+  only — semantic, numerical-policy and parameter identities equal, `deployment_id`
+  different. The pass is scoped to the tested configuration (same build, two A40).
+- **B — GDN decomposition, with attribution.** Raw inputs and a nonzero initial
+  state held fixed, lengths 2..128, arms of whole/recurrent/half/chunk64/tail1. The
+  **prepare stage is bitwise invariant across every arm** (51/51 measurements), so
+  the residual difference is the core's: output ≤ 9.2e-5 (7.2e-3 relative, about one
+  BF16 ULP) and FP32 `ssm_state` ≤ 4.2e-4. A split aligned to the FLA chunk size
+  (64+64 at L=128) is bitwise identical; the recurrent path and a one-token tail are
+  where it moves. This is the region-level attribution the plan asked for, and it
+  also says the projections are *not* implicated — they are claim D's.
+- **C — attention tiling.** 264 tilings over head_dim 128/256, GQA 24x4/24x8/8x4 and
+  kv_len 1..269, comparing one full call against a prefix/suffix split and against
+  one call per query over a cache built on the host. 202 are bitwise identical; the
+  worst is 2.0e-3 relative (about half a BF16 ULP) and the deviations cluster where
+  a split boundary does not align with the query tile. Split-KV is *recorded as
+  disabled from code*, not assumed: the engine passes a null workspace and
+  FlashInfer's dispatcher clears `partition_kv` when the workspace is null.
+- **D — GEMM shape invariance, falsified and quantified.** One M-row call against
+  one call per row (decode's shape) and against prefix/suffix splits, over the real
+  projection shapes (N x K of 1024..248320 x 5120, 5120 x 6144, 5120 x 17408) and
+  M 1..434. Only 33 of 251 BF16-output measurements are bitwise, worst 5.4e-3
+  relative (below one BF16 ULP); only 22 of 222 FP32-output measurements are
+  bitwise, worst 3.0e-5 relative. cuBLAS selects by shape, so the accumulation order
+  changes with M — this is the measurement that turns six Stage-1 `unverified` pairs
+  into measured exceptions.
+- **E — the attention forward/backward pair.** The forward *can* produce what a
+  backward needs: FlashInfer's prefill writes a base-2 LSE (`log2 SUM e^s`, layout
+  `[qo_len, num_heads]` f32, every element written) when asked, and asking leaves the
+  attention output bitwise unchanged. The convention is identified empirically (the
+  two plausible misreadings are 69x and 1000x further off) because the kernel folds
+  log2(e) into the scores so it can use exp2. On the backward side, the analytic form
+  from `(q, k, v, LSE)` reproduces `torch.autograd` in float64 to 1.7e-16 including
+  the GQA grouping, and the two compatibility requirements are *demonstrated*: an
+  unconverted LSE moves `dv` by 3.04, and a paired library (torch SDPA in bf16)
+  differs from this forward by 3.2e-3 forward and up to 2.8e-2 on gradients, so a
+  library backward cannot be bolted on without a paired gradient check. Resource
+  estimate: 45 KB of saved state per token per layer, 2.96 GB for 4096 tokens x 16
+  attention layers, and recomputing P from the LSE avoids a 4096x4096 bf16 tensor
+  (0.8 GB per layer).
+
+The experiments also produced the stage's registry change: six case pairs that Stage
+1 could only call `unverified` are now measured `exception`s carrying the tested
+architecture, the tested shapes, and bounds rounded up to two significant digits
+(`attention_core` x2, `gemm_bf16`, `gemm_fp32_lmhead`, `gdn_core` x2). Nothing was
+promoted to `exact`: measuring a bound is not establishing a reduction order, and
+the manifest registry's `deterministic` verdict is still the only thing that
+authorises an `exact` pair.
+
+The dW guarantee is defined in
+[plan-numeric-contract.md](plan-numeric-contract.md#stage-2--feasibility-and-invariance-experiments):
+parameter gradients are independent of the microbatch grouping only under a *fixed
+accumulation schedule*, bitwise equality is claimed only under that schedule,
+adding tokens is explicitly out of scope, and the forward per-row invariance
+measured here is a necessary input to that guarantee rather than the guarantee
+itself.
 
 **Region inventory and cross-case harness** (plan Stage 1, verified 2026-09-25).
 The engine can now say which forward *cases* a region is reachable under and what
@@ -265,10 +340,23 @@ CPU case pinning the behaviour.
   recorded as `cublas_default_heuristic_unpinned`: an exact claim about that region
   is unsupported until the plan's Stage 2 pins or replaces it. Stage 1 measures the
   case-pair deltas (above) but promotes none of them to `exact`.
-- **No case pair is registered `exception` yet.** An `exception` has to carry a
-  tested architecture, tested shapes and a measured max_abs/rms. Stage 1 has the
-  measurements but has not established that any pair is a *known* deviation rather
-  than an unestablished one, which is a Stage-2 decision.
+- **Six case pairs are registered `exception`, the rest are `unverified` or
+  `exact`.** The exceptions carry bounds measured over the Stage-2 matrix and
+  rounded up; they are regression ceilings, not proofs, and the underlying library
+  reduction orders are still not established (that is what promotion to `exact`
+  would require).
+- **`capture_logits.py --compare` exits 0 on a rejected comparison.** Its exit code
+  reports that the comparison *ran*, not what it found; the strict exit-code
+  contract (0 admitted / 1 rejected / 2 legacy / 3 diagnostic) belongs to the
+  `manifest-compare` CLI. Scripted gating must read the printed verdict (or use the
+  CLI). Stage 2's claim-A fixture was initially fooled by this before checking the
+  identities directly.
+- **The LSE's last bits are the kernel's, not an identity.** FlashInfer's LSE agrees
+  with a float64 `log2 SUM e^s` to ~2e-3 absolute (the same reduced-precision softmax
+  denominator the PV product uses), which is why the Stage-2 probe identifies the
+  convention by its margin over the alternatives rather than gating on an exact
+  match. A backward that must match the forward to the bit has to recompute the
+  scores the same way, which is a Stage-4 concern.
 - **The trainer traversal is registered as unavailable, not as implemented.**
   `train_forward`, `eval_no_autograd`, `recompute` and `backward` are reachable from
   no region, and both new gates refuse a region that advertises them: registering a
@@ -298,5 +386,5 @@ CPU case pinning the behaviour.
 | [README.md](../README.md) | Build, test entry points, usage, phase status, model weights |
 | [design.md](design.md) | Architecture rationale, per-family layout differences, testing strategy |
 | [manifest-contract.md](manifest-contract.md) | The execution manifest: canonical encoding, field ownership and projections, the region determinism registry, and the comparison modes |
-| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stages 0-1 are implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
+| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stages 0-2 are implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
 | [reference-output.json](reference-output.json) | Transformers reference tokens for the 27B debugging prompt |

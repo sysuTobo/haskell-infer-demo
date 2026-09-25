@@ -15,9 +15,10 @@
  *                   reduction, no library tiling decision).
  *   exception       a known, quantified deviation. It carries the tested
  *                   architecture, shapes, max_abs/rms and how persistent state
- *                   was compared. It does NOT authorize a bitwise whole-model
- *                   claim. No pair is `exception` yet: Stage 2 is what
- *                   quantifies them.
+ *                   was compared, all rounded up to two significant digits so the
+ *                   bound has a margin over the observation. It does NOT authorize
+ *                   a bitwise whole-model claim. Stage 2 (claims B-D) quantified
+ *                   the deviations the Stage-1 fixtures could only report.
  *   unverified      the cases are compared and the difference is measured and
  *                   reported, but invariance is not established (a library
  *                   reduction/tiling order, a cross-device reduction, or a

@@ -545,6 +545,22 @@ of the numerical identity a capture observed. See
 [plan-numeric-contract.md](plan-numeric-contract.md) Stage 1 and
 [worklog.md](worklog.md) for the measured pair-by-pair evidence.
 
+Stage 2 then asked what those measurements mean, and the answers are narrower than
+the *shared-implementation* argument would suggest. Whole-layer placement is
+bitwise inert on a fixed build and a same-architecture device pair (claim A), and
+the GDN decomposition difference is entirely the core's, not prepare's (claim B,
+51/51 prepare comparisons bitwise identical). But the library-backed regions are
+*not* shape-invariant: cuBLAS changes its accumulation order with M, costing up to
+5.4e-3 relative on a BF16 output and 3.0e-5 on an FP32 one (claim D), and
+FlashInfer's attention tiling is bitwise stable for 202 of 264 measured tilings and
+within half a BF16 ULP otherwise (claim C). That is why those pairs carry measured
+`exception` bounds instead of an exactness claim, and it is the concrete answer to
+"does sharing an implementation establish anything by construction": it does not.
+The attention forward/backward pair (claim E) is feasible — the forward can return
+the base-2 LSE a backward needs while leaving the output bitwise unchanged — and the
+guarantee a trainer may claim about gradients is spelled out separately in the plan,
+because a forward per-row property does not carry over to accumulated dW.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:

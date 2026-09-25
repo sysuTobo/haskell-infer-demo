@@ -240,9 +240,9 @@ single elementwise pass, a row gather or a permutation, and only where the Stage
 registry already says `deterministic`. Everything whose reduction or tiling order
 comes from a library (FlashInfer, cuBLAS, the AOT FLA cubins) stays `unverified`;
 promoting a pair that measures zero to `exact` is a Stage-2 decision, not a
-Stage-1 one. No pair is `exception` yet, because an exception has to carry tested
-shapes, an architecture and a measured max_abs/rms, which is what Stage 2
-produces. `region_ffi` prints the region entry-point host cost against its device
+Stage-1 one. No pair carried an `exception` yet, because an exception has to carry
+tested shapes, an architecture and a measured max_abs/rms; **Stage 2 has now
+produced them** (six pairs, below). `region_ffi` prints the region entry-point host cost against its device
 cost; the engine's Haskell FFI is model-level today, so that number is the C
 boundary (argument validation, workspace arithmetic, enqueue), not a `ccall`, and
 Stage 3's region handles are what would make the two comparable.
@@ -301,6 +301,74 @@ inputs and persistent state across applicable cases; unsupported shapes/cases
 fail explicitly. Model-only and region harnesses remain independently runnable.
 
 ### Stage 2 — Feasibility and invariance experiments
+
+**Status: implemented and verified, 2026-09-25.** The experiments are
+`ctest test_gdn_invariance` (B), `ctest test_attention_invariance` (C),
+`ctest test_gemm_invariance` (D), `ctest test_attention_lse` (E's forward half),
+`tests/test_pp.py` (A) and `tests/attention_backward_feasibility.py` (E's backward
+half). The gate below is met:
+
+- **A** has evidence, scoped: Qwen3-4B (a model that fits one A40) run with all 36
+  layers on device 0 and with a two-device layer split produces bitwise identical
+  logits and **324/324 byte-identical tap dumps** (every layer's residual stream,
+  mixer and ffn output). The strict manifest verdict is `rejected`, not `admitted`,
+  because a one-device run and a two-device run differ in runtime provenance (the
+  device list itself) and strict admission requires provenance to agree; the
+  identities show a clean placement-only difference (semantic, numerical-policy and
+  parameter identities equal, `deployment_id` different). The pass is scoped to the
+  tested configuration: same build, two A40 of the same architecture.
+- **B** has region-level results with attribution: with raw inputs and a nonzero
+  initial state fixed, the **prepare stage is bitwise invariant across every arm**
+  (51/51 measurements over lengths 2..128 and splits at L-1, L/2, 64), so the
+  remaining difference belongs to the core. The chunkwise core's output stays within
+  9.2e-5 (7.2e-3 relative, about one BF16 ULP) and the FP32 `ssm_state` within
+  4.2e-4; the recurrent path (one token per call) and a one-token tail are the arms
+  that differ, while a split aligned to the FLA chunk size (64+64 at L=128) is
+  bitwise identical.
+- **C** has region-level results: 264 tilings (head_dim 128/256 x GQA 24x4, 24x8,
+  8x4 x kv_len 1..269 x {single-query, split at 1, L/2, 64, 128}) with **202 bitwise
+  identical**, and a worst case of 2.0e-3 relative (about half a BF16 ULP) at
+  head_dim 128 / 24x4 / L=63. The deviations cluster where a boundary does not align
+  with the query tile. Split-KV is *recorded* as disabled and is verifiable in code,
+  not assumed: `kernel_attention` passes a null workspace and FlashInfer's
+  dispatcher clears `partition_kv` when the workspace is null
+  (`flashinfer/attention/prefill.cuh`).
+- **D** has region-level results at the real projection shapes: **one M-row call
+  against one call per row and against prefix/suffix splits**, over N x K of
+  1024..248320 x 5120, 5120 x 6144 and 5120 x 17408 and M 1..434. Only 33 of 251
+  BF16-output measurements are bitwise, with a worst case of **5.4e-3 relative
+  (below one BF16 ULP of the output)**; only 22 of 222 FP32-output measurements are
+  bitwise, worst **3.0e-5 relative**. Invariance is falsified, and the falsification
+  is quantified rather than waved through: the six `unverified` pairs of Stage 1
+  have become measured `exception`s.
+- **E** has a concrete path and a resource estimate: the forward **can** produce the
+  state a backward needs — a base-2 LSE (`log2 SUM e^s`, identified against the two
+  plausible misreadings by a 69x margin) of layout `[qo_len, num_heads]` f32 — and
+  asking for it leaves the attention output **bitwise unchanged**. A backward
+  consuming `(q, k, v, LSE)` is well defined: the analytic form reproduces
+  `torch.autograd` in float64 to 1.7e-16, including the GQA head grouping, and the
+  two compatibility requirements are demonstrated rather than asserted (feeding the
+  LSE without converting the log2 moves `dv` by up to 3.04, and a paired library
+  (torch SDPA, bf16) differs from this forward by 3.2e-3 forward and up to 2.8e-2 on
+  gradients, because it is a *different function*). Resource estimate: 45 KB per
+  token per layer of saved state (q/o/dq, k/v/dk/dv bf16 plus the LSE), 2.96 GB for
+  4096 tokens x 16 attention layers, and recomputing P from the LSE avoids a
+  4096x4096 bf16 probability tensor (0.8 GB per layer).
+
+**The dW guarantee, defined separately from the forward properties above.** For a
+fixed set of logical tokens and a fixed loss normalization, the gradient of a
+parameter is required to be independent of how those tokens are grouped into
+microbatches **only under a fixed accumulation schedule**: each microbatch's
+contribution is computed by the same kernel configuration, and the contributions
+are summed in a defined order (a fixed microbatch index order) that is not
+reordered. Bitwise equality is claimed only under that schedule. Without it, the
+same tokens legitimately produce a different dW, because grouping changes the GEMM
+shapes — claim D measured that as 3.0e-5 relative for FP32 accumulators and below
+one BF16 ULP for BF16 outputs. **Adding tokens is not covered**: it changes dW and
+is a different question from this one. The forward per-row invariance that claims
+B-D measure is a necessary input, not the guarantee: it bounds each microbatch's
+contribution, while the guarantee is about the accumulation *across* microbatches,
+which needs its own test once a trainer exists (Stage 3-4).
 
 | Claim | Experiment and decision |
 |---|---|

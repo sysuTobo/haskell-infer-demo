@@ -155,6 +155,28 @@ if(BUILD_TESTS)
     add_executable(test_region_cases ../tests/kernels/test_region_cases.cu)
     target_link_libraries(test_region_cases PRIVATE engine)
     add_test(NAME test_region_cases COMMAND test_region_cases)
+    # Stage-2 invariance experiments (plan claims B, C, D and E's forward half).
+    # Each one measures a matrix of tilings/decompositions/shapes and prints the
+    # bound the region has to carry; the claim's decision is asserted at the end.
+    add_executable(test_gdn_invariance ../tests/kernels/test_gdn_invariance.cu)
+    target_link_libraries(test_gdn_invariance PRIVATE engine)
+    add_test(NAME test_gdn_invariance COMMAND test_gdn_invariance)
+    add_executable(test_attention_invariance ../tests/kernels/test_attention_invariance.cu)
+    target_link_libraries(test_attention_invariance PRIVATE engine)
+    add_test(NAME test_attention_invariance COMMAND test_attention_invariance)
+    add_executable(test_gemm_invariance ../tests/kernels/test_gemm_invariance.cu)
+    target_link_libraries(test_gemm_invariance PRIVATE engine)
+    add_test(NAME test_gemm_invariance COMMAND test_gemm_invariance)
+    # Claim E's forward half calls FlashInfer's dispatcher directly (with a real
+    # LSE buffer, which the engine's own entry point never asks for), so unlike the
+    # others this test needs the FlashInfer include path and feature defines.
+    add_executable(test_attention_lse ../tests/kernels/test_attention_lse.cu)
+    target_link_libraries(test_attention_lse PRIVATE engine)
+    target_include_directories(test_attention_lse SYSTEM PRIVATE "${FLASHINFER_INCLUDE_DIR}")
+    target_compile_definitions(test_attention_lse PRIVATE FLASHINFER_ENABLE_F16
+        FLASHINFER_ENABLE_BF16 FLASHINFER_ENABLE_FP8_E4M3 FLASHINFER_ENABLE_FP8_E5M2 ENABLE_BF16
+        ENABLE_FP8)
+    add_test(NAME test_attention_lse COMMAND test_attention_lse)
     # Initialization resource safety: a checkpoint that cannot be loaded must
     # leave no handle and no device memory behind. Skips itself when no GPU is
     # visible.

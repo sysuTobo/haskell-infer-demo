@@ -169,7 +169,13 @@ bool adjudicate(const char *region, const char *left, const char *right,
         return true;
     }
     if (strcmp(pair->verdict, REGION_VERDICT_EXCEPTION) == 0) {
-        if (out.max_abs > pair->max_abs || out.rms > pair->rms) {
+        // The registered numbers are the conservative worst of the output and the
+        // state over the Stage-2 matrix, so the same bound gates both.
+        printf("region_cases: %-22s %s vs %s: registered exception bound max_abs=%.9g rms=%.9g "
+               "(%s)\n",
+               region, left, right, pair->max_abs, pair->rms, pair->arch);
+        if (out.max_abs > pair->max_abs || out.rms > pair->rms ||
+            st.max_abs > pair->max_abs || st.rms > pair->rms) {
             printf("region_cases: %s/%s/%s: FAIL: outside the registered exception bound\n",
                    region, left, right);
             return false;

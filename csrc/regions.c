@@ -30,6 +30,16 @@
 #define PAIR_EXACT(l, r, st, why) \
     {l, r, REGION_VERDICT_EXACT, "-", "-", 0.0, 0.0, st, why}
 
+/* A measured, quantified deviation: the worst the Stage-2 experiment saw for this
+ * pair over the tested architecture and shapes, rounded *up* to two significant
+ * digits so the bound has a margin over the observation it came from (a bound that
+ * the measurement reproduces exactly is a bad bound: the last digit trips it).
+ * max_abs/rms are absolute in the region's own output units and are conservative
+ * -- for a region with persistent state they are the worse of the output and the
+ * state comparison, over both the Stage-2 matrix and the Stage-1 fixture. */
+#define PAIR_EXCEPTION(l, r, arch, shapes, mx, rm, st, why) \
+    {l, r, REGION_VERDICT_EXCEPTION, arch, shapes, mx, rm, st, why}
+
 /* ------------------------------------------------------------------ */
 /* Case-pair tables                                                   */
 /* ------------------------------------------------------------------ */
@@ -74,15 +84,25 @@ static const struct RegionCasePair mKvWritePairs[] = {
 };
 
 static const struct RegionCasePair kAttentionCorePairs[] = {
-    PAIR(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_DECODE, REGION_VERDICT_UNVERIFIED,
-         "-", "-", "-",
-         "the null workspace fixes the no-split-KV mode only, not the internal "
-         "tiling; a prefill query block and a single-query decode are different "
-         "reduction schedules (Stage 2 claim C)"),
-    PAIR(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_TAIL1, REGION_VERDICT_UNVERIFIED,
-         "-", "-", "-",
-         "the trailing one-token chunk of a chunked prefill takes the same entry "
-         "point with a different query count (Stage 2 claim C)"),
+    PAIR_EXCEPTION(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_DECODE,
+                   "sm_86 (2x A40)",
+                   "head_dim 128/256; GQA 24x4, 24x8, 8x4; kv_len 1..269",
+                   1.0e-03, 1.0e-04,
+                   "the KV cache is compared elementwise and is unchanged by any arm",
+                   "the query-block tiling changes the softmax reduction: one call "
+                   "with all L queries versus one call per query. 202 of 264 measured "
+                   "tilings are bitwise identical and the worst is 2.0e-3 relative "
+                   "(about half a BF16 ULP), at head_dim 128 / 24x4 / L=63. Stage 2 "
+                   "claim C"),
+    PAIR_EXCEPTION(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_TAIL1,
+                   "sm_86 (2x A40)",
+                   "head_dim 128/256; GQA 24x4, 24x8, 8x4; kv_len 1..269; split boundaries 1, L/2, 64, 128",
+                   1.0e-03, 4.2e-05,
+                   "the KV cache is compared elementwise and is unchanged by any arm",
+                   "a prefix+suffix prefill against the single-call prefill over the "
+                   "same cache: worst 2.0e-3 relative, and the deviations cluster at "
+                   "the boundaries that do not align with the query tile. Stage 2 "
+                   "claim C"),
 };
 
 static const struct RegionCasePair kAttentionOutputGatePairs[] = {
@@ -92,19 +112,29 @@ static const struct RegionCasePair kAttentionOutputGatePairs[] = {
 };
 
 static const struct RegionCasePair kGemmBf16Pairs[] = {
-    PAIR(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_DECODE, REGION_VERDICT_UNVERIFIED,
-         "-", "-", "-",
-         "cuBLAS selects its own algorithm and workspace, and an M=1 decode is a "
-         "different kernel from an M=tokens prefill (Stage 2 claim D)"),
+    PAIR_EXCEPTION(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_DECODE,
+                   "sm_86 (2x A40)",
+                   "real projections N x K: 1024..248320 x 5120, 5120 x 6144, "
+                   "5120 x 17408; M 1..434; per-row and prefix/suffix arms",
+                   1.3e-01, 1.2e-02,
+                   "no persistent state: the output matrix is the comparison",
+                   "cuBLAS selects its algorithm and workspace by shape, so the "
+                   "accumulation order changes with M: an M-row call against one call "
+                   "per row (decode's M=1). 33 of 251 measurements are bitwise and the "
+                   "worst is 5.4e-3 relative, below one BF16 ULP of the output, at the "
+                   "widest K. Stage 2 claim D"),
 };
 
 static const struct RegionCasePair kGemmFp32LmHeadPairs[] = {
-    PAIR(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_DECODE, REGION_VERDICT_UNVERIFIED,
-         "-", "-", "-",
-         "the released engine enters this with M=1 in both cases (the final row "
-         "only), so the fixture drives the M=tokens projection a full-sequence "
-         "evaluation would use against the M=1 decode shape -- claim D's GEMM "
-         "question, through the region's own entry point"),
+    PAIR_EXCEPTION(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_DECODE,
+                   "sm_86 (2x A40)",
+                   "the same projections with an FP32 output; the engine enters the "
+                   "LM head with M=1, so the fixture also drives M=tokens",
+                   8.0e-04, 1.3e-04,
+                   "no persistent state: the FP32 output matrix is the comparison",
+                   "an FP32 output has no output rounding to hide behind, so the "
+                   "deviation is the accumulation order alone: worst 3.0e-5 relative "
+                   "at K=17408, and 22 of 222 measurements are bitwise. Stage 2 claim D"),
 };
 
 static const struct RegionCasePair kResidualAddPairs[] = {
@@ -138,14 +168,31 @@ static const struct RegionCasePair kGdnPreparePairs[] = {
 };
 
 static const struct RegionCasePair kGdnCorePairs[] = {
-    PAIR(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_RECURRENT_PREFILL, REGION_VERDICT_UNVERIFIED,
-         "-", "-", "the FP32 ssm_state is compared elementwise after the run",
-         "the chunked and recurrent decompositions do not share a reduction "
-         "schedule (Stage 2 claim B)"),
-    PAIR(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_TAIL1, REGION_VERDICT_UNVERIFIED,
-         "-", "-", "the FP32 ssm_state is compared elementwise after the run",
-         "a one-token tail takes the recurrent path inside a chunked prefill "
-         "(Stage 2 claim B)"),
+    PAIR_EXCEPTION(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_RECURRENT_PREFILL,
+                   "sm_86 (2x A40)",
+                   "conv 10240, 48 v-heads x head_dim 128; lengths 2..128; splits at "
+                   "L-1, L/2 and 64; nonzero initial state",
+                   4.3e-04, 4.8e-05,
+                   "the FP32 ssm_state is compared elementwise after the run",
+                   "the recurrent path (one token per call) against one chunkwise "
+                   "call. prepare is bitwise invariant across every arm (51/51 "
+                   "measurements), so the difference is the core's: the output stays "
+                   "within 9.2e-5 (7.2e-3 relative, about one BF16 ULP) and the FP32 "
+                   "ssm_state within 4.2e-4 (4.0e-3 relative). A split aligned to the "
+                   "FLA chunk size (64+64 at L=128) is bitwise identical. Stage 2 "
+                   "claim B"),
+    PAIR_EXCEPTION(REGION_CASE_CHUNKED_PREFILL, REGION_CASE_TAIL1,
+                   "sm_86 (2x A40)",
+                   "conv 10240, 48 v-heads x head_dim 128; lengths 2..128; a one-token "
+                   "tail after an L-1 chunk; nonzero initial state",
+                   3.8e-04, 4.3e-05,
+                   "the FP32 ssm_state is compared elementwise after the run",
+                   "a one-token tail takes the recurrent path inside a chunked "
+                   "prefill: the output stays within 3.1e-5 and the ssm_state within "
+                   "3.8e-4 (4.0e-3 relative). The registered numbers are the maximum "
+                   "over the Stage-2 matrix and the Stage-1 fixture, so the smaller "
+                   "rms of the two does not become an accidental ceiling. Stage 2 "
+                   "claim B"),
 };
 
 static const struct RegionCasePair kGdnGatedNormPairs[] = {

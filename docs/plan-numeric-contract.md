@@ -1,11 +1,12 @@
 # Plan: Numerical Execution Contract, Haskell Training, and Asynchronous RL
 
-Status: Stages 4–8 proposed, not implemented; **Stages 0-3 are implemented**
+Status: Stages 5–8 proposed, not implemented; **Stages 0-4 are implemented**
 (the versioned execution manifest with capture provenance, the region inventory
-with its cross-case harness, the feasibility/invariance experiments, and the
-trainable runtime's parameter lifecycle — see
+with its cross-case harness, the feasibility/invariance experiments, the
+trainable runtime's parameter lifecycle, and the backward/loss/optimizer layer —
+see
 [manifest-contract.md](manifest-contract.md), [worklog.md](worklog.md),
-`csrc/regions.c` and `csrc/include/train.h`).
+`csrc/regions.c`, `csrc/include/train.h` and `csrc/include/backward.h`).
 Revised after the design review, 2026-09-23.
 Extends [design.md](design.md). This document separates current capabilities,
 proposed interfaces, measured observations and hypotheses requiring experiments.
@@ -483,6 +484,71 @@ tied roles stay tied; a synthetic parameter update refreshes all readers;
 lifetime tests reject update/free while a reader or backward context is active.
 
 ### Stage 4 — Backward, losses and optimizer
+
+**Status: implemented and verified, 2026-09-25.** The CUDA-free half is
+`csrc/include/backward.h` + `csrc/backward.c` (the differentiation convention, the
+losses, AdamW, the checkpoint format and the RNG); the kernels are
+`csrc/kernels/backward.cu` and `csrc/kernels/backward_paired.cu`. Gates:
+`ctest test_backward` (CPU: the region table against the Stage-1 inventory, the losses
+and AdamW against an independent FP64 implementation, the checkpoint's refusals, and a
+tiny fixture that overfits) and `ctest test_backward_kernels` (every kernel against a
+double-precision definition or a central difference of one). The gate below is met:
+
+- **the plan's Stage-4 table is the region table, in both directions.**
+  `backward_region_info` carries one row per table row, each naming the Stage-1
+  inventory regions it differentiates; `test_backward` walks it both ways (every named
+  region exists in the inventory; every region the table gives a backward is claimed by
+  exactly one row), so a missing row and an invented one both fail.
+- **the forward rounding boundaries were documented before differentiating**, as this
+  stage requires: `design.md`'s GDN section now carries the per-step table (the BF16
+  boundary after each L2 norm, the BF16-rounded beta, the FP32 log-decay, the three
+  boundaries inside the gated norm). Two of its consequences are enforced rather than
+  noted: the sigmoid chain is evaluated at the pre-cast value (a cast is identity for
+  gradient propagation) while the operand derivative uses the rounded value, and the
+  gated norm's weight gradient belongs to the BF16 source, not to Stage 3's FP32
+  derived copy.
+- **independent gradient checks.** Elementwise gates, residual branches, plain/Gemma
+  RMSNorm, the GDN L2 norm, the gated norm, the embedding gather, RoPE (the transposed
+  rotation must invert the forward's), the Q/gate re-interleave, GEMM dX/dW, the masked
+  cross entropy, the fused log-probability row and AdamW are each compared against a
+  double-precision analytic reference or a finite difference of one. Measured maxima are
+  1e-8…1e-6, except the conv1d, prepare, attention and GDN-core rows, which are checked
+  by central difference and land at 1e-7…1e-3.
+- **the paired regions are paired.** `kernel_attention_lse` is the engine's forward with
+  a real LSE buffer (Stage 2 measured that this leaves the output bitwise unchanged), and
+  `kernel_attention_backward` recomputes the softmax from that base-2 LSE — the analytic
+  double-precision reading of it reproduces the finite difference of the definition, so
+  the convention is pinned rather than assumed. `kernel_gdn_core_backward` reverses the
+  decay-before-prediction recurrence in FP32 from the retained chunk-boundary states.
+- **the gate's cases are all in the fixture.** Nonzero GDN initial state *and* a nonzero
+  final-state gradient; sequence boundaries crossed (one chunk and three chunks, both
+  matching the same reference); repeated embedding ids (summed, not overwritten); head
+  duplication (the GQA group's dK/dV summed across its queries); tied weights (the
+  gradient sum and exactly one optimizer update); and a masked loss.
+- **one complete AdamW step** matches an FP64 implementation of PyTorch's own order —
+  including the bias-correction/eps ordering, which is what separates it from the
+  textbook form — plus the BF16 publication as the master's round-to-nearest-even.
+- **an overfit fixture converges and resumes.** A deterministic separable fixture is
+  trained through this stage's own loss and optimizer to 32/32 in 20 steps; a second run
+  reaches the same bits; and a run of 12 steps that is saved, wiped, restored and
+  continued for 8 more lands bitwise on the same parameters, both optimizer moments and
+  data cursor as 20 uninterrupted steps. The model-level SFT overfit is Stage 5's, whose
+  gate re-runs this against the transformer.
+- **determinism is tested separately from closeness.** The attention backward's dQ is
+  bitwise reproducible (one owner per coordinate) and the GDN core backward is bitwise
+  reproducible for all six gradients; the attention dK/dV group sums use atomics, so
+  they are *reported* rather than required, and `csrc/backward.c`'s registry says which
+  regions are fixed-order.
+
+Two limits are recorded rather than papered over. The gradient *pairing* with the
+library forwards is not bitwise: the attention backward recomputes P in FP32 while the
+forward's PV product rounds it to BF16 (the gate's residual, ~1e-3 on dV, is that gap
+and Stage 2's claim E predicted it), and the GDN core backward differentiates the
+recurrence rather than the cubin's `(I + A)^{-1}`/BF16-MMA decomposition. Both are
+Stage 6 alignment work. And the GDN core backward's per-thread reduction is
+O(tokens x head_dim) per coordinate rather than the blocked form a production kernel
+would use: it is correct and reproducible, and its cost is the next thing to fix if
+training throughput (not correctness) becomes the constraint.
 
 The mathematical GDN convention is the corrected decay-before-prediction rule
 in `design.md` and `tests/kernels/test_gdn.cu::delta_reference`. Its exact

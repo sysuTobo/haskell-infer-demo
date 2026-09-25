@@ -218,13 +218,6 @@ static const struct RegionCasePair kMaskedLossPairs[] = {
          "that consumes it are Stage 4"),
 };
 
-static const struct RegionCasePair kBackwardPairs[] = {
-    PAIR(REGION_CASE_TRAIN_FORWARD, REGION_CASE_BACKWARD, REGION_VERDICT_NOT_APPLICABLE,
-         "-", "-", "-",
-         "no backward region exists; the plan's Stages 3-4 define it, and the "
-         "manifest registry records it as not_implemented rather than assuming a "
-         "determinism verdict"),
-};
 
 /* ------------------------------------------------------------------ */
 /* The inventory                                                      */
@@ -292,16 +285,16 @@ static const struct RegionInventoryEntry kInventory[] = {
 
     {"attention_core", 1, "families with full attention",
      "FlashInfer single prefill (kernels/attention.cu: kernel_attention); "
-     "split-KV disabled by a null workspace; the entry point does not return the "
-     "LSE, although the kernel can (Stage 2 claim E)",
+     "split-KV disabled by a null workspace; the LSE is available from "
+     "kernel_attention_lse (kernels/backward_paired.cu), which is the same dispatcher "
+     "with a real LSE buffer",
      "bf16 q[tokens,heads,head_dim]; bf16 kv_cache; seq_start,tokens,seq_len; "
      "scale = 1/sqrt(head_dim)",
-     "bf16 out[tokens,heads,head_dim]",
+     "bf16 out[tokens,heads,head_dim]; optionally fp32 lse[tokens,heads]",
      "reads the KV cache; writes no persistent state",
-     "nothing usable today, and Stage 2 showed what a backward would need: this "
-     "entry point passes lse=nullptr, while the same FlashInfer dispatcher writes "
-     "a base-2 LSE of layout [qo_len, num_heads] f32 when asked, leaving the "
-     "output bitwise unchanged (Stage 2 claim E)",
+     "the base-2 LSE, layout [qo_len, num_heads] f32, which Stage 2 measured as leaving "
+     "the output bitwise unchanged; Stage 4's kernel_attention_backward recomputes the "
+     "softmax from it rather than retaining a [T,T] probability tensor",
      "chunked_prefill,tail1,decode", "none",
      N_PAIRS(kAttentionCorePairs), kAttentionCorePairs},
 
@@ -415,31 +408,44 @@ static const struct RegionInventoryEntry kInventory[] = {
      "none", "none",
      N_PAIRS(kLogitsGatherPairs), kLogitsGatherPairs},
 
-    {"masked_loss", 1, "all families (proposed)",
-     "the FP32 log-softmax and gather landed in Stage 3 (kernels/logprob.cu, one row at "
-     "a time so no [tokens, vocab] tensor is materialised); the masked reduction and "
-     "its backward are Stage 4",
-     "proposed: fp32 logits[tokens,vocab_size] and int64 targets[tokens] with a loss mask",
-     "proposed: fp32 per-token log-softmax and the masked mean loss",
+    {"masked_loss", 1, "all families",
+     "kernels/logprob.cu (one row at a time, so no [tokens, vocab] tensor is "
+     "materialised) plus csrc/backward.c's masked cross entropy, dense reverse KL, "
+     "clipped objective and group advantage reduction; the masked reduction and its "
+     "backward landed in Stage 4",
+     "fp32 logits[tokens,vocab_size] and int targets[tokens] with a loss mask",
+     "fp32 per-token log-softmax, the masked mean loss and its dlogits",
      "none",
-     "proposed: the log-softmax probabilities (Stage 4)",
+     "the softmax probabilities, which the backward rebuilds row by row",
      "none",
      "the trainer's FP32 differentiable loss region; deliberately not the same "
      "region as sampler_softmax_cdf. Stage 3 gave it its first implementation (the "
-     "natural-log log-softmax of a selected row), which is why it is no longer "
-     "registered as absent: a region the forward runs cannot be recorded as "
-     "not_implemented",
+     "natural-log log-softmax of a selected row) and Stage 4 the masked reduction, the "
+     "other objectives and the backward",
      N_PAIRS(kMaskedLossPairs), kMaskedLossPairs},
 
-    {"backward", 1, "all families (proposed)",
-     "not implemented: no backward region exists",
-     "proposed: the values each forward region would have to save",
-     "proposed: dW and dx per region",
-     "proposed: an FP32 gradient accumulator per parameter",
-     "the forward regions must save what it needs; none of them does today",
+    {"backward", 1, "all families",
+     "kernels/backward.cu and kernels/backward_paired.cu, with the CUDA-free contract, "
+     "losses and optimizer in csrc/backward.c: one entry point per row of the plan's "
+     "Stage-4 table",
+     "per region: the values Stage 1's saved_for_backward column names, which "
+     "csrc/backward.c's backward_check_retained refuses a backward without",
+     "fp32 gradients per region and per parameter; the losses also produce a scalar and "
+     "dlogits, and AdamW updates an fp32 master and one bf16 refresh",
+     "an fp32 gradient accumulator per parameter, an AdamW master/m/v triple, and the "
+     "step's retained values",
+     "the plan's Stage-4 differentiation convention: gradients are fp32, a cast is "
+     "identity for gradient propagation, and a saved statistic (the inverse RMS, the "
+     "base-2 LSE, the chunk-boundary states) is consumed as the rounded value the "
+     "forward produced",
      "none",
-     "the plan's Stages 3-4 define this",
-     N_PAIRS(kBackwardPairs), kBackwardPairs},
+     "the trainer's backward path, implemented in Stage 4 and gated by ctest "
+     "test_backward (the contract, the losses, AdamW, the checkpoint format) and ctest "
+     "test_backward_kernels (every kernel against a double-precision reference or a "
+     "central difference of it). The region's own `cases` column stays `none`: a "
+     "backward is a traversal, not a forward execution case, so it is not registered "
+     "as one",
+     0, NULL},
 
     {"sampler_softmax_cdf", 0, "generation only (proposed)",
      "proposed host binary64 softmax/CDF with a request-owned RNG (plan T0-T4)",

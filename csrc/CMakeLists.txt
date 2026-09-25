@@ -70,11 +70,11 @@ add_custom_command(
 
 add_library(engine SHARED
     engine.cu memory.cu safetensors_loader.cu safetensors.cpp model_desc.c manifest.c sha256.c
-    regions.c train.c layer_dispatch.cu collective.cu moe.cu tap.cu
+    regions.c train.c backward.c layer_dispatch.cu collective.cu moe.cu tap.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu kernels/mla.cu
-    kernels/logprob.cu
+    kernels/logprob.cu kernels/backward.cu kernels/backward_paired.cu
     "${GENERATED}/aot_kernels.cpp" "${GENERATED}/aot_kernels.h"
     "${GENERATED}/causal_conv1d.h" "${GENERATED}/causal_conv1d_update.cuh"
     "${BUILD_INFO_HEADER}"
@@ -137,6 +137,17 @@ target_include_directories(test_train PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/inclu
 add_test(NAME test_train COMMAND test_train
          "${CMAKE_CURRENT_SOURCE_DIR}/../descriptors/qwen3-4b.json")
 
+# CPU-only: the Stage-4 differentiation contract, the losses, AdamW and the checkpoint
+# format. The losses and the optimizer are compared against an independent FP64
+# implementation in the test itself, and the region table is checked in both directions
+# against the Stage-1 inventory, so neither can drift silently.
+add_executable(test_backward ../tests/backward_test.c backward.c regions.c manifest.c
+               sha256.c model_desc.c)
+target_include_directories(test_backward PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+# The losses and AdamW use libm (exp, log, sqrt, pow, fminf); the other CPU gates do not.
+target_link_libraries(test_backward PRIVATE m)
+add_test(NAME test_backward COMMAND test_backward)
+
 option(BUILD_TESTS "Build GPU numerical tests" OFF)
 if(BUILD_TESTS)
     add_executable(test_attention ../tests/kernels/test_attention.cu)
@@ -166,6 +177,13 @@ if(BUILD_TESTS)
     add_executable(test_region_cases ../tests/kernels/test_region_cases.cu)
     target_link_libraries(test_region_cases PRIVATE engine)
     add_test(NAME test_region_cases COMMAND test_region_cases)
+    # Stage-4 gradient gate: every backward kernel against a host FP64 reference, the
+    # paired attention backward against autograd of the same composition, the GDN core
+    # backward with a nonzero initial state and across chunk boundaries, and the
+    # run-to-run determinism of both paired kernels.
+    add_executable(test_backward_kernels ../tests/kernels/test_backward_kernels.cu)
+    target_link_libraries(test_backward_kernels PRIVATE engine)
+    add_test(NAME test_backward_kernels COMMAND test_backward_kernels)
     # Stage-2 invariance experiments (plan claims B, C, D and E's forward half).
     # Each one measures a matrix of tilings/decompositions/shapes and prints the
     # bound the region has to carry; the claim's decision is asserted at the end.

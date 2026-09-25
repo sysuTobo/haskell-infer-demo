@@ -179,9 +179,12 @@ static void check_entry(const struct RegionInventoryEntry *entry) {
         }
         check(enforceable, "%s: no pair carries a verdict the harness can enforce", entry->region);
     }
-    /* The trainer traversal does not exist in this release: Stage 3 added a
-     * single-sequence teacher-forced forward, but not the traversal a trainer needs
-     * (a per-step schedule, recomputation, a backward). */
+    /* The forward `cases` column never names a traversal. Stage 3 added a
+     * single-sequence teacher-forced forward but not a per-step schedule, so
+     * train_forward and eval_no_autograd still have no API; recompute is an attention
+     * backward option rather than a per-region forward case; and the backward itself
+     * now exists (Stage 4) but is registered in the backward inventory, not as a
+     * per-region forward case. */
     check(!region_case_available(entry->region, REGION_CASE_TRAIN_FORWARD),
           "%s: registers train_forward, which has no trainer API", entry->region);
     check(!region_case_available(entry->region, REGION_CASE_EVAL_NO_AUTOGRAD),
@@ -189,7 +192,7 @@ static void check_entry(const struct RegionInventoryEntry *entry) {
     check(!region_case_available(entry->region, REGION_CASE_RECOMPUTE),
           "%s: registers recompute, which has no trainer API", entry->region);
     check(!region_case_available(entry->region, REGION_CASE_BACKWARD),
-          "%s: registers backward, which does not exist", entry->region);
+          "%s: registers backward as a forward case, which is not what it is", entry->region);
 }
 
 static void print_inventory(void) {

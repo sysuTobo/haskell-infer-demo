@@ -31,6 +31,7 @@
  */
 #include "fla_ops.h"
 #include "flashinfer_ops.h"
+#include "backward.h"
 #include "kernels.h"
 #include "layers.h"
 #include "regions.h"
@@ -832,12 +833,54 @@ bool unsupported(cudaStream_t stream) {
     printf("region_cases: unsupported cases are unavailable from all %d inventoried regions\n",
            count);
 
-    /* A region that is registered as not_applicable must not be runnable. */
-    const struct RegionCasePair *na =
-        region_find_pair("backward", REGION_CASE_TRAIN_FORWARD, REGION_CASE_BACKWARD);
-    if (na == nullptr || strcmp(na->verdict, REGION_VERDICT_NOT_APPLICABLE) != 0) {
-        printf("region_cases: FAIL: the backward region is not registered not_applicable\n");
+    /* Stage 1 registered the backward region as one `not_applicable` pair, because no
+     * backward existed and saying so was better than leaving the region unexplained.
+     * Stage 4 implemented it, so that pair is gone and the backward is no longer a
+     * forward region with case pairs at all: it is a *traversal*, whose coverage lives
+     * in the Stage-4 backward inventory (csrc/backward.c) rather than in a per-region
+     * forward case. What has to hold now is that the two registries agree and that the
+     * region still offers no forward case. */
+    const struct RegionInventoryEntry *backward_entry = region_inventory_find("backward");
+    if (backward_entry == nullptr || backward_entry->pair_count != 0) {
+        printf("region_cases: FAIL: the backward region still registers forward case pairs\n");
         ok = false;
+    }
+    {
+        int row_count = 0;
+        const struct BackwardRegionInfo *rows = backward_region_info(&row_count);
+        const struct RegionInventoryEntry *inv = region_inventory(&count);
+        if (rows == nullptr || row_count == 0) {
+            printf("region_cases: FAIL: the Stage-4 backward inventory is empty\n");
+            ok = false;
+        }
+        for (int i = 0; i < row_count; ++i) {
+            if (!rows[i].implemented) {
+                printf("region_cases: FAIL: the Stage-4 row '%s' claims no implementation\n",
+                       rows[i].name);
+                ok = false;
+            }
+            const int names = backward_region_stage1_count(rows[i].region);
+            for (int j = 0; j < names; ++j) {
+                char name[64];
+                if (backward_region_stage1_name_at(rows[i].region, j, name, sizeof(name)) <= 0) {
+                    printf("region_cases: FAIL: a Stage-4 row name does not fit\n");
+                    ok = false;
+                    continue;
+                }
+                int found = 0;
+                for (int k = 0; k < count; ++k) {
+                    if (strcmp(inv[k].region, name) == 0) found = 1;
+                }
+                if (!found) {
+                    printf("region_cases: FAIL: the Stage-4 row '%s' names the unknown region %s\n",
+                           rows[i].name, name);
+                    ok = false;
+                }
+            }
+        }
+        printf("region_cases: %d Stage-4 backward rows are implemented and name inventoried "
+               "regions\n",
+               row_count);
     }
     return ok;
 }

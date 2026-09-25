@@ -27,7 +27,9 @@ and hardware" are the exceptions, and they say so.
 | Gate | Result |
 |---|---|
 | `cargo test --locked --offline` | 11/11 |
-| `ctest --test-dir csrc/build-libs` | 21/21 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops` |
+| `ctest --test-dir csrc/build-libs` | 23/23 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_backward`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_backward_kernels`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops` |
+| `ctest test_backward` (CPU, Stage 4) | the Stage-4 region table against the Stage-1 inventory in both directions; masked CE, reverse KL, the token/sequence clipped objective and the group advantage reduction against an independent FP64 implementation with its gradient checked by central difference; AdamW against FP64 in PyTorch's own order (including the bias-correction/eps ordering) plus the BF16 publication; the checkpoint round-trip with every failure mode refused; a deterministic fixture overfitting 32/32 through this stage's own loss and optimizer, and a 12+8 resumed run landing bitwise on the uninterrupted 20-step parameters, moments and cursor |
+| `ctest test_backward_kernels` (Stage 4, 2× A40) | every backward against a double-precision definition or a central difference of one: elementwise gates, residual branches, plain/Gemma RMSNorm, the GDN L2 norm, the gated norm, embedding (repeated ids summed), RoPE (the transposed rotation inverting the forward's), the Q/gate re-interleave, GEMM dX/dW, masked CE, AdamW, conv1d (d_x, d_weight, d_bias, d_state_in), GDN prepare (d_conv_out, d_a, d_b, d_A_log, d_dt_bias) — all 1e-8…1e-6 except the finite-difference rows at 1e-7…1e-3; attention forward+LSE vs the definition (2.1e-3 BF16 out, 1.5e-3 LSE) and its backward vs the FD of the definition (dQ 2.5e-4, dK 2.8e-4, dV 1.0e-3), with an analytic double reading of the device LSE reproducing the FD, so the base-2 convention is pinned; the GDN core backward with a nonzero initial state and a nonzero final-state gradient, one chunk and three chunks both matching the same reference (≤1.0e-7), d_state_start included; dQ and the whole GDN core backward bitwise reproducible, dK/dV reported (atomics) |
 | `ctest test_train` (CPU, Stage 3) | tying (35 specs into 34 logical parameters on Qwen3-4B's descriptor), frozen parameters with no training state, the borrow/update/free lifetime rules, publication with derived-copy refresh, the accumulation schedule, replica sync, and the teacher-forcing plan |
 | `ctest test_train_forward` (Stage 3, synthetic checkpoint) | all-position forward 12/12 top-1 vs a transformers forward (rms 0.004); teacher-forced selection and log-probabilities vs the reference's own log-softmax (gap 0.007); tied roles one logical parameter with two readers; a no-op publication bitwise inert; an updated tied weight and an updated GDN norm weight each matching a torch recomputation with the same edit (rms 0.004-0.01, 12/12); an update refused while a step is live |
 | `cabal test infer-trainer-tests` (CPU, Stage 3) | the Haskell teacher-forcing plan and the C implementation of the same schedule agree across shifts, masks, forced labels and explicit positions |
@@ -40,8 +42,8 @@ and hardware" are the exceptions, and they say so.
 | `ctest -R test_region_inventory` (CPU) | the inventory covers the plan's 21 in-scope regions and nothing else, agrees with the manifest registry in both directions, and every `exact` pair is backed by that registry's `deterministic` |
 | `ctest -R test_region_cases` (2× A40) | 18/18 registered `exact`/`unverified` pairs adjudicated; 8 `exact` pairs bitwise (output and persistent state); 7 unsupported shapes/cases rejected with a named reason; no trainer case offered by any of the 21 regions |
 | `cabal test all --enable-tests` | `infer-tests` 66/66, `infer-generation-tests` 15/15, `infer-trainer-tests` 9/9 (the Haskell and C teacher-forcing plans must agree) |
-| `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12868-byte canonical document over 27 recorded regions carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, no unestablished provenance path, and every digest re-derived independently by `tests/manifest_check.py` |
-| Two independent 27B captures, strict comparison | bitwise identical (`max_abs == 0` on every array) and verdict `admitted` (exit 0) — the identities, parameter identity and provenance all agree, over the two captures' own `numerical_policy_id` (`012c264c…314f0e`) |
+| `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12868-byte canonical document over 27 recorded regions carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, no unestablished provenance path, and every digest re-derived independently by `tests/manifest_check.py`. The byte count and the identities are the ones the *pre-Stage-4* registry produced; Stage 4 edits three registry rows (`attention_core`'s LSE, `masked_loss`'s stage, and `backward` from `not_implemented` to the backward inventory), which is a numerical-policy change: `ctest test_manifest`'s identity matrix is the gate that says only `numerical_policy_id` (and the `regions_sha256` inside it) moves, and the literals are re-derived by the same command |
+| Two independent 27B captures, strict comparison | bitwise identical (`max_abs == 0` on every array) and verdict `admitted` (exit 0) — the identities, parameter identity and provenance all agree, over the two captures' own `numerical_policy_id` (`012c264c…314f0e`, taken before Stage 4's registry edit) |
 | Pre-refactor golden vs a fresh 27B capture | bitwise identical (`max_abs == 0` on every array) with verdict `legacy/unverified` (exit 2) — the older capture's numeric arrays are compared, but nothing about its identity is invented. Re-run against the Stage-1 tree and again after Stage 3's engine changes, which is what shows the conv-activation export, the registry change and the training runtime are all numerically inert on the inference path |
 | Qwen3.8-27B golden capture | bitwise identical to the pre-refactor baseline (`max_abs == 0`) |
 | `tests/test_engine.py` (27B vs independent PyTorch logits) | 20/20 greedy tokens (one step is a BF16 tie the reference itself reports as equal-maximal); per-step logit RMS 0.015–0.038; descriptor round-trip and the invalid-input/capacity checks pass; chunk boundaries 129-token rms 1.06 and 64+64+1 rms 1.33, both top-1 stable |
@@ -95,6 +97,80 @@ greedy-token agreement — never a relaxation of the top-1 check.
   (`cuobjdump`) only — there is no H200 here.
 
 ## Recently completed
+
+**Backward, losses and optimizer** (plan Stage 4, verified 2026-09-25). The engine can
+now differentiate every region the dense/dense-hybrid path runs, and the three pieces a
+trainer needs — the losses, the optimizer and a resumable checkpoint — are one tested
+module rather than a plan:
+
+- `csrc/include/backward.h` + `csrc/backward.c` are CUDA-free: the differentiation
+  convention (a cast is identity for gradient propagation, so a pre-cast function's
+  local derivative uses the pre-cast value while an operand derivative uses the rounded
+  one — the output gate's gate-gradient is exactly that case), the losses (masked cross
+  entropy, dense reverse KL, the token- and sequence-level clipped objective, the group
+  advantage reduction), AdamW in PyTorch's own order, a CRC-32-checked checkpoint over
+  parameters, optimizer moments, RNG and data cursor, and a counter-based RNG.
+- `csrc/kernels/backward.cu` and `csrc/kernels/backward_paired.cu` are the kernels: the
+  elementwise gates and branches, the four norms, embedding scatter-add, the RoPE
+  transpose and the Q/gate re-interleave, GEMM dX/dW, the fused log-probability row,
+  AdamW, GDN conv1d and prepare, and the two paired regions — attention from its saved
+  base-2 LSE, GDN core from its retained chunk-boundary states.
+- **the plan's Stage-4 table is code.** `backward_region_info` carries one row per table
+  row, each naming the Stage-1 regions it differentiates; `ctest test_backward` walks it
+  in both directions and `ctest test_backward_kernels` re-checks it against the
+  inventory, so a row that is missing and a row that invents a region both fail. The
+  Stage-1 GPU harness changed with it: its assertion that the backward region must be
+  registered `not_applicable` (because no backward existed) is replaced by one that the
+  backward registers no forward case pair *and* that its eleven Stage-4 rows are all
+  implemented and all name inventoried regions.
+- **the GDN rounding boundaries are documented before differentiating**, as this stage
+  requires: `design.md` now carries the per-step table (the BF16 boundary after each L2
+  norm and its 1e-6-inside-rsqrt epsilon, the BF16-rounded beta, the FP32 log-decay, the
+  conv's single output rounding, and the gated norm's three). Two consequences are
+  enforced rather than noted: the gated norm's weight gradient belongs to the BF16
+  source, not to Stage 3's FP32 derived copy; and the duplicated key heads' contribution
+  must be summed once, not once per group member — the bug the prepare gate caught.
+- **an LSE is a statistic, not a tensor.** `kernel_attention_lse` is the engine's
+  forward with a real LSE buffer (Stage 2 measured that asking for it leaves the output
+  bitwise unchanged), and `kernel_attention_backward` recomputes the softmax from it, so
+  no `[T,T]` probability tensor is retained. The base-2 convention is pinned by
+  measurement rather than by reading the source: an analytic double reading of the
+  device's own LSE reproduces the finite difference of the definition, and the backward
+  needs *no* extra ln-2 (the ln-2 in Stage 2's Python harness belonged to a harness
+  forward that defined P as 2^(s-L), which is not the softmax).
+- **the gate's cases are all in the fixture.** Nonzero GDN initial state and nonzero
+  final-state gradient; one chunk and three chunks crossing internal boundaries, both
+  against the same reference; repeated embedding ids summed rather than overwritten; the
+  GQA group's dK/dV summed across its queries; a tied weight getting one optimizer
+  update; and a masked loss. One complete AdamW step matches an FP64 implementation of
+  PyTorch's order, including the bias-correction/eps ordering that separates it from the
+  textbook form.
+- **a fixture overfits and resumes.** A deterministic separable fixture trains to 32/32
+  in 20 steps through this stage's own loss and optimizer; a second run reaches the same
+  bits; and a run that is saved at step 12, wiped, restored and continued for 8 more
+  lands bitwise on the uninterrupted 20-step parameters, both moments and the data
+  cursor. The model-level SFT overfit is Stage 5's, whose gate re-runs this against the
+  transformer.
+- Two limits are recorded, not papered over. The gradient pairing with the library
+  forwards is not bitwise — attention's backward recomputes P in FP32 while the
+  forward's PV product rounds it to BF16 (dV's ~1e-3 residual is exactly that gap,
+  predicted by Stage 2's claim E), and the GDN core backward differentiates the
+  recurrence rather than the cubin's `(I + A)^{-1}`/BF16-MMA decomposition; both are
+  Stage 6 alignment work. And the GDN core backward's per-coordinate reduction is
+  O(tokens × head_dim) rather than blocked, which is correct and reproducible but is
+  the first thing to fix when training throughput matters.
+
+Three bugs are worth remembering because each was a *silent* wrong answer rather than a
+crash, and each is now a shape the gate rejects. A host `for` loop over a device pointer
+does not fail to compile — it segfaults, and it appeared three times (the conv1d and
+prepare wrappers zeroing a gradient, and the GDN core seeding its workspace); the fix is
+a kernel-side zero or a `cudaMemcpyAsync`. A wrapper that offsets the V plane of the KV
+cache *and* a kernel that offsets it again leaves dV correct (it needs no V) while
+silently corrupting dP, hence dQ and dK — which is why the gate compares all three
+gradients and why the offset is now explained where it is done. And a test fixture whose
+operands are "a BF16 value times a constant" is a different operand after the upload
+rounds it, so the finite difference is of a function the kernel never evaluated; every
+fixture now rounds to the storage type explicitly.
 
 **Trainable runtime and parameter lifecycle** (plan Stage 3, verified 2026-09-25).
 The inference path is untouched; what is new is the ownership a trainer needs.

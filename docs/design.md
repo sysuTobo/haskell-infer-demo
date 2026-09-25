@@ -283,6 +283,32 @@ recurrent path. Different decompositions are not assumed bitwise equivalent;
 the numerical-contract plan separates state-correctness tests from invariance
 claims. Any new CPR forward must be paired with a revalidated backward.
 
+#### Where the GDN forward rounds (required before differentiating it)
+
+The equations above specify the function; a backward needs the *execution*, because a
+derivative that consumes a differently-rounded operand is the gradient of a different
+function. Stage 4 of `plan-numeric-contract.md` asks for this table before any
+derivative is written, and `tests/kernels/test_gdn.cu` plus the Stage-4 gate pin each
+row. Reading order is the conv output → prepare → core → gated norm:
+
+| Step | Exact arithmetic | Rounding boundary |
+|---|---|---|
+| conv1d | `bias[c] + Σ_j w[c,j] x[t-(k-1)+j]`, state oldest-first, FP32 accumulation | output rounded to BF16 once, at the store (`causal_conv1d_update.cu`); the state keeps BF16 |
+| conv SiLU | `x/(1+e^-x)` in FP32 from the BF16 input | result rounded to BF16 at the store (`kernel_silu_inplace`) |
+| Q/K L2 norm | `x * rsqrt(Σ_d x_d² + eps)`, eps **1e-6 inside** the rsqrt, per (token, key head); no mean | rounded to BF16 once, when written into the head-expanded buffer; the three value heads sharing a key head each recompute the same norm rather than sharing it |
+| v in prepare | a plain copy of the conv output | none beyond its existing BF16 storage |
+| g (log-decay) | `-exp(A_log[h]) * softplus(a + dt_bias)`, softplus with the `x > 20 → x` branch | `a`, `dt_bias`, `A_log` are BF16 inputs; **g is stored FP32** |
+| beta | `sigmoid(b)` | rounded **through BF16 and widened back to FP32** before use, so the core's beta is a BF16 value |
+| core | the decay-before-prediction recurrence above, state FP32 | the chunkwise cubin rounds the state to BF16 for each MMA operand and accumulates in FP32; the recurrent path is FP32 throughout |
+| gated norm | `s = rsqrt(mean(x²)+eps)`; `n = x*s`; `y = n * w * swish(z)` with the **raw** weight (no +1) | three boundaries: `x*s` → BF16, then `*w` → BF16, then `*swish(z)` → BF16 |
+
+Two consequences the backward has to respect. `beta`'s BF16 rounding is *inside* the
+sigmoid's chain: the convention this project adopted is that a cast is identity for
+gradient propagation, so `d_beta` passes through unchanged while the sigmoid's own
+derivative is evaluated at the pre-cast value. And the gated norm's weight gradient
+belongs to the BF16 source weight, not to the FP32 effective copy the forward reads
+(Stage 3's derived-copy registry), so a publication has to refresh that copy.
+
 ### Mixture-of-experts feed-forward
 
 A layer whose `layer_ffns` entry is `moe` routes through a sparse FFN instead of

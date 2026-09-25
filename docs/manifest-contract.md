@@ -86,7 +86,9 @@ Not here, on purpose:
 `norm_impl`, `gemm_algorithm_policy` (`cublas_default_heuristic_unpinned`),
 `gemm_output_type`, `lm_head_output_type`, `cast_boundaries`,
 `gdn_recurrent_impl`, `mla_impl`, `moe_combine`, `moe_ep_merge`, `collective`,
-`fusion`, `backward` (`not_implemented`), `regions_sha256`, `sampling_sha256`.
+`fusion`, `backward` (the Stage-4 backward inventory: `implemented` with the mechanism
+and the atomically-accumulated group sums recorded as unverified), `regions_sha256`,
+`sampling_sha256`.
 
 Two things are worth stating explicitly.
 

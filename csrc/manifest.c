@@ -230,7 +230,8 @@ static const struct ManifestRegion kRegions[] = {
      "engine KV cache write at [seq_start, seq_start+tokens)", "deterministic",
      "contiguous copy with no reduction", 0},
     {"attention_core", "prefill,decode",
-     "FlashInfer single prefill, split-KV disabled, LSE not returned", "unverified",
+     "FlashInfer single prefill, split-KV disabled, LSE available from "
+     "kernel_attention_lse", "unverified",
      "null workspace fixes the no-split-KV mode only, not the internal tiling", 0},
     {"attention_output_gate", "prefill,decode", "sigmoid gate multiply", "deterministic",
      "elementwise", 0},
@@ -269,14 +270,19 @@ static const struct ManifestRegion kRegions[] = {
     {"logits_softmax_gather", "prefill,decode", "host FP32 argmax over the final row",
      "deterministic", "exact host comparison, no reduction reorder", 0},
     {"masked_loss", "prefill",
-     "FP32 log-softmax and gather (kernels/logprob.cu, one row at a time) landed in "
-     "stage 3; the masked reduction and its backward are stage 4",
+     "FP32 log-softmax and gather (kernels/logprob.cu, one row at a time); the masked "
+     "reduction, the other objectives and the backward landed in stage 4",
      "unverified", "an in-block reduction over the vocabulary; order not established", 0},
     {"sampler_softmax_cdf", "not_implemented",
      "proposed host binary64 softmax/CDF (plan T0-T4)", "not_implemented",
      "one RNG word per sampled token once implemented", 1},
-    {"backward", "not_implemented", "no backward region is implemented", "not_implemented",
-     "the trainer plan stages 3-4 define this", 0},
+    {"backward", "none",
+     "one backward entry point per stage-4 region (kernels/backward.cu, "
+     "kernels/backward_paired.cu) plus the CUDA-free contract, losses and AdamW in "
+     "csrc/backward.c", "unverified",
+     "the elementwise, norm, RoPE and loss backwards reduce in a fixed order, but the "
+     "scatter and group-sum ones (embedding, attention dK/dV, GDN core dQ/dK, prepare) "
+     "accumulate with atomics, whose order is not pinned", 0},
 };
 
 const struct ManifestRegion *manifest_default_regions(int *count) {

@@ -192,6 +192,10 @@ int model_desc_check_runtime_support(const struct ModelDesc *desc, char *err, si
 /* Index of a role in the descriptor's role table, or -1 if absent. */
 int model_desc_role_index(const struct ModelDesc *desc, int role);
 
+/* The role id for a role's name ("gdnNorm"), or -1. The inverse of
+ * model_desc_role_name, so a caller names a role instead of hardcoding its ordinal. */
+int model_desc_role_from_name(const char *name);
+
 /* The slice of a role's tensor one tensor-parallel rank holds. With tp_size 1
  * (or an ENGINE_SHARD_NONE rule) the view is the whole tensor. */
 struct ShardView {

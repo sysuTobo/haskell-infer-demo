@@ -70,10 +70,11 @@ add_custom_command(
 
 add_library(engine SHARED
     engine.cu memory.cu safetensors_loader.cu safetensors.cpp model_desc.c manifest.c sha256.c
-    regions.c layer_dispatch.cu collective.cu moe.cu tap.cu
+    regions.c train.c layer_dispatch.cu collective.cu moe.cu tap.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu kernels/mla.cu
+    kernels/logprob.cu
     "${GENERATED}/aot_kernels.cpp" "${GENERATED}/aot_kernels.h"
     "${GENERATED}/causal_conv1d.h" "${GENERATED}/causal_conv1d_update.cuh"
     "${BUILD_INFO_HEADER}"
@@ -126,6 +127,16 @@ add_executable(test_region_inventory ../tests/region_inventory_test.c
 target_include_directories(test_region_inventory PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 add_test(NAME test_region_inventory COMMAND test_region_inventory)
 
+# CPU-only: the trainable runtime's ownership objects (plan Stage 3). The parameter
+# store's buffers are opaque slots, so tying, frozen parameters, the borrow/update
+# lifetime, derived-copy publication and the teacher-forcing plan are tested exactly
+# as they run in the engine; the tying case is the real Qwen3-4B descriptor, whose
+# lmHead role maps onto the embedding tensor.
+add_executable(test_train ../tests/train_test.c train.c model_desc.c)
+target_include_directories(test_train PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME test_train COMMAND test_train
+         "${CMAKE_CURRENT_SOURCE_DIR}/../descriptors/qwen3-4b.json")
+
 option(BUILD_TESTS "Build GPU numerical tests" OFF)
 if(BUILD_TESTS)
     add_executable(test_attention ../tests/kernels/test_attention.cu)
@@ -177,6 +188,18 @@ if(BUILD_TESTS)
         FLASHINFER_ENABLE_BF16 FLASHINFER_ENABLE_FP8_E4M3 FLASHINFER_ENABLE_FP8_E5M2 ENABLE_BF16
         ENABLE_FP8)
     add_test(NAME test_attention_lse COMMAND test_attention_lse)
+    # Stage 3's device gate: the all-position teacher-forced forward against an
+    # independent transformers reference, the tied-role parameter store, a synthetic
+    # update that must refresh both readers and the derived FP32 copy, and the step
+    # lifetime. It needs the synthetic checkpoint and torch, so it skips itself when
+    # the checkpoint is not there (like test_engine_resources without a device).
+    set(ENGINE_SYNTH_MODEL_DIR "/var/pony/cache/bohaotu-haskell/synth-qwen3next"
+        CACHE STRING "Synthetic Qwen3-Next checkpoint for the Stage-3 gate")
+    add_test(NAME test_train_forward COMMAND ${Python3_EXECUTABLE}
+             "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_train_forward.py"
+             --library $<TARGET_FILE:engine>
+             --model-dir "${ENGINE_SYNTH_MODEL_DIR}"
+             --desc "${CMAKE_CURRENT_SOURCE_DIR}/../descriptors/qwen3-next-synth.json")
     # Initialization resource safety: a checkpoint that cannot be loaded must
     # leave no handle and no device memory behind. Skips itself when no GPU is
     # visible.

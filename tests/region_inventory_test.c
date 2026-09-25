@@ -179,7 +179,9 @@ static void check_entry(const struct RegionInventoryEntry *entry) {
         }
         check(enforceable, "%s: no pair carries a verdict the harness can enforce", entry->region);
     }
-    /* The trainer traversal does not exist in this release. */
+    /* The trainer traversal does not exist in this release: Stage 3 added a
+     * single-sequence teacher-forced forward, but not the traversal a trainer needs
+     * (a per-step schedule, recomputation, a backward). */
     check(!region_case_available(entry->region, REGION_CASE_TRAIN_FORWARD),
           "%s: registers train_forward, which has no trainer API", entry->region);
     check(!region_case_available(entry->region, REGION_CASE_EVAL_NO_AUTOGRAD),

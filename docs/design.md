@@ -561,6 +561,33 @@ the base-2 LSE a backward needs while leaving the output bitwise unchanged — a
 guarantee a trainer may claim about gradients is spelled out separately in the plan,
 because a forward per-row property does not carry over to accumulated dW.
 
+### The training runtime's ownership model
+
+Stage 3's prerequisite is that a trainer can share the inference engine's weights
+without either side copying them or surprising the other. The shape is: **the store
+owns the parameter's identity, the engine owns its buffer.** A store resolves the
+descriptor's roles into logical parameters (two roles with one template are one
+parameter with two readers), gives each a version, and points its compute slot at the
+engine's own BF16 weight - so a published update is visible to an inference forward by
+construction rather than by a copy, and a reader can never observe a half-updated set
+because an update requires exclusive ownership.
+
+That leaves the two things a copy would otherwise hide. A *derived* copy - the FP32
+GDN norm weight, cast from its BF16 source at load - would silently disagree with a
+published update, so the store marks derived copies stale on publication and refuses
+to close the window while one is stale; the refresh is enforced, not remembered. And a
+*tied* parameter has one master but more than one reader buffer, so a publication
+walks every alias: writing one and not the other would leave the model with two
+versions of one weight, which is exactly the failure the tie is supposed to make
+impossible.
+
+The same section's retention rules are the other half. A training step keeps the
+mixer, ffn and residual activations of every layer (the residual stream is updated in
+place, so "read it later" is not an option) and the GDN chunk-boundary states under a
+full-sequence schedule, with alias rules and per-consumer free points. Stage 4's
+backward consumes them; what Stage 3 fixes is that they exist, are accounted for, and
+cannot be freed while a consumer still holds them.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:

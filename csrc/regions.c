@@ -213,8 +213,9 @@ static const struct RegionCasePair kLogitsGatherPairs[] = {
 static const struct RegionCasePair kMaskedLossPairs[] = {
     PAIR(REGION_CASE_TRAIN_FORWARD, REGION_CASE_BACKWARD, REGION_VERDICT_NOT_APPLICABLE,
          "-", "-", "-",
-         "no loss region exists in this release; the plan's Stage 4 defines the "
-         "FP32 differentiable log-softmax and the masked loss"),
+         "no loss exists in this release: Stage 3 implemented the per-position "
+         "log-probability a loss needs, while the masked reduction and the backward "
+         "that consumes it are Stage 4"),
 };
 
 static const struct RegionCasePair kBackwardPairs[] = {
@@ -415,14 +416,19 @@ static const struct RegionInventoryEntry kInventory[] = {
      N_PAIRS(kLogitsGatherPairs), kLogitsGatherPairs},
 
     {"masked_loss", 1, "all families (proposed)",
-     "not implemented",
+     "the FP32 log-softmax and gather landed in Stage 3 (kernels/logprob.cu, one row at "
+     "a time so no [tokens, vocab] tensor is materialised); the masked reduction and "
+     "its backward are Stage 4",
      "proposed: fp32 logits[tokens,vocab_size] and int64 targets[tokens] with a loss mask",
      "proposed: fp32 per-token log-softmax and the masked mean loss",
      "none",
      "proposed: the log-softmax probabilities (Stage 4)",
      "none",
      "the trainer's FP32 differentiable loss region; deliberately not the same "
-     "region as sampler_softmax_cdf",
+     "region as sampler_softmax_cdf. Stage 3 gave it its first implementation (the "
+     "natural-log log-softmax of a selected row), which is why it is no longer "
+     "registered as absent: a region the forward runs cannot be recorded as "
+     "not_implemented",
      N_PAIRS(kMaskedLossPairs), kMaskedLossPairs},
 
     {"backward", 1, "all families (proposed)",

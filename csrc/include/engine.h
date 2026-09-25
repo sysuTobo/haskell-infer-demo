@@ -18,6 +18,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "train.h"   /* the trainable runtime's handles and status codes (Stage 3) */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -201,6 +203,104 @@ const char *engine_last_error(void);
  *                a negative error code.
  */
 int engine_hello_gpu(int device, int value);
+
+/* ------------------------------------------------------------------ */
+/*  Stage 3: the training path                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * These calls add a training lifecycle to the same weights the inference API already
+ * uses; they do not change `engine_create/prefill/decode/reset/destroy`.
+ *
+ * The ownership model is the plan's: the parameter store owns the *identity* of a
+ * parameter (its logical id, whether it is tied, frozen, trainable, how many readers
+ * hold it) while the engine owns the *buffers*. A parameter's compute buffer is the
+ * engine's own BF16 weight, so a published update is visible to an inference forward
+ * without any second copy, and a publication that forgot to refresh a derived copy
+ * (the FP32 GDN norm weight) is refused rather than left silently disagreeing.
+ */
+
+/** What a caller wants attached. Training state is optional: a rollout-only caller
+ *  needs the parameter identities without paying for FP32 masters. */
+struct TrainAttachOptions {
+    int allocate_training_state;   /* FP32 master, gradient and two optimizer slots */
+    const int *frozen_roles;       /* role ids to freeze (no training state allocated) */
+    int frozen_role_count;
+};
+
+/**
+ * Attach a parameter store to this engine. One parameter per (layer, role) the
+ * checkpoint actually provides; tied roles collapse to one logical parameter whose
+ * compute slot is written once per reader. Returns the store (owned by the engine, or
+ * NULL on failure with engine_last_error set). Calling it twice returns the same
+ * store.
+ */
+struct TrainStore *engine_train_attach(EngineHandle *engine,
+                                       const struct TrainAttachOptions *options);
+
+/** The attached store, or NULL. */
+struct TrainStore *engine_train_store(EngineHandle *engine);
+
+/** Open the exclusive update window: refused while a context or a step is live. */
+int engine_train_begin_update(EngineHandle *engine);
+
+/** Upload FP32 master values for one logical parameter. Requires an open window and
+ *  a parameter whose training state was allocated (a frozen one has none). */
+int engine_train_write_master(EngineHandle *engine, int logical, const float *host_values);
+
+/**
+ * Publish: cast every written master into the BF16 weight of every reader, bump the
+ * version, recompute every derived copy (the FP32 GDN norm weight among them) and
+ * close the window. Refuses to close while a derived copy is stale, so the refresh
+ * cannot be skipped.
+ */
+int engine_train_publish(EngineHandle *engine);
+
+/** Close the window without publishing (an aborted update). */
+int engine_train_end_update(EngineHandle *engine);
+
+/** What a teacher-forced forward produces. `all_logits` is the debug/reference path
+ *  and is the caller's host buffer of [tokens x vocab]; `logprobs` is the path a loss
+ *  uses and needs only [tokens]. */
+struct TrainForwardOutput {
+    float *all_logits;
+    float *logprobs;
+    int *selected;
+    int selected_count;
+};
+
+/**
+ * Begin a training step: retain the values this sequence's backward will consume -
+ * one mixer output, one ffn output and one residual per layer (the residual stream is
+ * overwritten in place, so each layer needs its own copy), plus the GDN chunk-boundary
+ * state per GDN layer under a full-sequence schedule. The step is a reader of the
+ * current version, so an update is refused until it ends; its buffers are freed by
+ * engine_train_step_end in the order the free points allow.
+ *
+ * This is the retention half of the plan's training-step context; the backward that
+ * consumes the values is Stage 4.
+ */
+int engine_train_step_begin(EngineHandle *engine, int tokens, int chunk_count,
+                           struct TrainStep **out_step);
+int engine_train_step_end(struct TrainStep *step);
+
+/** How many values a step of this size retains, and how many bytes of GDN
+ *  chunk-boundary state they include - the numbers the plan's truncated-vs-full BPTT
+ *  choice is made from. */
+int engine_train_step_plan(EngineHandle *engine, int tokens, int chunk_count,
+                          int *saved_count, long long *gdn_state_elements);
+
+/**
+ * Teacher-forced forward over ONE sequence, from position 0 (call engine_reset
+ * between steps). For every selected position - next-token label shift, optional
+ * prompt/padding mask, explicit positions - the natural-log log-probability of the
+ * label is written to `output->logprobs`, computed on the device row by row so no
+ * [tokens, vocab] tensor is ever materialised. Independent sequences are never
+ * flattened into one causal sequence.
+ */
+int engine_train_forward(EngineHandle *engine, const int *token_ids, int tokens,
+                         const int64_t *positions, const int *labels, const uint8_t *mask,
+                         int shift, struct TrainForwardOutput *output);
 
 #ifdef __cplusplus
 }

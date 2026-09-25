@@ -517,6 +517,14 @@ int model_desc_parse(const char *json, struct ModelDesc *out, char *err, size_t 
     return model_desc_validate(out, err, err_len);
 }
 
+int model_desc_role_from_name(const char *name) {
+    if (name == NULL) return -1;
+    for (int role = 0; role < ROLE_COUNT; ++role) {
+        if (strcmp(kRoleNames[role], name) == 0) return role;
+    }
+    return -1;
+}
+
 int model_desc_role_index(const struct ModelDesc *desc, int role) {
     for (int i = 0; i < desc->role_count; ++i)
         if (desc->role_ids[i] == role) return i;

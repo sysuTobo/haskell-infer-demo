@@ -193,7 +193,10 @@ equal highest BF16 reference logits are treated as ties.
   `test_region_inventory`, which checks the plan's in-scope forward path is
   inventoried region by region, that the inventory and the manifest registry cannot
   drift apart, and that every registered case-pair verdict carries the evidence it
-  needs. The rest of ctest
+  needs, and `test_train`, which checks the trainable runtime's ownership objects:
+  tying, frozen parameters with no training state, the borrow/update/free lifetime
+  rules, publication with derived-copy refresh, the accumulation schedule, replicas and
+  the teacher-forcing plan. The rest of ctest
   needs a GPU: `test_engine_resources` (repeated failing initializations leave no
   handle and no device memory; skips itself when no device is visible),
   `test_collective` (event-ordered copies and the cross-device all-reduce on 2
@@ -206,7 +209,11 @@ equal highest BF16 reference logits are treated as ties.
   over head dims, GQA and KV lengths), `test_gemm_invariance` (one M-row call vs
   per-row and prefix splits at the real projection shapes) and `test_attention_lse`
   (the query that asks FlashInfer for the LSE a backward needs, and checks the
-  output is unchanged), and the
+  output is unchanged), `test_train_forward` (the Stage-3 gate on the synthetic
+  checkpoint: all-position forward against a transformers forward, teacher-forced
+  log-probabilities, tied roles, a synthetic update that must refresh both readers and
+  the derived FP32 copy, and the training-step lifetime; it skips itself when the
+  checkpoint is absent), and the
   operator-level regressions `test_attention` (causal GQA, KV write, output
   gate), `test_gdn` (FLA recurrent decode, causal-conv1d, gated norm), `test_moe`
   (router, permute, expert GEMMs, combine, EP shards), `test_mla` (MLA chunking
@@ -242,13 +249,15 @@ equal highest BF16 reference logits are treated as ties.
 - `tests/test_manifest_compare_cli.py` — drives the real executable's
   `manifest-compare` over built manifests and checks the exit codes the contract
   fixes (0 admitted, 1 rejected, 2 legacy/unverified, 3 diagnostic-only).
-- `cabal test all --enable-tests` — two suites, neither needing a GPU:
+- `cabal test all --enable-tests` — three suites, none needing a GPU:
   `infer-tests` (descriptor round-trip, layer plan and placement; with
   `INFER_MODEL_DIR` set it also checks the adapter still reproduces
   `descriptors/*.json`) and `infer-generation-tests`, which drives the real
   generation loop and tokenizer wrapper against a scriptable C stub of the engine
   — token budgets, first/later EOS, prefill/decode failures and the cleanup that
-  follows them.
+  follows them. `infer-trainer-tests` links `csrc/train.c` directly and requires the
+  Haskell teacher-forcing plan and the C implementation of the same schedule to agree
+  across shifts, masks, forced labels and explicit positions.
 - `ctest` also runs `test_norm` (both RMSNorm variants) and `test_rope` (partial
   and full rotation), each against a CPU reference.
 - `tests/test_engine.py --rms-tolerance` defaults to 0.1 and is raised per family
@@ -305,6 +314,7 @@ migrated from handwritten CUDA to FlashInfer + FLA + causal-conv1d.
 | 10 | Resource safety and regression gates: buffer ownership at allocation, cross-device read-completion ordering, bounded safetensors parsing, tokenizer capacity/streaming protocol, generation budget/EOS/error semantics, MLA shared-memory bound, TP shard-coverage rule, FP32 expert-parallel merge | ✅ verified on sm_86 (A40): ctest 11/11, cargo 11/11, hspec 41 + 14, Qwen3.8 golden bitwise identical, TP2 rms ≤ 0.05 with identical tokens |
 | 11 | Execution manifest and capture provenance (plan Stage 0): content identities `semantic_id`/`numerical_policy_id`/`deployment_id` over canonical blocks, build-time provenance generation, parameter identity, region/case determinism registry, and strict/diagnostic/legacy capture comparison | ✅ CPU gates (ctest `test_manifest` + `test_manifest_hashes`, hspec manifest specs, CLI runner); engine query verified on sm_86 |
 | 12 | Region inventory and cross-case harness (plan Stage 1): a committed inventory of every in-scope dense/dense-hybrid forward region (inputs, outputs, persistent state, saved-for-backward values, case availability) with a per-case-pair verdict (`exact`/`exception`/`unverified`/`not_applicable`), the device fixtures that compare identical inputs and state across cases, explicit unsupported-shape/case rejection, and the region entry-point cost | ✅ CPU gate `test_region_inventory` + device harness `test_region_cases` on sm_86 |
+| 14 | Trainable runtime and parameter lifecycle (plan Stage 3): a parameter store with logical ids, tying, frozen parameters, versions and derived copies; exclusive update windows whose publication casts masters and refreshes every derived copy; teacher-forced all-position forward with a fused row-by-row log-softmax; a training step that retains activations and GDN chunk-boundary states; and the Haskell schedule with its typed handles | ✅ CPU store/lifetime gate + device gate on the synthetic checkpoint + the Haskell schedule cross-check |
 | 13 | Feasibility and invariance experiments (plan Stage 2): PP inertness on a one-GPU model (logits + 324 tap dumps), GDN decomposition with prepare/core attribution, attention tiling across head dims/GQA/KV lengths, GEMM shape invariance at the real projection shapes, and the attention forward/backward pair (LSE availability, convention, gradient check, resource estimate) | ✅ six experiments on sm_86; six case pairs became measured `exception`s; no pair promoted to `exact` |
 
 Known gaps, stated rather than implied:

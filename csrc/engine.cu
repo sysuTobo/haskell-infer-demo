@@ -272,6 +272,16 @@ struct EngineHandle {
     struct ManifestWeights weights{};
     /* Debug taps: INFER_TAP_LAYERS / INFER_TAP_DIR, see tap.cu. */
     TapConfig taps;
+    /* Stage 3: the checkpoint's tensor index is kept so a training parameter's
+     * element count comes from the tensor that was actually loaded rather than from
+     * a shape formula, and the training path's device scratch. */
+    std::map<std::string, TensorInfo> tensor_index;
+    float *train_scratch = nullptr;   /* [max_chunk] fp32: fused log-probabilities */
+    int *train_labels = nullptr;      /* [max_chunk] int32: labels for the gather */
+    struct TrainStore *train_store = nullptr;
+    /* Training state attach allocated (masters, gradients, optimizer slots), freed at
+     * destroy. A frozen parameter contributes nothing here. */
+    std::vector<void *> train_buffers;
 };
 
 /* Weights of `layer` on device index `dev` (rank index when replicated). */
@@ -929,6 +939,9 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                                   safetensors_last_error());
         fprintf(stderr, "[engine] Scanned %zu tensors from %s\n", index.size(), model_dir);
         compute_weights_identity(index, &eng->weights);
+        /* Kept for the training path: a parameter's element count must come from the
+         * tensor that was loaded, not from a shape formula that could disagree. */
+        eng->tensor_index = index;
 
         const int hidden = eng->dims.hidden_size;
         eng->ctx = new DeviceCtx[eng->num_devices]();
@@ -1325,7 +1338,8 @@ static void compute_logits(EngineHandle *eng, DeviceCtx &last, const __nv_bfloat
 
 /* Layer-wise placement: the residual hops device-to-device once per layer. */
 static void forward_pipelined(EngineHandle *eng, const int64_t *token_ids, int tokens,
-                              float *h_logits) {
+                              float *h_logits, __nv_bfloat16 **out_act = nullptr,
+                              DeviceCtx **out_ctx = nullptr) {
     DeviceCtx &first = eng->ctx[0];
     check_cuda(cudaSetDevice(first.device_id), "Select embedding device");
     check_cuda(cudaMemcpyAsync(first.token_ids, token_ids, tokens * sizeof(int64_t),
@@ -1347,13 +1361,17 @@ static void forward_pipelined(EngineHandle *eng, const int64_t *token_ids, int t
                       eng->dims.hidden_size);
     }
 
-    if (h_logits) {
+    if (h_logits || out_act) {
         const int last_idx = eng->num_devices - 1;
         __nv_bfloat16 *act = move_activation(eng, current, last_idx, tokens);
         current = last_idx;
         DeviceCtx &last = eng->ctx[last_idx];
         check_cuda(cudaSetDevice(last.device_id), "Select logits device");
-        compute_logits(eng, last, act, tokens, h_logits);
+        if (h_logits) compute_logits(eng, last, act, tokens, h_logits);
+        /* The training path needs every position's hidden states, not just the last
+         * row's logits, so it takes the buffer the logits branch would have used. */
+        if (out_act) *out_act = act;
+        if (out_ctx) *out_ctx = &last;
     }
     check_cuda(cudaSetDevice(eng->devices[current]), "Select final forward device");
     check_cuda(cudaStreamSynchronize(eng->ctx[current].stream), "Finish forward");
@@ -1363,7 +1381,8 @@ static void forward_pipelined(EngineHandle *eng, const int64_t *token_ids, int t
  * its weight shards, activations are replicas, and a sublayer whose weights were
  * split all-reduces its partial output before the residual add. */
 static void forward_replicated(EngineHandle *eng, const int64_t *token_ids, int tokens,
-                               float *h_logits) {
+                               float *h_logits, __nv_bfloat16 **out_act = nullptr,
+                               DeviceCtx **out_ctx = nullptr) {
     for (int d = 0; d < eng->num_devices; ++d) {
         DeviceCtx &ctx = eng->ctx[d];
         check_cuda(cudaSetDevice(ctx.device_id), "Select embedding device");
@@ -1431,11 +1450,13 @@ static void forward_replicated(EngineHandle *eng, const int64_t *token_ids, int 
                       eng->ctx[0].residual, tokens, eng->dims.hidden_size);
     }
 
-    if (h_logits) {
+    if (h_logits || out_act) {
         const int last_idx = eng->num_devices - 1;
         DeviceCtx &last = eng->ctx[last_idx];
         check_cuda(cudaSetDevice(last.device_id), "Select logits device");
-        compute_logits(eng, last, last.residual, tokens, h_logits);
+        if (h_logits) compute_logits(eng, last, last.residual, tokens, h_logits);
+        if (out_act) *out_act = last.residual;
+        if (out_ctx) *out_ctx = &last;
     }
     for (int d = 0; d < eng->num_devices; ++d) {
         DeviceCtx &ctx = eng->ctx[d];
@@ -1444,10 +1465,16 @@ static void forward_replicated(EngineHandle *eng, const int64_t *token_ids, int 
     }
 }
 
-static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
-                           int tokens, float *h_logits) {
+static void forward_tokens(EngineHandle *eng, const int64_t *token_ids, int tokens,
+                           float *h_logits, const int64_t *positions_override = nullptr,
+                           __nv_bfloat16 **out_act = nullptr, DeviceCtx **out_ctx = nullptr) {
     std::vector<int64_t> positions(eng->dims.max_chunk);
-    for (int t = 0; t < tokens; ++t) positions[t] = (int64_t)eng->seq_len + t;
+    /* Inference derives the positions from the sequence length; a training call may
+     * pass them explicitly, which is what the teacher-forcing contract needs. */
+    for (int t = 0; t < tokens; ++t) {
+        positions[t] = positions_override != nullptr ? positions_override[t]
+                                                     : (int64_t)eng->seq_len + t;
+    }
     for (int d = 0; d < eng->num_devices; ++d) {
         DeviceCtx &ctx = eng->ctx[d];
         check_cuda(cudaSetDevice(ctx.device_id), "Select position device");
@@ -1457,9 +1484,9 @@ static void forward_tokens(EngineHandle *eng, const int64_t *token_ids,
         check_cuda(cudaStreamSynchronize(ctx.stream), "Finish position upload");
     }
     if (eng->replicated) {
-        forward_replicated(eng, token_ids, tokens, h_logits);
+        forward_replicated(eng, token_ids, tokens, h_logits, out_act, out_ctx);
     } else {
-        forward_pipelined(eng, token_ids, tokens, h_logits);
+        forward_pipelined(eng, token_ids, tokens, h_logits, out_act, out_ctx);
     }
     eng->seq_len += tokens;
 }
@@ -1567,6 +1594,31 @@ static void cleanup_cuda(cudaError_t status) {
 
 void engine_destroy(EngineHandle *eng) {
     if (!eng) return;
+    /* The training store owns its own buffers, but it refuses to be destroyed while
+     * a context or a step is live; at engine teardown there are none, and a leftover
+     * reader would be a bug worth reporting rather than leaking. */
+    for (void *ptr : eng->train_buffers) {
+        if (ptr != nullptr) cleanup_cuda(cudaFree(ptr));
+    }
+    eng->train_buffers.clear();
+    /* The training scratch lives on the logits device. */
+    {
+        const int logits_index = eng->num_devices > 0 ? eng->num_devices - 1 : -1;
+        if (logits_index >= 0 && eng->ctx != nullptr && eng->ctx[logits_index].device_id >= 0) {
+            cleanup_cuda(cudaSetDevice(eng->ctx[logits_index].device_id));
+        }
+        if (eng->train_scratch != nullptr) cleanup_cuda(cudaFree(eng->train_scratch));
+        if (eng->train_labels != nullptr) cleanup_cuda(cudaFree(eng->train_labels));
+        eng->train_scratch = nullptr;
+        eng->train_labels = nullptr;
+    }
+    if (eng->train_store != nullptr) {
+        const TrainStatus status = train_store_destroy(eng->train_store);
+        if (status != TRAIN_OK)
+            fprintf(stderr, "[engine] train store not released at destroy: %s\n",
+                    train_last_error());
+        eng->train_store = nullptr;
+    }
     // Drain every stream before freeing buffers that peer copies may still read.
     if (eng->ctx) {
         for (int d = 0; d < eng->num_devices; ++d) {
@@ -1613,3 +1665,667 @@ void engine_destroy(EngineHandle *eng) {
 
 int engine_vocab_size(const EngineHandle *eng) { return eng ? eng->dims.vocab_size : 0; }
 int engine_seq_len(const EngineHandle *eng) { return eng ? eng->seq_len : 0; }
+
+/* ------------------------------------------------------------------ */
+/* Stage 3: the training path                                         */
+/* ------------------------------------------------------------------ */
+
+namespace {
+
+/* The tensor a (layer, role) was loaded from, or null when the descriptor has no
+ * template for the role or the checkpoint has no tensor for it (a family that has
+ * no such weight). */
+const TensorInfo *role_tensor(const EngineHandle *eng, int role, int layer) {
+    const int slot = model_desc_role_index(&eng->desc, role);
+    if (slot < 0) return nullptr;
+    char name[ENGINE_TEMPLATE_MAX];
+    model_desc_expand(eng->desc.role_templates[slot], layer, 0, name, sizeof(name));
+    auto it = eng->tensor_index.find(name);
+    return it == eng->tensor_index.end() ? nullptr : &it->second;
+}
+
+long long tensor_elements(const TensorInfo &ti) {
+    long long elements = 1;
+    for (int i = 0; i < ti.ndim; ++i) elements *= ti.shape[i];
+    return elements;
+}
+
+/* Where a role's BF16 weight lives for one layer in one rank. The role targets are
+ * the same fields the loader filled, so a training write lands on the buffer the
+ * forward reads - that is what makes a publication visible to every reader without
+ * a second copy of the weights. */
+__nv_bfloat16 *layer_role_buffer(EngineHandle *eng, int layer, int role, int rank) {
+    if (layer < 0) {
+        /* Global roles: the embedding is loaded per device, the LM head and the final
+         * norm only on the logits device. */
+        DeviceCtx &ctx = eng->ctx[rank == 0 ? 0 : eng->num_devices - 1];
+        if (role == ROLE_EMBED) return ctx.embed_w;
+        if (role == ROLE_LM_HEAD) return ctx.lm_head_w;
+        if (role == ROLE_FINAL_NORM) return ctx.final_norm_w;
+        return nullptr;
+    }
+    LayerWeights &lw = eng->replicated ? eng->layers[layer * eng->num_devices + rank]
+                                      : eng->layers[layer];
+    __nv_bfloat16 **target = role_target(lw, role);
+    return target == nullptr ? nullptr : *target;
+}
+
+/* The FP32 derived copy of a role's BF16 weight, when the engine keeps one. The GDN
+ * norm weight is the case the plan names: it is cast once at load and the forward
+ * reads the FP32 copy, so an update that refreshed only the BF16 source would leave
+ * the model reading the old weight. */
+float *layer_role_derived(EngineHandle *eng, int layer, int role, int rank) {
+    if (role != ROLE_GDN_NORM || layer < 0) return nullptr;
+    LayerWeights &lw = eng->replicated ? eng->layers[layer * eng->num_devices + rank]
+                                      : eng->layers[layer];
+    return lw.gdn_norm_f32;
+}
+
+}  // namespace
+
+TrainStore *engine_train_attach(EngineHandle *eng, const struct TrainAttachOptions *options) {
+    if (eng == nullptr) {
+        set_error("engine_train_attach: null engine");
+        return nullptr;
+    }
+    if (eng->train_store != nullptr) return eng->train_store;
+    const struct TrainAttachOptions defaults = {0, nullptr, 0};
+    if (options == nullptr) options = &defaults;
+
+    /* One spec per (layer, role) the checkpoint actually provides. The element count
+     * comes from the loaded tensor, so a write cannot overrun a buffer. */
+    std::vector<TrainParamSpec> specs;
+    std::vector<std::string> templates;
+    std::vector<std::string> names;
+    for (int i = 0; i < eng->desc.role_count; ++i) {
+        const int role = eng->desc.role_ids[i];
+        const bool global = role == ROLE_EMBED || role == ROLE_LM_HEAD || role == ROLE_FINAL_NORM;
+        const int layers = global ? 1 : eng->num_layers;
+        for (int layer = 0; layer < layers; ++layer) {
+            const int scope_layer = global ? -1 : layer;
+            const TensorInfo *ti = role_tensor(eng, role, global ? 0 : layer);
+            if (ti == nullptr) continue;
+            if (layer_role_buffer(eng, scope_layer, role, 0) == nullptr) continue;
+            int frozen = 0;
+            for (int f = 0; f < options->frozen_role_count; ++f) {
+                if (options->frozen_roles[f] == role) frozen = 1;
+            }
+            TrainParamSpec spec;
+            spec.layer = scope_layer;
+            spec.role = role;
+            spec.elements = tensor_elements(*ti);
+            spec.frozen = frozen;
+            spec.trainable = 1;
+            specs.push_back(spec);
+            templates.push_back(eng->desc.role_templates[i]);
+            names.push_back(model_desc_role_name(role));
+            /* A derived FP32 copy gets its own logical identity so the store can
+             * track it: it is not in the checkpoint, so it is frozen and trainable=0. */
+            if (layer_role_derived(eng, scope_layer, role, 0) != nullptr) {
+                TrainParamSpec copy = spec;
+                copy.role = TRAIN_DERIVED_ROLE_BASE;
+                copy.elements = eng->dims.gdn_head_dim;
+                copy.frozen = 1;
+                copy.trainable = 0;
+                specs.push_back(copy);
+                /* A distinct template text: the store ties specs by (layer, template),
+                 * and a derived buffer is a *different* parameter from its source -
+                 * sharing the text would make it an alias of the source and the
+                 * trainability disagreement would be rejected (correctly). */
+                templates.push_back(std::string(eng->desc.role_templates[i]) + "#f32");
+                names.push_back("gdnNormF32");
+            }
+        }
+    }
+    if (specs.empty()) {
+        set_error("engine_train_attach: the engine has no loadable parameter");
+        return nullptr;
+    }
+    std::vector<const char *> template_ptrs(templates.size());
+    std::vector<const char *> name_ptrs(names.size());
+    for (size_t i = 0; i < templates.size(); ++i) {
+        template_ptrs[i] = templates[i].c_str();
+        name_ptrs[i] = names[i].c_str();
+    }
+    TrainStore *store = train_store_create(specs.data(), template_ptrs.data(), name_ptrs.data(),
+                                           (int)specs.size());
+    if (store == nullptr) {
+        set_error("engine_train_attach: %s", train_last_error());
+        return nullptr;
+    }
+
+    /* Wire the buffers. COMPUTE is the engine's own weight, so nothing is duplicated
+     * and an inference forward sees a published update by construction. */
+    for (int i = 0; i < (int)specs.size(); ++i) {
+        const int logical = train_store_logical_of(store, specs[i].layer, specs[i].role);
+        if (logical < 0) continue;
+        __nv_bfloat16 *compute = layer_role_buffer(eng, specs[i].layer, specs[i].role, 0);
+        if (compute != nullptr) train_store_set_slot(store, logical, TRAIN_SLOT_COMPUTE, compute);
+        if (specs[i].role == TRAIN_DERIVED_ROLE_BASE) {
+            float *derived = layer_role_derived(eng, specs[i].layer, ROLE_GDN_NORM, 0);
+            train_store_set_slot(store, logical, TRAIN_SLOT_COMPUTE, derived);
+            const int source = train_store_logical_of(store, specs[i].layer, ROLE_GDN_NORM);
+            if (source >= 0 && derived != nullptr) {
+                train_store_register_derived(store, source, logical, TRAIN_DERIVED_BF16_TO_FP32);
+            }
+            continue;
+        }
+        if (!specs[i].trainable || specs[i].frozen) continue;
+        if (!options->allocate_training_state) continue;
+        /* FP32 master, gradient and two optimizer slots, on the device that owns the
+         * parameter. A frozen parameter gets none of this, which is what "frozen
+         * parameters omit unused training state" means in memory. */
+        const int rank_device_index =
+            specs[i].layer < 0 ? (specs[i].role == ROLE_EMBED ? 0 : eng->num_devices - 1)
+                               : eng->layer_device[specs[i].layer];
+        const int device = eng->devices[rank_device_index];
+        const size_t bytes = (size_t)specs[i].elements * sizeof(float);
+        check_cuda(cudaSetDevice(device), "Select training device");
+        float *master = nullptr;
+        float *grad = nullptr;
+        float *slot_m = nullptr;
+        float *slot_v = nullptr;
+        check_cuda(cudaMalloc(&master, bytes), "Allocate master weight");
+        /* The master starts as *the loaded weight in FP32*, not as zero. A publication
+         * casts every master into its compute weight, so a zeroed master would make
+         * the first update silently wipe every parameter the caller did not write -
+         * which is exactly what the Stage-3 gate caught. */
+        __nv_bfloat16 *initial = layer_role_buffer(eng, specs[i].layer, specs[i].role, 0);
+        if (initial != nullptr) {
+            kernel_cast_bf16_f32(master, initial, (int)specs[i].elements, eng->ctx[0].stream);
+            check_cuda(cudaGetLastError(), "Seed the master weight");
+            check_cuda(cudaStreamSynchronize(eng->ctx[0].stream), "Finish master seed");
+        }
+        check_cuda(cudaMalloc(&grad, bytes), "Allocate gradient");
+        check_cuda(cudaMemset(grad, 0, bytes), "Clear gradient");
+        check_cuda(cudaMalloc(&slot_m, bytes), "Allocate optimizer slot m");
+        check_cuda(cudaMemset(slot_m, 0, bytes), "Clear optimizer slot m");
+        check_cuda(cudaMalloc(&slot_v, bytes), "Allocate optimizer slot v");
+        check_cuda(cudaMemset(slot_v, 0, bytes), "Clear optimizer slot v");
+        /* The allocations are owned by the store, so a failed attach cannot leak
+         * them: the caller's cleanup path is train_store_release_buffers. */
+        train_store_set_slot(store, logical, TRAIN_SLOT_MASTER, master);
+        train_store_set_slot(store, logical, TRAIN_SLOT_GRAD, grad);
+        train_store_set_slot(store, logical, TRAIN_SLOT_OPT_M, slot_m);
+        train_store_set_slot(store, logical, TRAIN_SLOT_OPT_V, slot_v);
+        eng->train_buffers.push_back(master);
+        eng->train_buffers.push_back(grad);
+        eng->train_buffers.push_back(slot_m);
+        eng->train_buffers.push_back(slot_v);
+    }
+    /* Replicas: a replicated parameter has one buffer per rank, and the plan forbids
+     * independent optimizers, so the sync requirement is recorded per parameter. */
+    if (eng->replicated) {
+        for (int i = 0; i < (int)specs.size(); ++i) {
+            const int logical = train_store_logical_of(store, specs[i].layer, specs[i].role);
+            if (logical >= 0) {
+                std::vector<int> ordinals(eng->devices.begin(), eng->devices.end());
+                train_store_set_replica_devices(store, logical, (int)ordinals.size(),
+                                                ordinals.data());
+            }
+        }
+    }
+    eng->train_store = store;
+    return store;
+}
+
+TrainStore *engine_train_store(EngineHandle *eng) { return eng ? eng->train_store : nullptr; }
+
+namespace {
+
+/* The CUDA device a logical parameter's buffers live on. */
+int train_param_device(EngineHandle *eng, int logical) {
+    const int index = train_store_alias_at(eng->train_store, logical, 0);
+    if (index < 0) return eng->devices[0];
+    const int layer = train_store_spec_layer(eng->train_store, index);
+    const int role = train_store_spec_role(eng->train_store, index);
+    if (layer < 0) return role == ROLE_EMBED ? eng->devices[0] : eng->devices[eng->num_devices - 1];
+    return eng->devices[eng->layer_device[layer]];
+}
+
+}  // namespace
+
+int engine_train_begin_update(EngineHandle *eng) {
+    if (eng == nullptr || eng->train_store == nullptr) {
+        set_error("engine_train_begin_update: no training store attached");
+        return ENGINE_ERR_STATE;
+    }
+    const TrainStatus status = train_store_begin_update(eng->train_store);
+    if (status != TRAIN_OK) {
+        set_error("engine_train_begin_update: %s", train_last_error());
+        return ENGINE_ERR_STATE;
+    }
+    return ENGINE_OK;
+}
+
+int engine_train_write_master(EngineHandle *eng, int logical, const float *host_values) {
+    if (eng == nullptr || eng->train_store == nullptr) {
+        set_error("engine_train_write_master: no training store attached");
+        return ENGINE_ERR_STATE;
+    }
+    if (!train_store_in_update(eng->train_store)) {
+        set_error("engine_train_write_master: no update window is open");
+        return ENGINE_ERR_STATE;
+    }
+    float *master = (float *)train_store_slot(eng->train_store, logical, TRAIN_SLOT_MASTER);
+    if (master == nullptr) {
+        set_error("engine_train_write_master: parameter %d has no master weight (frozen or "
+                  "training state not allocated)", logical);
+        return ENGINE_ERR_WEIGHTS;
+    }
+    const long long elements = train_store_elements(eng->train_store, logical);
+    check_cuda(cudaSetDevice(train_param_device(eng, logical)), "Select training device");
+    check_cuda(cudaMemcpy(master, host_values, (size_t)elements * sizeof(float),
+                          cudaMemcpyHostToDevice), "Upload master weight");
+    return ENGINE_OK;
+}
+
+/* The publication: every written master becomes the BF16 compute weight of every
+ * reader, and then every derived copy is recomputed from its source. Doing both here
+ * is what the plan means by "publishing follows BF16 casting and all derived-copy
+ * refreshes (in particular refresh gdn_norm_f32, not just its BF16 source)": the
+ * store marks the copies stale on publish and refuses to end the window while one is
+ * still stale, so the refresh cannot be skipped. */
+int engine_train_publish(EngineHandle *eng) {
+    if (eng == nullptr || eng->train_store == nullptr) {
+        set_error("engine_train_publish: no training store attached");
+        return ENGINE_ERR_STATE;
+    }
+    TrainStore *store = eng->train_store;
+    if (!train_store_in_update(store)) {
+        set_error("engine_train_publish: no update window is open");
+        return ENGINE_ERR_STATE;
+    }
+    /* Which DeviceCtx holds a rank's copy of a parameter: a replicated engine has one
+     * per rank, a layer-split engine keeps the embedding on the first device and the
+     * LM head and final norm on the logits device. */
+    auto ctx_index_for = [&](int layer, int role, int rank) -> int {
+        if (eng->replicated) return rank;
+        if (layer < 0) return role == ROLE_EMBED ? 0 : eng->num_devices - 1;
+        return eng->layer_device[layer];
+    };
+    try {
+        /* 1. Every alias of every parameter that has a master becomes the BF16 weight
+         * its readers load. A tied parameter has one entry per reader, and both are
+         * written: that is what resolving the tie in the store buys. */
+        for (int logical = 0; logical < train_store_logical_count(store); ++logical) {
+            float *master = (float *)train_store_slot(store, logical, TRAIN_SLOT_MASTER);
+            if (master == nullptr) continue;
+            const long long elements = train_store_elements(store, logical);
+            const int aliases = train_store_alias_count(store, logical);
+            const int ranks = eng->replicated ? eng->num_devices : 1;
+            for (int a = 0; a < aliases; ++a) {
+                const int index = train_store_alias_at(store, logical, a);
+                const int layer = train_store_spec_layer(store, index);
+                const int role = train_store_spec_role(store, index);
+                if (role == TRAIN_DERIVED_ROLE_BASE) continue;
+                for (int r = 0; r < ranks; ++r) {
+                    __nv_bfloat16 *compute = layer_role_buffer(eng, layer, role, r);
+                    if (compute == nullptr) continue;
+                    const int ci = ctx_index_for(layer, role, r);
+                    check_cuda(cudaSetDevice(eng->devices[ci]), "Select publish device");
+                    kernel_cast_f32_bf16(compute, master, (int)elements, eng->ctx[ci].stream);
+                    check_cuda(cudaGetLastError(), "Cast master to compute weight");
+                    check_cuda(cudaStreamSynchronize(eng->ctx[ci].stream),
+                               "Finish weight publication");
+                }
+            }
+        }
+        /* 2. The version moves and every derived copy goes stale. */
+        const TrainStatus published = train_store_publish(store);
+        if (published != TRAIN_OK) {
+            set_error("engine_train_publish: %s", train_last_error());
+            return ENGINE_ERR_STATE;
+        }
+        /* 3. Refresh them from the source that was just written, then close. The
+         * store refuses to close while a stale copy remains, so this step cannot be
+         * skipped without the failure being visible. */
+        const int ranks = eng->replicated ? eng->num_devices : 1;
+        for (int i = 0; i < train_store_derived_count(store); ++i) {
+            int source = -1, derived = -1;
+            TrainDerivedKind kind = TRAIN_DERIVED_BF16_TO_FP32;
+            int stale = 0;
+            if (train_store_derived_at(store, i, &source, &derived, &kind, &stale) != TRAIN_OK)
+                continue;
+            const int layer = train_store_spec_layer(store, train_store_alias_at(store, derived, 0));
+            const long long elements = train_store_elements(store, derived);
+            for (int r = 0; r < ranks; ++r) {
+                float *target = layer_role_derived(eng, layer, ROLE_GDN_NORM, r);
+                __nv_bfloat16 *from = layer_role_buffer(eng, layer, ROLE_GDN_NORM, r);
+                if (target == nullptr || from == nullptr) continue;
+                const int ci = ctx_index_for(layer, ROLE_GDN_NORM, r);
+                check_cuda(cudaSetDevice(eng->devices[ci]), "Select derived-refresh device");
+                kernel_cast_bf16_f32(target, from, (int)elements, eng->ctx[ci].stream);
+                check_cuda(cudaGetLastError(), "Refresh derived copy");
+                check_cuda(cudaStreamSynchronize(eng->ctx[ci].stream), "Finish derived refresh");
+            }
+            train_store_derived_refreshed(store, i);
+        }
+        const TrainStatus closed = train_store_end_update(store);
+        if (closed != TRAIN_OK) {
+            set_error("engine_train_publish: %s", train_last_error());
+            return ENGINE_ERR_STATE;
+        }
+    } catch (const std::exception &e) {
+        set_error("engine_train_publish: %s", e.what());
+        return ENGINE_ERR_CUDA;
+    }
+    return ENGINE_OK;
+}
+
+int engine_train_end_update(EngineHandle *eng) {
+    if (eng == nullptr || eng->train_store == nullptr) {
+        set_error("engine_train_end_update: no training store attached");
+        return ENGINE_ERR_STATE;
+    }
+    const TrainStatus status = train_store_end_update(eng->train_store);
+    if (status != TRAIN_OK) {
+        set_error("engine_train_end_update: %s", train_last_error());
+        return ENGINE_ERR_STATE;
+    }
+    return ENGINE_OK;
+}
+
+/* Teacher forcing over one sequence. The LM head is evaluated one row at a time into
+ * the engine's single-row logits buffer, so nothing here ever materialises a
+ * [tokens, vocab] tensor on the device: the plan's "chunked/fused LM-head/loss
+ * evaluation". `output->all_logits`, when asked for, is the debug/reference path and
+ * is the caller's own host buffer. */
+int engine_train_forward(EngineHandle *eng, const int *token_ids, int tokens,
+                         const int64_t *positions, const int *labels, const uint8_t *mask,
+                         int shift, struct TrainForwardOutput *output) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr || !eng->state_valid) {
+        set_error("engine_train_forward: engine is null or needs engine_reset");
+        return ENGINE_ERR_STATE;
+    }
+    if (token_ids == nullptr || output == nullptr || tokens < 1) {
+        set_error("engine_train_forward: tokens and an output structure are required");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (output->all_logits == nullptr && output->logprobs == nullptr) {
+        set_error("engine_train_forward: ask for all logits, log-probabilities, or both");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (tokens > eng->dims.max_seq_len || tokens > eng->dims.max_chunk) {
+        set_error("engine_train_forward: sequence length %d exceeds the %d-token chunk",
+                  tokens, eng->dims.max_chunk);
+        return ENGINE_ERR_SEQ_FULL;
+    }
+    /* One sequence at a time, from the start: a teacher-forced step is a full-sequence
+     * forward, and continuing a half-consumed sequence would silently mix two
+     * traversals (the plan forbids flattening independent sequences). */
+    if (eng->seq_len != 0) {
+        set_error("engine_train_forward: the sequence is at position %d; engine_reset first",
+                  eng->seq_len);
+        return ENGINE_ERR_STATE;
+    }
+    if (shift < 1) {
+        set_error("engine_train_forward: shift must be at least 1");
+        return ENGINE_ERR_CONFIG;
+    }
+    for (int t = 0; t < tokens; ++t) {
+        if (token_ids[t] < 0 || token_ids[t] >= eng->dims.vocab_size) {
+            set_error("engine_train_forward: token %d at offset %d is out of range", token_ids[t], t);
+            return ENGINE_ERR_CONFIG;
+        }
+    }
+
+    /* The selection is the pure plan from train.c, so the same mapping is testable on
+     * the CPU. */
+    std::vector<int> ids(token_ids, token_ids + tokens);
+    std::vector<TrainForcedPosition> selected(tokens);
+    const int selected_count = train_plan_teacher_forcing(tokens, ids.data(), labels, mask,
+                                                          positions, shift, selected.data(),
+                                                          (int)selected.size());
+    if (selected_count < 0) {
+        set_error("engine_train_forward: %s", train_last_error());
+        return ENGINE_ERR_CONFIG;
+    }
+    /* A caller that asked only for all-logits (the reference/debug path) gets the
+     * selection reported and nothing else; a caller that asked for log-probabilities
+     * with nothing to compute them for is told, because that is a silent no-op. */
+    if (output->all_logits == nullptr && output->logprobs == nullptr) {
+        set_error("engine_train_forward: nothing was asked for");
+        return ENGINE_ERR_CONFIG;
+    }
+
+    try {
+        std::vector<int64_t> ids64(token_ids, token_ids + tokens);
+        __nv_bfloat16 *act = nullptr;
+        DeviceCtx *last = nullptr;
+        forward_tokens(eng, ids64.data(), tokens, nullptr, positions, &act, &last);
+        if (last == nullptr || act == nullptr) {
+            set_error("engine_train_forward: the forward produced no hidden states");
+            return ENGINE_ERR_CUDA;
+        }
+        const int hidden = eng->dims.hidden_size;
+        const int vocab = eng->dims.vocab_size;
+        check_cuda(cudaSetDevice(last->device_id), "Select logits device");
+        if (eng->train_scratch == nullptr) {
+            check_cuda(cudaMalloc(&eng->train_scratch, (size_t)eng->dims.max_chunk * sizeof(float)),
+                       "Allocate training log-probability scratch");
+            check_cuda(cudaMalloc(&eng->train_labels, (size_t)eng->dims.max_chunk * sizeof(int)),
+                       "Allocate training label scratch");
+        }
+
+        auto norm_row = [&](int row) {
+            const __nv_bfloat16 *x = act + (size_t)row * hidden;
+            if (eng->dims.norm_style == 1) {
+                kernel_rms_norm_plain(last->workspace, x, last->final_norm_w, hidden, 1,
+                                      eng->dims.rms_eps, last->stream);
+            } else {
+                kernel_gemma_rms_norm(last->workspace, x, last->final_norm_w, hidden, 1,
+                                      eng->dims.rms_eps, last->stream);
+            }
+            check_cuda(cudaGetLastError(), "Final norm for one row");
+            check_forward(gemm_bf16_f32out(last->cublas, last->d_logits, last->workspace,
+                                          last->lm_head_w, 1, vocab, hidden), "LM head for one row");
+        };
+
+        if (output->all_logits != nullptr) {
+            for (int row = 0; row < tokens; ++row) {
+                norm_row(row);
+                check_cuda(cudaMemcpyAsync(output->all_logits + (size_t)row * vocab, last->d_logits,
+                                           (size_t)vocab * sizeof(float), cudaMemcpyDeviceToHost,
+                                           last->stream), "Download one row of logits");
+            }
+            check_cuda(cudaStreamSynchronize(last->stream), "Finish logits download");
+        }
+
+        if (output->logprobs != nullptr && selected_count > 0) {
+            if (output->all_logits != nullptr) {
+                /* The rows are already here: take the natural-log log-softmax on the
+                 * host rather than reading the device again. */
+                for (int j = 0; j < selected_count; ++j) {
+                    const float *row = output->all_logits + (size_t)selected[j].query * vocab;
+                    float row_max = -INFINITY;
+                    for (int v = 0; v < vocab; ++v) row_max = std::max(row_max, row[v]);
+                    double sum = 0.0;
+                    for (int v = 0; v < vocab; ++v) sum += std::exp((double)row[v] - row_max);
+                    const int label = selected[j].label;
+                    if (label < 0 || label >= vocab) {
+                        set_error("engine_train_forward: label %d is out of range", label);
+                        return ENGINE_ERR_CONFIG;
+                    }
+                    output->logprobs[j] = (float)((double)row[label] - (row_max + std::log(sum)));
+                }
+            } else {
+                /* Fused: the row never leaves the device; only the scalar comes back. */
+                for (int j = 0; j < selected_count; ++j) {
+                    norm_row(selected[j].query);
+                    std::vector<int> one{selected[j].label};
+                    check_cuda(cudaMemcpyAsync(eng->train_labels + j, one.data(), sizeof(int),
+                                               cudaMemcpyHostToDevice, last->stream),
+                               "Upload the label");
+                    kernel_logprob_gather(eng->train_scratch + j, last->d_logits,
+                                          eng->train_labels + j, 1, vocab, last->stream);
+                }
+                check_cuda(cudaMemcpyAsync(output->logprobs, eng->train_scratch,
+                                           (size_t)selected_count * sizeof(float),
+                                           cudaMemcpyDeviceToHost, last->stream),
+                           "Download log-probabilities");
+                check_cuda(cudaStreamSynchronize(last->stream), "Finish logprob download");
+            }
+        }
+        if (output->selected != nullptr) {
+            for (int j = 0; j < selected_count; ++j) output->selected[j] = selected[j].query;
+        }
+        output->selected_count = selected_count;
+    } catch (const std::exception &e) {
+        return forward_error(eng, e);
+    }
+    return ENGINE_OK;
+}
+
+/* The training step's retention plan: what a sequence's backward needs, per layer.
+ * The activation list is per layer because the residual stream is updated in place -
+ * which is exactly why the plan requires a training-step context to retain them
+ * rather than read them later. A fixed backward sequence (Stage 4) means the free
+ * points can be per-layer; it does not mean the values can be skipped. */
+/* FP32 elements one layer's retained chunk-boundary states cost. */
+long long train_step_gdn_state_elements_plan(int chunk_count, int value_heads, int head_dim);
+
+namespace {
+
+struct StepValue {
+    std::string name;
+    int layer;
+    long long elements;
+    int alias_of;
+    int free_after;
+    int device_index;
+};
+
+std::vector<StepValue> step_plan(const EngineHandle *eng, int tokens, int chunk_count) {
+    std::vector<StepValue> values;
+    const long long activation = (long long)tokens * eng->dims.hidden_size;
+    for (int layer = 0; layer < eng->num_layers; ++layer) {
+        const int device_index = eng->replicated ? 0 : eng->layer_device[layer];
+        const std::string prefix = "layer" + std::to_string(layer) + ".";
+        /* The mixer and the ffn outputs are consumed by that layer's backward; the
+         * residual is too, and cannot be re-read because the next layer overwrites it. */
+        values.push_back({prefix + "mixerOut", layer, activation, -1, 1, device_index});
+        values.push_back({prefix + "ffnOut", layer, activation, -1, 1, device_index});
+        values.push_back({prefix + "residual", layer, activation, -1, 1, device_index});
+        /* A GDN layer's chunk-boundary states are what let a full-sequence gradient
+         * cross the internal chunk boundaries instead of being truncated at them. */
+        const int mixer = eng->desc.layer_mixers[layer];
+        if (mixer == ENGINE_MIXER_GDN) {
+            const long long state = train_step_gdn_state_elements_plan(
+                chunk_count, eng->dims.gdn_num_v_heads, eng->dims.gdn_head_dim);
+            values.push_back({prefix + "gdnChunkState", layer, state, -1, 2, device_index});
+        }
+    }
+    return values;
+}
+
+}  // namespace
+
+long long train_step_gdn_state_elements_plan(int chunk_count, int value_heads, int head_dim) {
+    return (long long)chunk_count * value_heads * head_dim * head_dim;
+}
+
+int engine_train_step_plan(EngineHandle *eng, int tokens, int chunk_count, int *saved_count,
+                          long long *gdn_state_elements) {
+    if (eng == nullptr || tokens < 1 || chunk_count < 1) {
+        set_error("engine_train_step_plan: tokens and chunk_count must be positive");
+        return ENGINE_ERR_CONFIG;
+    }
+    const std::vector<StepValue> values = step_plan(eng, tokens, chunk_count);
+    long long gdn = 0;
+    for (const StepValue &v : values) {
+        if (v.name.find("gdnChunkState") != std::string::npos) gdn += v.elements;
+    }
+    if (saved_count) *saved_count = (int)values.size();
+    if (gdn_state_elements) *gdn_state_elements = gdn;
+    return ENGINE_OK;
+}
+
+int engine_train_step_begin(EngineHandle *eng, int tokens, int chunk_count,
+                           struct TrainStep **out_step) {
+    if (eng == nullptr || eng->train_store == nullptr) {
+        set_error("engine_train_step_begin: no training store attached");
+        return ENGINE_ERR_STATE;
+    }
+    if (out_step == nullptr) {
+        set_error("engine_train_step_begin: null output");
+        return ENGINE_ERR_CONFIG;
+    }
+    *out_step = nullptr;
+    if (tokens < 1 || tokens > eng->dims.max_chunk || chunk_count < 1) {
+        set_error("engine_train_step_begin: tokens in [1, %d] and chunk_count >= 1 are required",
+                  eng->dims.max_chunk);
+        return ENGINE_ERR_CONFIG;
+    }
+    const std::vector<StepValue> values = step_plan(eng, tokens, chunk_count);
+    if (values.empty()) {
+        set_error("engine_train_step_begin: the model has no layers to retain");
+        return ENGINE_ERR_STATE;
+    }
+    std::vector<TrainSavedSpec> specs(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        specs[i].name = values[i].name.c_str();
+        specs[i].layer = values[i].layer;
+        specs[i].elements = values[i].elements;
+        specs[i].alias_of = values[i].alias_of;
+        specs[i].free_after = values[i].free_after;
+    }
+    TrainStep *step = train_step_create(eng->train_store, specs.data(), (int)specs.size());
+    if (step == nullptr) {
+        set_error("engine_train_step_begin: %s", train_last_error());
+        return ENGINE_ERR_STATE;
+    }
+    if (train_step_set_bptt(step, TRAIN_BPTT_FULL_SEQUENCE, chunk_count) != TRAIN_OK) {
+        set_error("engine_train_step_begin: %s", train_last_error());
+        train_step_destroy(step);
+        return ENGINE_ERR_STATE;
+    }
+    /* Retain the buffers. The values are *allocated and kept*: a step that recorded
+     * what it needs but held nothing would not be a retention at all. */
+    for (size_t i = 0; i < values.size(); ++i) {
+        const int ci = values[i].device_index;
+        check_cuda(cudaSetDevice(eng->devices[ci]), "Select retention device");
+        void *buffer = nullptr;
+        const size_t bytes = (size_t)values[i].elements * sizeof(float);
+        if (cudaMalloc(&buffer, bytes) != cudaSuccess || buffer == nullptr) {
+            set_error("engine_train_step_begin: cannot retain '%s'", values[i].name.c_str());
+            train_step_destroy(step);
+            return ENGINE_ERR_ALLOC;
+        }
+        /* The retained bytes are the engine's, so the step's cleanup frees them
+         * through the same list; a step whose creation failed has already released
+         * everything it retained. */
+        eng->train_buffers.push_back(buffer);
+        if (train_step_retain(step, (int)i, buffer) != TRAIN_OK) {
+            set_error("engine_train_step_begin: %s", train_last_error());
+            train_step_destroy(step);
+            return ENGINE_ERR_STATE;
+        }
+    }
+    *out_step = step;
+    return ENGINE_OK;
+}
+
+int engine_train_step_end(struct TrainStep *step) {
+    if (step == nullptr) {
+        set_error("engine_train_step_end: null step");
+        return ENGINE_ERR_CONFIG;
+    }
+    /* Release in the order the free points allow: the aliases first, then the value
+     * they alias. A caller that skips a release is told by train_step_destroy. */
+    const int count = train_step_saved_count(step);
+    for (int i = count - 1; i >= 0; --i) {
+        const TrainStatus status = train_step_free(step, i);
+        if (status != TRAIN_OK && status != TRAIN_ERR_STATE) {
+            set_error("engine_train_step_end: %s", train_last_error());
+            return ENGINE_ERR_STATE;
+        }
+    }
+    const TrainStatus status = train_step_destroy(step);
+    if (status != TRAIN_OK) {
+        set_error("engine_train_step_end: %s", train_last_error());
+        return ENGINE_ERR_STATE;
+    }
+    return ENGINE_OK;
+}

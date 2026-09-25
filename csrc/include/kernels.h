@@ -118,6 +118,14 @@ void kernel_embedding(__nv_bfloat16 *out, const __nv_bfloat16 *table,
 /*  Small helpers                                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Natural-log log-softmax of one row plus the label's log-probability:
+ * out[row] = logits[row*label] - logsumexp(logits[row, :]), computed in FP32 on the
+ * device so a teacher-forced loss never materialises a [rows, vocab] tensor.
+ */
+void kernel_logprob_gather(float *out, const float *logits, const int *labels, int rows,
+                           int vocab, cudaStream_t stream);
+
 /** BF16 to F32 cast. */
 void kernel_cast_bf16_f32(float *out, const __nv_bfloat16 *in, int n,
                           cudaStream_t stream);

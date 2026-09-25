@@ -71,8 +71,9 @@ extern "C" {
  * backward            gradient computation (absent)
  *
  * The four absent cases are the trainer traversal the plan's Stages 3-4
- * introduce. Registering them as reachable would claim an API that does not
- * exist. */
+ * introduce. Stage 3 gave the engine a single-sequence teacher-forced forward, but
+ * not the traversal a trainer needs (a per-step schedule, recomputation, a backward),
+ * so registering these as reachable would still claim an API that does not exist. */
 #define REGION_CASE_CHUNKED_PREFILL "chunked_prefill"
 #define REGION_CASE_RECURRENT_PREFILL "recurrent_prefill"
 #define REGION_CASE_TAIL1 "tail1"

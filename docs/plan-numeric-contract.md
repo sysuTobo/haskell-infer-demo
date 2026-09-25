@@ -1,9 +1,11 @@
 # Plan: Numerical Execution Contract, Haskell Training, and Asynchronous RL
 
-Status: Stages 2–8 proposed, not implemented; **Stages 0 and 1 are implemented**
-(the versioned execution manifest with capture provenance, and the region
-inventory with its cross-case harness — see [manifest-contract.md](manifest-contract.md),
-[worklog.md](worklog.md) and `csrc/regions.c`).
+Status: Stages 4–8 proposed, not implemented; **Stages 0-3 are implemented**
+(the versioned execution manifest with capture provenance, the region inventory
+with its cross-case harness, the feasibility/invariance experiments, and the
+trainable runtime's parameter lifecycle — see
+[manifest-contract.md](manifest-contract.md), [worklog.md](worklog.md),
+`csrc/regions.c` and `csrc/include/train.h`).
 Revised after the design review, 2026-09-23.
 Extends [design.md](design.md). This document separates current capabilities,
 proposed interfaces, measured observations and hypotheses requiring experiments.
@@ -388,6 +390,59 @@ whole-model RMS; E has a concrete forward/backward path and resource estimate.
 Retain state-loss tests rather than replacing them with an arbitrary tighter RMS.
 
 ### Stage 3 — Trainable runtime and parameter lifecycle
+
+**Status: implemented and verified, 2026-09-25.** The C side is
+`csrc/include/train.h` + `csrc/train.c` (the ownership objects, CUDA-free and
+CPU-tested) with the engine-facing half in `csrc/engine.cu`
+(`engine_train_attach/begin_update/write_master/publish/step_*/forward`); the Haskell
+side is `src/Infer/Trainer.hs` with `Infer.Trainer.Types` and `Infer.Trainer.Plan`.
+Gates: `ctest test_train` (CPU: tying, frozen parameters, the borrow/update lifetime,
+publication and derived copies, the accumulation schedule, replicas, the
+teacher-forcing plan), `ctest test_train_forward` (the synthetic checkpoint on a
+device), `cabal test infer-trainer-tests` (the two implementations of one schedule
+must agree). The gate below is met:
+
+- **the tiny-model all-position forward agrees with an independent reference.** The
+  synthetic Qwen3-Next checkpoint (4 layers, vocab 1024) is compared position by
+  position against a `transformers` forward: 12/12 top-1 with logit rms 0.004. The
+  teacher-forced selection (next-token label shift, prompt/padding mask, explicit
+  positions) is checked against that reference's own log-softmax (worst gap 0.007) and
+  the engine's device-fused path against its host path (5e-7).
+- **tied roles stay tied.** Qwen3-4B's `lmHead` templates onto its embedding, so the
+  store resolves 35 specs into 34 logical parameters with one master and two compute
+  buffers, and a publication writes *both* readers. On the synthetic model given the
+  same tie, a synthetic update of the tied parameter matches an independent torch
+  forward whose two tensors were edited with the same values (rms 0.01, 12/12 top-1).
+- **a synthetic parameter update refreshes all readers.** A master starts as the
+  loaded weight in FP32; a no-op publication is bitwise inert on both the inference and
+  the training reader (max change 0.0); and publishing an updated GDN norm weight
+  matches a torch forward with the same edit (rms 0.004, 12/12) — which is only
+  possible because the FP32 `gdn_norm_f32` copy is refreshed, not just its BF16 source.
+- **lifetime tests reject update/free while a reader or step is active.** An update is
+  refused while a context or a step borrows the version (naming the reader), a second
+  window and a publication with no window are refused, a frozen parameter refuses a
+  master write, a saved value another live value references cannot be freed, and a step
+  with retained values cannot be destroyed until they are released.
+
+The ownership objects are the plan's, and three of the rules are rejections rather
+than assertions: `train_store_begin_update` fails while any reader borrows the store,
+`train_store_destroy`/`train_step_destroy` fail while a step is live, and
+`train_store_end_update` fails while a derived copy of a published parameter is still
+stale — so "publishing follows BF16 casting and all derived-copy refreshes" is
+enforced, not remembered. The store is CUDA-free on purpose: its buffers are opaque
+slots, so the same rules govern the CPU test and the engine.
+
+The teacher-forcing schedule is implemented **twice on purpose** — in Haskell (which
+the plan says owns the traversal) and in C — and the test suite requires the two to
+agree across shifts, masks, forced labels and explicit positions. A split that is only
+asserted by a comment is a split that drifts.
+
+**The bug the gate caught**, recorded because it is what a gate is for: the first
+publication cast *every* master into its compute weight, and the store's masters were
+allocated zeroed, so the first update silently wiped every parameter the caller had
+not written. A master now starts as the loaded weight in FP32, and the gate compares
+the model *before and after* a no-op publication instead of only comparing two
+post-publication readers with each other.
 
 This prerequisite is a real engine/FFI change, not covered by Stage 1 tagging.
 Haskell owns the fixed model traversal, training schedule and typed opaque

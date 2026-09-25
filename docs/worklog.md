@@ -4,12 +4,13 @@ A running snapshot of what this project can do today, what has been verified and
 where it is knowingly incomplete. [README.md](../README.md) describes the
 component layout and how to build and test; [design.md](design.md) holds the
 architecture rationale; [plan-numeric-contract.md](plan-numeric-contract.md) is the
-proposal for the trainer, RL and inference-optimization work — of which **Stages 0,
-1 and 2 are implemented here**: the execution manifest with capture provenance
-(specified in [manifest-contract.md](manifest-contract.md)), the region inventory
-with its cross-case harness (`csrc/regions.c`), and the feasibility/invariance
-experiments that measured what those regions actually guarantee. All three are
-described below.
+proposal for the trainer, RL and inference-optimization work — of which **Stages 0
+through 3 are implemented here**: the execution manifest with capture provenance
+(specified in [manifest-contract.md](manifest-contract.md)), the region inventory with
+its cross-case harness (`csrc/regions.c`), the feasibility/invariance experiments that
+measured what those regions actually guarantee, and the trainable runtime's parameter
+lifecycle (`csrc/include/train.h`, `src/Infer/Trainer.hs`). All four are described
+below.
 
 Last updated: 2026-09-25.
 
@@ -18,13 +19,18 @@ Last updated: 2026-09-25.
 Everything below was run and passed on 2× A40 46 GB (sm_86) unless a line says
 otherwise. No GPU result here is implied by a document edit alone.
 
-Every row below was re-run on 2026-09-25 against the Stage-1 tree. The sm_89 and
-sm_90a lines in "Placement and hardware" are the exceptions, and they say so.
+Every row below was re-run on 2026-09-25 against the tree each stage left, and the
+golden row was re-checked once more after Stage 3's engine changes (the training
+runtime does not touch the inference path). The sm_89 and sm_90a lines in "Placement
+and hardware" are the exceptions, and they say so.
 
 | Gate | Result |
 |---|---|
 | `cargo test --locked --offline` | 11/11 |
-| `ctest --test-dir csrc/build-libs` | 19/19 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_library_ops` |
+| `ctest --test-dir csrc/build-libs` | 21/21 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops` |
+| `ctest test_train` (CPU, Stage 3) | tying (35 specs into 34 logical parameters on Qwen3-4B's descriptor), frozen parameters with no training state, the borrow/update/free lifetime rules, publication with derived-copy refresh, the accumulation schedule, replica sync, and the teacher-forcing plan |
+| `ctest test_train_forward` (Stage 3, synthetic checkpoint) | all-position forward 12/12 top-1 vs a transformers forward (rms 0.004); teacher-forced selection and log-probabilities vs the reference's own log-softmax (gap 0.007); tied roles one logical parameter with two readers; a no-op publication bitwise inert; an updated tied weight and an updated GDN norm weight each matching a torch recomputation with the same edit (rms 0.004-0.01, 12/12); an update refused while a step is live |
+| `cabal test infer-trainer-tests` (CPU, Stage 3) | the Haskell teacher-forcing plan and the C implementation of the same schedule agree across shifts, masks, forced labels and explicit positions |
 | `ctest test_gdn_invariance` (claim B) | prepare **bitwise invariant 51/51** across lengths 2..128 and splits at L-1, L/2, 64; core output ≤ 9.2e-5 (7.2e-3 relative, ≈1 BF16 ULP), FP32 `ssm_state` ≤ 4.2e-4; a 64+64 split at L=128 is bitwise identical |
 | `ctest test_attention_invariance` (claim C) | 264 tilings (head_dim 128/256 x GQA 24x4/24x8/8x4 x kv_len 1..269 x single-query/split), **202 bitwise**, worst 2.0e-3 relative (≈half a BF16 ULP); split-KV disabled is recorded from code, not assumed |
 | `ctest test_gemm_invariance` (claim D) | 251 BF16-output measurements (33 bitwise), worst 5.4e-3 relative (**below one BF16 ULP**); 222 FP32-output measurements (22 bitwise), worst 3.0e-5 relative — invariance falsified and quantified |
@@ -33,25 +39,28 @@ sm_90a lines in "Placement and hardware" are the exceptions, and they say so.
 | `tests/attention_backward_feasibility.py` (claim E backward) | the analytic backward from `(q,k,v,LSE)` reproduces torch.autograd in float64 to 1.7e-16; consuming the LSE without the log2 conversion moves `dv` by 3.04; a paired library (torch SDPA bf16) differs by 3.2e-3 forward / 2.8e-2 on gradients |
 | `ctest -R test_region_inventory` (CPU) | the inventory covers the plan's 21 in-scope regions and nothing else, agrees with the manifest registry in both directions, and every `exact` pair is backed by that registry's `deterministic` |
 | `ctest -R test_region_cases` (2× A40) | 18/18 registered `exact`/`unverified` pairs adjudicated; 8 `exact` pairs bitwise (output and persistent state); 7 unsupported shapes/cases rejected with a named reason; no trainer case offered by any of the 21 regions |
-| `cabal test all --enable-tests` | `infer-tests` 66/66, `infer-generation-tests` 15/15 |
-| `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12791-byte canonical document over 27 recorded regions carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, no unestablished provenance path, and every digest re-derived independently by `tests/manifest_check.py` |
-| Two independent 27B captures, strict comparison | bitwise identical (`max_abs == 0` on every array) and verdict `admitted` (exit 0) — the identities, parameter identity and provenance all agree, over the two captures' own `numerical_policy_id` (`0b549229…470d8b`) |
-| Pre-refactor golden vs a fresh 27B capture | bitwise identical (`max_abs == 0` on every array) with verdict `legacy/unverified` (exit 2) — the older capture's numeric arrays are compared, but nothing about its identity is invented. Re-run against the Stage-1 tree on 2026-09-25, which is what shows the conv-activation export and the registry change are numerically inert |
+| `cabal test all --enable-tests` | `infer-tests` 66/66, `infer-generation-tests` 15/15, `infer-trainer-tests` 9/9 (the Haskell and C teacher-forcing plans must agree) |
+| `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12868-byte canonical document over 27 recorded regions carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, no unestablished provenance path, and every digest re-derived independently by `tests/manifest_check.py` |
+| Two independent 27B captures, strict comparison | bitwise identical (`max_abs == 0` on every array) and verdict `admitted` (exit 0) — the identities, parameter identity and provenance all agree, over the two captures' own `numerical_policy_id` (`012c264c…314f0e`) |
+| Pre-refactor golden vs a fresh 27B capture | bitwise identical (`max_abs == 0` on every array) with verdict `legacy/unverified` (exit 2) — the older capture's numeric arrays are compared, but nothing about its identity is invented. Re-run against the Stage-1 tree and again after Stage 3's engine changes, which is what shows the conv-activation export, the registry change and the training runtime are all numerically inert on the inference path |
 | Qwen3.8-27B golden capture | bitwise identical to the pre-refactor baseline (`max_abs == 0`) |
 | `tests/test_engine.py` (27B vs independent PyTorch logits) | 20/20 greedy tokens (one step is a BF16 tie the reference itself reports as equal-maximal); per-step logit RMS 0.015–0.038; descriptor round-trip and the invalid-input/capacity checks pass; chunk boundaries 129-token rms 1.06 and 64+64+1 rms 1.33, both top-1 stable |
 | `tests/test_longseq.py` | 433-token chunk-split self-consistency (top-1 271/271, RMS 0.029) and 128-token generation coherence (4-gram repetition 0.008) |
 | `tests/test_tp.py --devices 0,1` (TP2) | identical greedy tokens; per-step logit RMS 0.014–0.045 on the 10-token arm and 0.029–0.039 on its 129-token boundary arm (gate 0.05) |
 
 The manifest rows ran on the real 27B with `semantic_id`
-`890c5472…fabde`, `numerical_policy_id` `0b549229…470d8b`, `deployment_id`
+`890c5472…fabde`, `numerical_policy_id` `012c264c…314f0e`, `deployment_id`
 `56f6e4aa…d6f4d` and `parameter_manifest_sha256` `4cb768d4…bbcc` over 1199
-tensors (device ordinals 0,1; 32 layers each; layer-split placement). Stage 1
-added `kv_write`, `conv_silu` and `masked_loss` to the region table, which moved
-`regions_sha256` to `29b44b3a…506734` and `numerical_policy_id` with it — and moved
-nothing else, which is exactly the projection the Stage-0 contract states (a
-region-table change is a numerical change; the semantic, deployment and parameter
-identities are untouched). The `git_commit` this build reports is `1f23880`, which
-is *not* the tree that was built: see the build-revision gap below.
+tensors (device ordinals 0,1; 32 layers each; layer-split placement), 27 recorded
+regions and a fully established provenance. The region table moved twice as the plan
+progressed — Stage 1 added `kv_write`, `conv_silu` and `masked_loss`
+(`regions_sha256` `29b44b3a…506734`), and Stage 3 implemented the per-position FP32
+log-softmax/gather that `masked_loss` had been waiting on, so it is no longer
+`not_implemented` (`regions_sha256` `8456b213…e35357`) — and each time *only*
+`numerical_policy_id` moved, which is exactly the projection the Stage-0 contract
+states (a region-table change is a numerical change; the semantic, deployment and
+parameter identities are untouched). The `git_commit` this build reports is `1f23880`,
+which is *not* the tree that was built: see the build-revision gap below.
 
 ## Supported model families
 
@@ -86,6 +95,45 @@ greedy-token agreement — never a relaxation of the top-1 check.
   (`cuobjdump`) only — there is no H200 here.
 
 ## Recently completed
+
+**Trainable runtime and parameter lifecycle** (plan Stage 3, verified 2026-09-25).
+The inference path is untouched; what is new is the ownership a trainer needs.
+
+- **The parameter store** (`csrc/train.c`, `csrc/include/train.h`) is the plan's
+  ownership object: logical parameters with tying already resolved, each with a
+  version, an FP32 master, a BF16 compute weight whose buffer *is* the engine's own
+  weight, gradient and optimizer-slot presence, the devices that hold a copy, and the
+  derived copies that depend on it. It is deliberately CUDA-free — the buffers are
+  opaque slots — so every rule in it is exercised by a CPU test and the same rules
+  govern the engine.
+- **Three rules are rejections, not comments.** An update fails while any context or
+  step borrows the current version; a store or step cannot be destroyed while a step
+  is live or its values are retained; and an update cannot end while a derived copy of
+  a published parameter is stale, which is what makes "refresh `gdn_norm_f32`, not
+  just its BF16 source" enforceable rather than aspirational.
+- **The teacher-forced forward** evaluates the LM head one row at a time on the
+  device, so a loss never materialises a [tokens, vocab] tensor, and returns
+  natural-log log-probabilities for the selected positions (next-token label shift, a
+  prompt/padding mask, explicit positions). One sequence at a time: independent
+  sequences are never flattened into one causal sequence.
+- **The training step** retains what a backward will consume — a mixer output, an ffn
+  output and a residual per layer (the residual stream is overwritten in place, which
+  is exactly why it has to be retained) plus the GDN chunk-boundary state per GDN
+  layer under a full-sequence schedule — and records alias rules and free points.
+  Stage 4 adds the backward that consumes them.
+- **The Haskell side** (`src/Infer/Trainer.hs`, `Infer.Trainer.Types`,
+  `Infer.Trainer.Plan`) owns the schedule and the typed handles: the store and step
+  are opaque newtypes, and the long-running calls are imported @safe@ so another
+  Haskell thread can run while they work. The schedule is implemented twice on
+  purpose, in Haskell and in C, and `cabal test infer-trainer-tests` requires the two
+  to agree — a split that is only asserted drifts.
+
+**The bug this gate caught** is worth recording: the first publication cast *every*
+master into its compute weight, and the store's masters were allocated zeroed, so the
+first update silently wiped every parameter the caller had not written. The engine
+now seeds each master from the loaded weight in FP32, and the gate compares the model
+*before and after* a no-op publication instead of only comparing two
+post-publication readers with each other.
 
 **Feasibility and invariance experiments** (plan Stage 2, verified 2026-09-25).
 Stage 1 measured region case pairs; Stage 2 asked what those measurements *mean*
@@ -205,7 +253,7 @@ Measured on 2× A40 (sm_86), one line per registered pair:
 | gdn_gated_norm | chunked_prefill / recurrent_prefill | unverified | 0 | — |
 
 On the real 27B the Stage-1 tree also re-established the Stage-0 gates rather than
-assuming them: `manifest --check` exits 0 on a 12791-byte canonical document whose
+assuming them: `manifest --check` exits 0 on a 12868-byte canonical document whose
 provenance is fully established, with two byte-identical queries and every digest
 re-derived independently by `tests/manifest_check.py`; the pre-refactor golden is
 still bitwise identical (`max_abs == 0` on every array, verdict
@@ -335,6 +383,22 @@ CPU case pinning the behaviour.
   is not queryable per kernel, so the manifest reports what the build's target
   lists plus the device's compute capability select for it, and the field names say
   `selected`.
+- **The forward regions are not yet registered under the `train_forward` case.**
+  Stage 3 added `engine_train_forward` (one sequence, all positions, teacher-forced),
+  so that case is now reachable in principle, while the Stage-1 inventory still lists
+  the trainer traversal as unavailable everywhere. Registering the case means fixtures
+  that compare the training forward against the inference forward at region level, and
+  half-doing it would put a coverage claim in the registry that no fixture backs, so it
+  is an open item rather than a partial edit.
+- **The training path has no backward, losses or optimizer yet.** Stage 3 delivers the
+  ownership objects, the teacher-forced forward and the retention a backward needs;
+  the masked loss reduction, the gradient kernels and the optimizer are Stage 4, which
+  is why the `masked_loss` region is still recorded as unfinished in the registry.
+- **The FP32 masters are per-parameter, not sharded.** A store with training state for
+  a 27B checkpoint would need ~54 GB of masters plus gradients and two optimizer slots
+  on a 46 GB device, so the gate attaches training state for the synthetic model and
+  the 27B path is bookkeeping-only. Sharding or offloading the optimizer state is
+  Stage 4's problem and is stated here rather than discovered later.
 - **No region has an established reduction order beyond the elementwise ones.** The
   registry marks 13 of 27 regions `unverified`, and the GEMM algorithm policy is
   recorded as `cublas_default_heuristic_unpinned`: an exact claim about that region
@@ -386,5 +450,5 @@ CPU case pinning the behaviour.
 | [README.md](../README.md) | Build, test entry points, usage, phase status, model weights |
 | [design.md](design.md) | Architecture rationale, per-family layout differences, testing strategy |
 | [manifest-contract.md](manifest-contract.md) | The execution manifest: canonical encoding, field ownership and projections, the region determinism registry, and the comparison modes |
-| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stages 0-2 are implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
+| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stages 0-3 are implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
 | [reference-output.json](reference-output.json) | Transformers reference tokens for the 27B debugging prompt |

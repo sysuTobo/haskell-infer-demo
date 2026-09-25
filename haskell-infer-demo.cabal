@@ -38,6 +38,9 @@ executable haskell-infer-demo
                       Infer.Manifest
                       Infer.Tokenizer
                       Infer.FFI.Engine
+                      Infer.Trainer
+                      Infer.Trainer.Types
+                      Infer.Trainer.Plan
   build-depends:
                       base
                     , aeson >=2.0
@@ -87,6 +90,9 @@ test-suite infer-generation-tests
                       Infer.Manifest
                       Infer.Tokenizer
                       Infer.FFI.Engine
+                      Infer.Trainer
+                      Infer.Trainer.Types
+                      Infer.Trainer.Plan
   build-depends:
                       base
                     , aeson
@@ -96,6 +102,23 @@ test-suite infer-generation-tests
                     , scientific >=0.3
                     , text
                     , vector
+                    , hspec >=2.10
+
+-- The trainable runtime's Haskell gate: the teacher-forcing schedule is implemented
+-- in Haskell and in C, and this suite requires the two to agree. It links train.c and
+-- model_desc.c (both CUDA-free), so it needs no GPU or checkpoint.
+test-suite infer-trainer-tests
+  import:             common-opts
+  type:               exitcode-stdio-1.0
+  main-is:            TrainerSpec.hs
+  hs-source-dirs:     tests, src
+  c-sources:          csrc/train.c csrc/model_desc.c
+  include-dirs:       csrc/include
+  other-modules:
+                      Infer.Trainer.Types
+                      Infer.Trainer.Plan
+  build-depends:
+                      base
                     , hspec >=2.10
 
 test-suite infer-tests

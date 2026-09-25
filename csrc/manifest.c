@@ -209,9 +209,11 @@ static int desc_has_ffn(const struct ModelDesc *d, int ffn) {
  *
  * `cases` lists the execution cases this build can actually reach. The trainer
  * traversal (train_forward, eval_no_autograd, recompute) is deliberately absent:
- * there is no trainer API, and a hashed numerical policy must not claim coverage
- * a region cannot be exercised for. test_region_inventory enforces that against
- * the Stage-1 inventory, which is where the per-case-pair verdicts live. */
+ * Stage 3 added a single-sequence teacher-forced forward, but not the traversal a
+ * trainer needs (a per-step schedule, recompute, a backward), and a hashed numerical
+ * policy must not claim coverage a region cannot be exercised for.
+ * test_region_inventory enforces that against the Stage-1 inventory, which is where
+ * the per-case-pair verdicts live. */
 static const struct ManifestRegion kRegions[] = {
     {"embedding", "prefill,decode", "kernels/embedding.cu row gather",
      "deterministic", "one thread per output element, no reduction", 0},
@@ -266,9 +268,10 @@ static const struct ManifestRegion kRegions[] = {
      "cross-device tree order not established", 0},
     {"logits_softmax_gather", "prefill,decode", "host FP32 argmax over the final row",
      "deterministic", "exact host comparison, no reduction reorder", 0},
-    {"masked_loss", "not_implemented",
-     "proposed FP32 differentiable log-softmax and masked loss (plan stage 4)",
-     "not_implemented", "the trainer plan stages 3-4 define this", 0},
+    {"masked_loss", "prefill",
+     "FP32 log-softmax and gather (kernels/logprob.cu, one row at a time) landed in "
+     "stage 3; the masked reduction and its backward are stage 4",
+     "unverified", "an in-block reduction over the vocabulary; order not established", 0},
     {"sampler_softmax_cdf", "not_implemented",
      "proposed host binary64 softmax/CDF (plan T0-T4)", "not_implemented",
      "one RNG word per sampled token once implemented", 1},

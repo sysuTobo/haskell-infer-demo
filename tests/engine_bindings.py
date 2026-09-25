@@ -40,6 +40,46 @@ def bind(lib):
         lib.engine_describe.restype = ctypes.c_int
     if hasattr(lib, "engine_desc_version"):
         lib.engine_desc_version.restype = ctypes.c_int
+    # Stage 3: the training path. Bound only when the library exports it, so the
+    # other tests keep working against an older build.
+    if hasattr(lib, "engine_train_attach"):
+        lib.engine_train_attach.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.engine_train_attach.restype = ctypes.c_void_p
+        lib.engine_train_store.argtypes = [ctypes.c_void_p]
+        lib.engine_train_store.restype = ctypes.c_void_p
+        lib.engine_train_begin_update.argtypes = [ctypes.c_void_p]
+        lib.engine_train_write_master.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                  ctypes.c_void_p]
+        lib.engine_train_publish.argtypes = [ctypes.c_void_p]
+        lib.engine_train_end_update.argtypes = [ctypes.c_void_p]
+        lib.engine_train_step_plan.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                              ctypes.POINTER(ctypes.c_int),
+                                              ctypes.POINTER(ctypes.c_int64)]
+        lib.engine_train_step_begin.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                               ctypes.POINTER(ctypes.c_void_p)]
+        lib.engine_train_step_end.argtypes = [ctypes.c_void_p]
+        lib.engine_train_forward.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                             ctypes.c_int, ctypes.c_void_p]
+        # The store's own accessors, for the tying and lifetime assertions.
+        lib.train_store_logical_count.argtypes = [ctypes.c_void_p]
+        lib.train_store_logical_count.restype = ctypes.c_int
+        lib.train_store_spec_count.argtypes = [ctypes.c_void_p]
+        lib.train_store_spec_count.restype = ctypes.c_int
+        lib.train_store_logical_of.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        lib.train_store_logical_of.restype = ctypes.c_int
+        lib.train_store_alias_count.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.train_store_alias_count.restype = ctypes.c_int
+        lib.train_store_is_frozen.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.train_store_is_frozen.restype = ctypes.c_int
+        lib.train_store_version.argtypes = [ctypes.c_void_p]
+        lib.train_store_version.restype = ctypes.c_int64
+        lib.train_store_stale_derived_count.argtypes = [ctypes.c_void_p]
+        lib.train_store_stale_derived_count.restype = ctypes.c_int
+        lib.train_last_error.restype = ctypes.c_char_p
+    if hasattr(lib, "model_desc_role_from_name"):
+        lib.model_desc_role_from_name.argtypes = [ctypes.c_char_p]
+        lib.model_desc_role_from_name.restype = ctypes.c_int
     return lib
 
 

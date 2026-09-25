@@ -180,7 +180,7 @@ equal highest BF16 reference logits are treated as ties.
 
 ## Tests
 
-- `ctest --test-dir csrc/build-libs` runs four suites that need no GPU at all:
+- `ctest --test-dir csrc/build-libs` runs five suites that need no GPU at all:
   `test_model_desc` (descriptor parsing, structural validation, the
   engine-capability gate for the AOT GDN layout, canonical echo and the tp-role
   coverage rule), `test_safetensors` (malformed headers, offsets, shapes and
@@ -188,13 +188,19 @@ equal highest BF16 reference logits are treated as ties.
   (SHA-256 against the FIPS vectors, canonical format determinism, and the
   identity matrix: a semantic or numerical change moves the matching id only, a
   deployment-only change moves `deployment_id` only, a provenance or weight change
-  moves no identity) and `test_manifest_hashes`, which re-derives every digest from
-  the emitted document with `hashlib` so the emitter cannot certify itself. The
-  rest of ctest
+  moves no identity), `test_manifest_hashes`, which re-derives every digest from
+  the emitted document with `hashlib` so the emitter cannot certify itself, and
+  `test_region_inventory`, which checks the plan's in-scope forward path is
+  inventoried region by region, that the inventory and the manifest registry cannot
+  drift apart, and that every registered case-pair verdict carries the evidence it
+  needs. The rest of ctest
   needs a GPU: `test_engine_resources` (repeated failing initializations leave no
   handle and no device memory; skips itself when no device is visible),
   `test_collective` (event-ordered copies and the cross-device all-reduce on 2
-  GPUs — once per element type — skipped with fewer devices) and the
+  GPUs — once per element type — skipped with fewer devices), `test_region_cases`
+  (the Stage-1 cross-case harness: identical inputs and persistent state under each
+  applicable case, adjudicated against the committed inventory, plus the
+  unsupported-shape/case rejections and the region entry-point cost) and the
   operator-level regressions `test_attention` (causal GQA, KV write, output
   gate), `test_gdn` (FLA recurrent decode, causal-conv1d, gated norm), `test_moe`
   (router, permute, expert GEMMs, combine, EP shards), `test_mla` (MLA chunking
@@ -284,6 +290,7 @@ migrated from handwritten CUDA to FlashInfer + FLA + causal-conv1d.
 | 9 | Descriptor-driven families (dense + MoE + Qwen3-Next + DeepSeek-V2 MLA), multi-arch SASS/PTX, placement policies (layer split, TP, EP) | ✅ verified on sm_86 (A40); sm_89 operator suite on L20 |
 | 10 | Resource safety and regression gates: buffer ownership at allocation, cross-device read-completion ordering, bounded safetensors parsing, tokenizer capacity/streaming protocol, generation budget/EOS/error semantics, MLA shared-memory bound, TP shard-coverage rule, FP32 expert-parallel merge | ✅ verified on sm_86 (A40): ctest 11/11, cargo 11/11, hspec 41 + 14, Qwen3.8 golden bitwise identical, TP2 rms ≤ 0.05 with identical tokens |
 | 11 | Execution manifest and capture provenance (plan Stage 0): content identities `semantic_id`/`numerical_policy_id`/`deployment_id` over canonical blocks, build-time provenance generation, parameter identity, region/case determinism registry, and strict/diagnostic/legacy capture comparison | ✅ CPU gates (ctest `test_manifest` + `test_manifest_hashes`, hspec manifest specs, CLI runner); engine query verified on sm_86 |
+| 12 | Region inventory and cross-case harness (plan Stage 1): a committed inventory of every in-scope dense/dense-hybrid forward region (inputs, outputs, persistent state, saved-for-backward values, case availability) with a per-case-pair verdict (`exact`/`exception`/`unverified`/`not_applicable`), the device fixtures that compare identical inputs and state across cases, explicit unsupported-shape/case rejection, and the region entry-point cost | ✅ CPU gate `test_region_inventory` + device harness `test_region_cases` on sm_86; no `exception` pair yet (Stage 2 quantifies those) |
 
 Known gaps, stated rather than implied:
 

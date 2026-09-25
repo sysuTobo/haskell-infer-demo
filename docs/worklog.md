@@ -4,9 +4,10 @@ A running snapshot of what this project can do today, what has been verified and
 where it is knowingly incomplete. [README.md](../README.md) describes the
 component layout and how to build and test; [design.md](design.md) holds the
 architecture rationale; [plan-numeric-contract.md](plan-numeric-contract.md) is the
-proposal for the trainer, RL and inference-optimization work — of which only
-**Stage 0 (the execution manifest and capture provenance) is implemented here**, as
-described below and specified in [manifest-contract.md](manifest-contract.md).
+proposal for the trainer, RL and inference-optimization work — of which **Stages 0
+and 1 are implemented here**: the execution manifest with capture provenance
+(specified in [manifest-contract.md](manifest-contract.md)) and the region
+inventory with its cross-case harness (`csrc/regions.c`), both described below.
 
 Last updated: 2026-09-25.
 
@@ -15,31 +16,38 @@ Last updated: 2026-09-25.
 Everything below was run and passed on 2× A40 46 GB (sm_86) unless a line says
 otherwise. No GPU result here is implied by a document edit alone.
 
-The manifest, ctest, cargo and cabal rows, the golden capture and the two
-capture-comparison rows were run on 2026-09-25. The `test_engine.py`,
-`test_longseq.py` and `test_tp.py` rows were last run on 2026-09-24: the forward
-arithmetic they exercise was re-confirmed bitwise identical on 2026-09-25 by the
-golden-capture row below, but those three suites were not re-executed in that
-session.
+The manifest, ctest, cargo and cabal rows, the golden capture and the
+capture-comparison rows below were run on 2026-09-25, the last group against the
+Stage-1 tree. `tests/test_engine.py` was re-run in that same session; the
+`test_longseq.py` and `test_tp.py` rows were last run on 2026-09-24, and the
+forward arithmetic they exercise was re-confirmed bitwise identical on 2026-09-25
+by the golden-capture row below.
 
 | Gate | Result |
 |---|---|
 | `cargo test --locked --offline` | 11/11 |
-| `ctest --test-dir csrc/build-libs` | 13/13 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_library_ops` |
+| `ctest --test-dir csrc/build-libs` | 15/15 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_library_ops` |
+| `ctest -R test_region_inventory` (CPU) | the inventory covers the plan's 21 in-scope regions and nothing else, agrees with the manifest registry in both directions, and every `exact` pair is backed by that registry's `deterministic` |
+| `ctest -R test_region_cases` (2× A40) | 18/18 registered `exact`/`unverified` pairs adjudicated; 8 `exact` pairs bitwise (output and persistent state); 7 unsupported shapes/cases rejected with a named reason; no trainer case offered by any of the 21 regions |
 | `cabal test all --enable-tests` | `infer-tests` 66/66, `infer-generation-tests` 15/15 |
-| `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12216-byte canonical document carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, and every digest re-derived independently by `tests/manifest_check.py` |
-| Two independent 27B captures, strict comparison | bitwise identical (`max_abs == 0`) and verdict `admitted` |
-| Pre-refactor golden vs a fresh 27B capture | bitwise identical (`max_abs == 0`) with verdict `legacy/unverified` (exit 2) — the older capture's numeric arrays are compared, but nothing about its identity is invented |
+| `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12791-byte canonical document over 27 recorded regions carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, no unestablished provenance path, and every digest re-derived independently by `tests/manifest_check.py` |
+| Two independent 27B captures, strict comparison | bitwise identical (`max_abs == 0` on every array) and verdict `admitted` (exit 0) — the identities, parameter identity and provenance all agree, over the two captures' own `numerical_policy_id` (`0b549229…470d8b`) |
+| Pre-refactor golden vs a fresh 27B capture | bitwise identical (`max_abs == 0` on every array) with verdict `legacy/unverified` (exit 2) — the older capture's numeric arrays are compared, but nothing about its identity is invented. Re-run against the Stage-1 tree on 2026-09-25, which is what shows the conv-activation export and the registry change are numerically inert |
 | Qwen3.8-27B golden capture | bitwise identical to the pre-refactor baseline (`max_abs == 0`) |
-| `tests/test_engine.py` (27B vs independent PyTorch logits) | 20/20 greedy tokens; logit RMS 0.02–0.04 |
+| `tests/test_engine.py` (27B vs independent PyTorch logits) | 20/20 greedy tokens (one step is a BF16 tie the reference itself reports as equal-maximal); per-step logit RMS 0.015–0.038; descriptor round-trip and the invalid-input/capacity checks pass; chunk boundaries 129-token rms 1.06 and 64+64+1 rms 1.33, both top-1 stable |
 | `tests/test_longseq.py` | 433-token chunk-split self-consistency (RMS 0.029) and 128-token generation coherence |
 | `tests/test_tp.py --devices 0,1` (TP2) | identical greedy tokens, per-step logit RMS ≤ 0.05 |
 
 The manifest rows ran on the real 27B with `semantic_id`
-`890c5472…fabde`, `numerical_policy_id` `b0da2057…d1c551`, `deployment_id`
+`890c5472…fabde`, `numerical_policy_id` `0b549229…470d8b`, `deployment_id`
 `56f6e4aa…d6f4d` and `parameter_manifest_sha256` `4cb768d4…bbcc` over 1199
-tensors (device ordinals 0,1; 32 layers each; layer-split placement), from a build
-whose own revision the manifest reports as `1f23880`.
+tensors (device ordinals 0,1; 32 layers each; layer-split placement). Stage 1
+added `kv_write`, `conv_silu` and `masked_loss` to the region table, which moved
+`regions_sha256` to `29b44b3a…506734` and `numerical_policy_id` with it — and moved
+nothing else, which is exactly the projection the Stage-0 contract states (a
+region-table change is a numerical change; the semantic, deployment and parameter
+identities are untouched). The `git_commit` this build reports is `1f23880`, which
+is *not* the tree that was built: see the build-revision gap below.
 
 ## Supported model families
 
@@ -75,6 +83,85 @@ greedy-token agreement — never a relaxation of the top-1 check.
 
 ## Recently completed
 
+**Region inventory and cross-case harness** (plan Stage 1, verified 2026-09-25).
+The engine can now say which forward *cases* a region is reachable under and what
+has been established about each pair of them, and a device harness re-derives the
+claims rather than asserting them:
+
+- `csrc/regions.c` inventories the 21 in-scope dense/dense-hybrid regions — every
+  one of the plan's Stage-1 bullets — with its inputs, outputs, persistent state,
+  saved-for-backward values and case availability, and registers each reachable
+  case pair as `exact`, a quantified `exception`, `unverified` or
+  `not_applicable`. MLA, MoE and the TP/EP collectives are listed as *excluded*
+  with the reason, so "not inventoried" cannot be mistaken for "not applicable".
+- Two coverage claims in the Stage-0 `cases` column were not reachable and are
+  removed (six rows listed `train_forward`, one `recompute`, and `gemm_bf16` listed
+  `backward`). That column is hashed into `numerical_policy_id`, so advertising a
+  traversal that does not exist is a policy claim, not a note;
+  `test_region_inventory` now fails if any manifest row names a traversal case.
+- `ctest test_region_inventory` (CPU, no GPU and no weights) checks the two things
+  a reader cannot: that the plan's bullet list maps onto the inventory region by
+  region and that nothing else is invented, and that the inventory cannot drift
+  from the Stage-0 registry — every inventory region must be a manifest region,
+  every manifest region must be inventoried or excluded, and an `exact` pair is
+  accepted only where that registry already says `deterministic`.
+- `ctest test_region_cases` runs the fixtures: identical inputs and identical
+  *nonzero* persistent state under each applicable case, adjudicated against the
+  registered verdict. It fails if a registered pair was skipped, and re-runs the
+  unsupported-shape/case rejections.
+
+Measured on 2× A40 (sm_86), one line per registered pair:
+
+| Region | Case pair | Verdict | Output max_abs | State max_abs |
+|---|---|---|---|---|
+| embedding | chunked_prefill / decode | exact | 0 | — |
+| rope | chunked_prefill / recurrent_prefill | exact | 0 | — |
+| q_gate_split | chunked_prefill / decode | exact | 0 | — |
+| kv_write | chunked_prefill / decode | exact | 0 | 0 (whole cache) |
+| attention_output_gate | chunked_prefill / decode | exact | 0 | — |
+| residual_add | chunked_prefill / decode | exact | 0 | — |
+| silu_mul | chunked_prefill / decode | exact | 0 | — |
+| conv_silu | chunked_prefill / recurrent_prefill | exact | 0 | — |
+| rmsnorm | chunked_prefill / decode | unverified | 0 | — |
+| per_head_norm | chunked_prefill / decode | unverified | 0 | — |
+| attention_core | chunked_prefill / decode | unverified | 0 | 0 (cache) |
+| attention_core | chunked_prefill / tail1 | unverified | 0 | — |
+| gemm_bf16 | chunked_prefill / decode | unverified | 0 | — |
+| gemm_fp32_lmhead | chunked_prefill / decode | unverified | 4.77e-07 | — |
+| gdn_conv1d | chunked_prefill / recurrent_prefill | unverified | 0 | 0 (shift register) |
+| gdn_core | chunked_prefill / recurrent_prefill | unverified | 6.10e-05 | 3.69e-04 (FP32 ssm_state) |
+| gdn_core | chunked_prefill / tail1 | unverified | 3.05e-05 | 3.06e-04 |
+| gdn_gated_norm | chunked_prefill / recurrent_prefill | unverified | 0 | — |
+
+On the real 27B the Stage-1 tree also re-established the Stage-0 gates rather than
+assuming them: `manifest --check` exits 0 on a 12791-byte canonical document whose
+provenance is fully established, with two byte-identical queries and every digest
+re-derived independently by `tests/manifest_check.py`; the pre-refactor golden is
+still bitwise identical (`max_abs == 0` on every array, verdict
+`legacy/unverified`, exit 2), which is what shows exporting the conv activation and
+changing the registry are numerically inert; and `tests/test_engine.py` re-runs
+green against the independent PyTorch reference (20/20 greedy tokens, per-step
+logit RMS 0.015–0.038).
+
+Two things about that table. A measured zero under `unverified` is *not* promoted
+to `exact`: `exact` requires the Stage-0 registry to say `deterministic` (no
+cross-thread reduction, no library tiling decision), and FlashInfer, cuBLAS and
+the FLA cubins are not. Promotion is a Stage-2 decision, taken by the experiment
+that establishes the reduction order, not by one measurement. And the GDN core's
+chunk-versus-recurrent difference is small *at the region boundary* (6e-05 output,
+3.7e-04 state) while whole-model logit RMS between prefill schedules has been
+observed around 1.0 — the decomposition difference accumulates across 48 GDN
+layers, which is exactly why the region boundary is where attribution has to start
+(Stage 2 claim B).
+
+`region_ffi` also measures what a region boundary costs: host-side enqueue
+(argument validation plus the launch) against device time, on real enqueues with
+no host synchronization between them. For the tiny fixtures here the host side
+dominates — 1.9–5.5 µs per enqueue against 3.7–10.6 µs of device time, 67–99%
+host share — which is a statement about these fixtures and about the engine's
+Haskell FFI being *model-level* today: the number is the C region entry point, not
+a `ccall`, and Stage 3's region handles are what would make the two comparable.
+
 **Execution manifest and capture provenance** (plan Stage 0, verified 2026-09-25).
 The engine can now answer *which numerical execution did this run observe*, as
 three content identities over canonical JSON blocks plus the provenance a bitwise
@@ -104,9 +191,10 @@ under:
   manifest version stays numerically comparable with an explicit `legacy/unverified`
   result and no invented identity, exit 2).
 - The committed region registry records the implementation each region ran and, per
-  region, determinism/mechanism/RNG-dependency separately (24 regions: 9
+  region, determinism/mechanism/RNG-dependency separately (27 regions: 11
   deterministic by construction, 13 unverified because a library or cross-device
-  reduction order is not established, 2 `not_implemented` — every backward region).
+  reduction order is not established, 3 `not_implemented` — the backward region,
+  the proposed loss region and the proposed sampler).
 - The canonical encoding is what makes the digests checkable elsewhere: keys sorted
   by byte value, no whitespace, integers bare, non-integer constants as decimal
   strings, printable ASCII only. `test_manifest` pins the identity matrix without a
@@ -151,15 +239,38 @@ CPU case pinning the behaviour.
 
 ## Known gaps
 
+- **The manifest's build revision can lag the tree that was built.**
+  `csrc/gen_build_info.cmake` reads `git rev-parse HEAD`, but the custom command
+  that runs it is declared with the generated AOT kernels and the script itself as
+  its dependencies — not the repository revision — so a commit that changes no
+  kernel does not regenerate `build_info.h`. Observed on 2026-09-25: a build from a
+  tree at `0df2bd8` plus uncommitted Stage-1 work still reported `git_commit`
+  `1f23880`, the revision current when the header was last regenerated. The
+  identities are unaffected (adding three regions to the table moved
+  `numerical_policy_id` and nothing else, as the Stage-0 design predicts), and the
+  generated-kernel and flag digests still move when the arithmetic does, but
+  `provenance.build.git_commit` is not by itself evidence of which tree ran. The fix
+  is to regenerate the header on every build while touching its mtime only when the
+  content changes (an always-run custom target around a content-compare write),
+  which is a build-system change needing its own re-verification.
 - **The manifest's per-device `kernel_path` and `triton_cubin_arch` are a
   selection rule, not an observation.** Which binary the driver actually launched
   is not queryable per kernel, so the manifest reports what the build's target
   lists plus the device's compute capability select for it, and the field names say
   `selected`.
 - **No region has an established reduction order beyond the elementwise ones.** The
-  registry marks 13 of 24 regions `unverified`, and the GEMM algorithm policy is
+  registry marks 13 of 27 regions `unverified`, and the GEMM algorithm policy is
   recorded as `cublas_default_heuristic_unpinned`: an exact claim about that region
-  is unsupported until the plan's Stage 2 pins or replaces it.
+  is unsupported until the plan's Stage 2 pins or replaces it. Stage 1 measures the
+  case-pair deltas (above) but promotes none of them to `exact`.
+- **No case pair is registered `exception` yet.** An `exception` has to carry a
+  tested architecture, tested shapes and a measured max_abs/rms. Stage 1 has the
+  measurements but has not established that any pair is a *known* deviation rather
+  than an unestablished one, which is a Stage-2 decision.
+- **The trainer traversal is registered as unavailable, not as implemented.**
+  `train_forward`, `eval_no_autograd`, `recompute` and `backward` are reachable from
+  no region, and both new gates refuse a region that advertises them: registering a
+  case with no API would claim a trainer Stages 3-4 have not built.
 - **`weights.content_sha256` is null** unless a caller chooses to hash 50 GiB of
   tensor data; the parameter-manifest digest over the tensor index is what strict
   admission compares.
@@ -185,5 +296,5 @@ CPU case pinning the behaviour.
 | [README.md](../README.md) | Build, test entry points, usage, phase status, model weights |
 | [design.md](design.md) | Architecture rationale, per-family layout differences, testing strategy |
 | [manifest-contract.md](manifest-contract.md) | The execution manifest: canonical encoding, field ownership and projections, the region determinism registry, and the comparison modes |
-| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stage 0 is implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
+| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stages 0-1 are implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
 | [reference-output.json](reference-output.json) | Transformers reference tokens for the 27B debugging prompt |

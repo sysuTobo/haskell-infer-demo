@@ -1,8 +1,9 @@
 # Plan: Numerical Execution Contract, Haskell Training, and Asynchronous RL
 
-Status: Stages 1–8 proposed, not implemented; **Stage 0 is implemented** (the
-versioned execution manifest and capture provenance, see
-[manifest-contract.md](manifest-contract.md) and [worklog.md](worklog.md)).
+Status: Stages 2–8 proposed, not implemented; **Stages 0 and 1 are implemented**
+(the versioned execution manifest with capture provenance, and the region
+inventory with its cross-case harness — see [manifest-contract.md](manifest-contract.md),
+[worklog.md](worklog.md) and `csrc/regions.c`).
 Revised after the design review, 2026-09-23.
 Extends [design.md](design.md). This document separates current capabilities,
 proposed interfaces, measured observations and hypotheses requiring experiments.
@@ -201,6 +202,65 @@ missing/mismatched provenance fails strict admission; unchanged arithmetic still
 passes the legacy numeric gate and a fresh strict capture comparison.
 
 ### Stage 1 — Region inventory and cross-case harness
+
+**Status: implemented and verified, 2026-09-25.** The inventory is
+`csrc/regions.c` (`csrc/include/regions.h`); the device harness is `ctest
+test_region_cases` and the CPU gate over the inventory is `ctest
+test_region_inventory`. The gate below is met:
+
+- every in-scope operation of the dense/dense-hybrid path is inventoried with its
+  inputs, outputs, persistent state, saved-for-backward values and case
+  availability, and nothing else is: `test_region_inventory` walks the bullet list
+  below region by region and also rejects an inventoried region the plan does not
+  list;
+- the inventory and the Stage-0 registry cannot drift apart — every inventory
+  region must be a region the manifest registry names, every manifest region must
+  be inventoried or explicitly excluded (MLA, MoE, TP/EP), and `exact` is accepted
+  only where that registry already says `deterministic`;
+- fixtures run identical inputs and identical persistent state under each
+  applicable case pair and adjudicate against the registered verdict: `exact` must
+  come out bitwise identical for output *and* state, `unverified` is measured and
+  reported (with the plan's coarse state-loss guard where the region owns state),
+  `not_applicable` must not run at all, and the run fails if a registered pair was
+  silently skipped;
+- unsupported shapes and cases fail explicitly, and that failure is asserted: a
+  chunk beyond the descriptor's `max_chunk`, a sequence beyond `max_seq_len`, a
+  non-contiguous SiLU pair, a wrong FLA key-head count, an over-long FLA token
+  count, a negative element count, a zero head dimension, and every trainer
+  traversal case on every region;
+- model-only and region harnesses stay independently runnable — the region harness
+  needs no checkpoint and no engine handle, and `tests/test_engine.py`,
+  `tests/test_longseq.py` and `tests/test_tp.py` are untouched;
+- registering a region is observability, not a trainer: nothing here traverses the
+  model for training, owns an activation lifetime or computes a gradient, and the
+  harness adds no arithmetic to the engine.
+
+Registered verdicts are deliberately conservative. `exact` is claimed only for a
+single elementwise pass, a row gather or a permutation, and only where the Stage-0
+registry already says `deterministic`. Everything whose reduction or tiling order
+comes from a library (FlashInfer, cuBLAS, the AOT FLA cubins) stays `unverified`;
+promoting a pair that measures zero to `exact` is a Stage-2 decision, not a
+Stage-1 one. No pair is `exception` yet, because an exception has to carry tested
+shapes, an architecture and a measured max_abs/rms, which is what Stage 2
+produces. `region_ffi` prints the region entry-point host cost against its device
+cost; the engine's Haskell FFI is model-level today, so that number is the C
+boundary (argument validation, workspace arithmetic, enqueue), not a `ccall`, and
+Stage 3's region handles are what would make the two comparable.
+
+Five gaps in the Stage-0 registry surfaced while writing the inventory. Three are
+regions the registry did not name, and it now does: `kv_write` (the KV cache
+write), `conv_silu` (the GDN conv activation) and `masked_loss` (the trainer's FP32
+differentiable log-softmax/loss, kept distinct from `sampler_softmax_cdf` as
+below). The first two are deterministic elementwise regions that the coarse
+`attention_core` and `gdn_conv1d` rows had been covering, and the activation was
+not exported at all (a `__global__` local to `layers.cu`), so no region harness
+could have reached it — it is now `kernel_silu_inplace` alongside the other region
+entry points. The other two are coverage claims the registry should not have made:
+six rows listed `train_forward`, one listed `recompute`, and `gemm_bf16` listed
+`backward`, for a traversal that does not exist. That column is hashed into
+`numerical_policy_id`, so it must not advertise coverage a region cannot be
+exercised for; those claims are removed, and `test_region_inventory` now refuses a
+manifest row that names a traversal case.
 
 Inventory the initial **dense/dense-hybrid** path, not a supposed thirteen-region
 vocabulary covering the whole framework:

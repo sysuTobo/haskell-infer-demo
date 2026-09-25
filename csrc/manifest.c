@@ -205,34 +205,45 @@ static int desc_has_ffn(const struct ModelDesc *d, int ffn) {
  * whole-model golden capture shows bitwise repeatability for one fixed
  * configuration, which is not the same as an established reduction order, and
  * the plan's Stage 2 experiments are what would establish it. Backward regions do
- * not exist yet, so they are recorded as not_implemented rather than assumed. */
+ * not exist yet, so they are recorded as not_implemented rather than assumed.
+ *
+ * `cases` lists the execution cases this build can actually reach. The trainer
+ * traversal (train_forward, eval_no_autograd, recompute) is deliberately absent:
+ * there is no trainer API, and a hashed numerical policy must not claim coverage
+ * a region cannot be exercised for. test_region_inventory enforces that against
+ * the Stage-1 inventory, which is where the per-case-pair verdicts live. */
 static const struct ManifestRegion kRegions[] = {
-    {"embedding", "prefill,decode,train_forward", "kernels/embedding.cu row gather",
+    {"embedding", "prefill,decode", "kernels/embedding.cu row gather",
      "deterministic", "one thread per output element, no reduction", 0},
-    {"rmsnorm", "prefill,decode,train_forward",
+    {"rmsnorm", "prefill,decode",
      "FlashInfer RMSNorm (plain or gemma weight+1)", "unverified",
      "library-internal reduction tree not established", 0},
     {"per_head_norm", "prefill,decode", "FlashInfer per-head Q/K RMSNorm", "unverified",
      "library-internal reduction tree not established", 0},
-    {"rope", "prefill,decode,train_forward", "FlashInfer RoPE position kernel",
+    {"rope", "prefill,decode", "FlashInfer RoPE position kernel",
      "deterministic", "per-element rotation, no cross-thread reduction", 0},
     {"q_gate_split", "prefill,decode", "engine de-interleave of the fused Q/gate projection",
      "deterministic", "elementwise permutation", 0},
-    {"attention_core", "prefill,decode,train_forward,recompute",
+    {"kv_write", "prefill,tail1,decode",
+     "engine KV cache write at [seq_start, seq_start+tokens)", "deterministic",
+     "contiguous copy with no reduction", 0},
+    {"attention_core", "prefill,decode",
      "FlashInfer single prefill, split-KV disabled, LSE not returned", "unverified",
      "null workspace fixes the no-split-KV mode only, not the internal tiling", 0},
     {"attention_output_gate", "prefill,decode", "sigmoid gate multiply", "deterministic",
      "elementwise", 0},
-    {"gemm_bf16", "prefill,decode,backward", "cuBLAS BF16 in, FP32 accumulate, BF16 out",
+    {"gemm_bf16", "prefill,decode", "cuBLAS BF16 in, FP32 accumulate, BF16 out",
      "unverified", "cuBLAS algorithm and workspace selection is not pinned", 0},
     {"gemm_fp32_lmhead", "prefill,decode", "cuBLAS BF16 in, FP32 out", "unverified",
      "cuBLAS algorithm and workspace selection is not pinned", 0},
-    {"residual_add", "prefill,decode,train_forward", "engine residual addition",
+    {"residual_add", "prefill,decode", "engine residual addition",
      "deterministic", "elementwise", 0},
-    {"silu_mul", "prefill,decode,train_forward", "fused SiLU(gate) * up", "deterministic",
+    {"silu_mul", "prefill,decode", "fused SiLU(gate) * up", "deterministic",
      "elementwise", 0},
     {"gdn_conv1d", "prefill,decode", "AOT causal_conv1d kernel", "unverified",
      "library scan order not established", 0},
+    {"conv_silu", "prefill,decode", "SiLU activation of the GDN conv output",
+     "deterministic", "elementwise, no reduction", 0},
     {"gdn_prepare", "prefill,decode", "engine Q/K L2 norm, head expansion, a/b/A_log/dt_bias",
      "unverified", "cross-thread reduction over the head dimension", 0},
     {"gdn_core", "chunked_prefill,recurrent_prefill,decode,tail1",
@@ -255,6 +266,9 @@ static const struct ManifestRegion kRegions[] = {
      "cross-device tree order not established", 0},
     {"logits_softmax_gather", "prefill,decode", "host FP32 argmax over the final row",
      "deterministic", "exact host comparison, no reduction reorder", 0},
+    {"masked_loss", "not_implemented",
+     "proposed FP32 differentiable log-softmax and masked loss (plan stage 4)",
+     "not_implemented", "the trainer plan stages 3-4 define this", 0},
     {"sampler_softmax_cdf", "not_implemented",
      "proposed host binary64 softmax/CDF (plan T0-T4)", "not_implemented",
      "one RNG word per sampled token once implemented", 1},

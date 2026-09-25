@@ -14,6 +14,16 @@ __device__ __forceinline__ float SiLU(const float &value) {
     return value / (1.0f + __expf(-value));
 }
 
+// Elementwise SiLU in place, for callers that hold the pre-activation in a
+// buffer of their own (the GDN conv output). Separate from kernel_silu_mul: it
+// takes one buffer, not a contiguous [gate, up] pair.
+__global__ void silu_inplace_kernel(__nv_bfloat16 *__restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = __bfloat162float(x[i]);
+    x[i] = __float2bfloat16(v / (1.0f + expf(-v)));
+}
+
 }  // namespace
 
 void kernel_silu_mul(__nv_bfloat16 *out, const __nv_bfloat16 *gate,
@@ -38,5 +48,20 @@ void kernel_silu_mul(__nv_bfloat16 *out, const __nv_bfloat16 *gate,
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("kernel_silu_mul: ") + cudaGetErrorString(status));
+    }
+}
+
+void kernel_silu_inplace(__nv_bfloat16 *x, int n, cudaStream_t stream) {
+    if (n < 0) {
+        throw std::runtime_error("kernel_silu_inplace: negative element count");
+    }
+    if (n == 0) return;
+    if (!x) {
+        throw std::runtime_error("kernel_silu_inplace: null buffer");
+    }
+    silu_inplace_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, n);
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("kernel_silu_inplace: ") + cudaGetErrorString(status));
     }
 }

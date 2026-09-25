@@ -114,7 +114,13 @@ struct ManifestWeights {
  * implementation has no cross-thread reduction to reorder, "unverified" where
  * the reduction or library tiling order has not been established, and
  * "not_implemented" for regions that do not exist yet. rng_dependency is a
- * separate axis: a seed does not order atomics. */
+ * separate axis: a seed does not order atomics.
+ *
+ * `cases` here is the coarse availability string a capture records. The Stage-1
+ * inventory (csrc/include/regions.h) refines it into a per-case-pair verdict with
+ * evidence; test_region_inventory requires the two to name the same regions, and
+ * an `exact` verdict there is accepted only where this registry says
+ * "deterministic". */
 struct ManifestRegion {
     const char *region;
     const char *cases;

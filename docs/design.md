@@ -519,6 +519,32 @@ Two contract violations were caught this way by the engine's own document: a
 missing top-level `manifest_version` and a region flag emitted as an integer where
 the contract fixes a boolean.
 
+### Region inventory: what a region reads, writes and may be compared across
+
+The manifest's region registry answers "what ran, and is it repeatable?" for a
+*capture*. A second, larger table answers the question the trainer needs:
+`csrc/regions.c` inventories every in-scope forward region of the dense/dense-hybrid
+path with its inputs, outputs, persistent state, saved-for-backward values and case
+availability, and registers each reachable pair of execution cases (chunked
+prefill, recurrent prefill, one-token tail, decode) as `exact`, a quantified
+`exception`, `unverified` or `not_applicable`.
+
+Three design rules make it usable rather than decorative. `exact` is claimed only
+where the manifest registry already says `deterministic` — a single elementwise
+pass, a row gather or a permutation — so a library's reduction order can never be
+blessed by a fixture that happened to agree once; `ctest test_region_cases` enforces
+that by requiring bitwise equality of output *and* persistent state, and
+`ctest test_region_inventory` ties the two registries together in both directions.
+A number is carried only by a measured `exception`; an `unverified` pair reports
+what the fixture measured and claims nothing. And the trainer traversal
+(`train_forward`, `eval_no_autograd`, `recompute`, `backward`) is registered as
+*unavailable* from every region, because an inventory that lists a case with no API
+would claim a trainer that does not exist. The inventory is deliberately not
+projected into `numerical_policy_id`: which test claims have been made is not part
+of the numerical identity a capture observed. See
+[plan-numeric-contract.md](plan-numeric-contract.md) Stage 1 and
+[worklog.md](worklog.md) for the measured pair-by-pair evidence.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:

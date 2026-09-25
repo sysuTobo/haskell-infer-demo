@@ -39,6 +39,20 @@ void kernel_attention(__nv_bfloat16 *out, const __nv_bfloat16 *q,
                       float scale, int max_seq_len, cudaStream_t stream);
 
 /**
+ * Split the fused Q / output-gate projection. `total` counts Q *elements*
+ * (rows * head_dim, where a row is a (token, head) pair), matching the real
+ * caller's `tokens * num_heads * head_dim`; raw holds 2 * total elements with Q
+ * and the gate interleaved per row, so q[i] = raw[row*2*head_dim + d] and
+ * gate[i] = raw[row*2*head_dim + head_dim + d] for i = row*head_dim + d. A
+ * per-token caller passes the token's slice of raw and the token-local element
+ * count. Exported so the region harness can drive it without a whole attention
+ * layer.
+ */
+void kernel_q_gate_split(__nv_bfloat16 *q, __nv_bfloat16 *gate,
+                         const __nv_bfloat16 *raw, int total, int head_dim,
+                         cudaStream_t stream);
+
+/**
  * Gated attention output: out = attn * sigmoid(gate), BF16-rounded sigmoid.
  */
 void kernel_sigmoid_mul(__nv_bfloat16 *out, const __nv_bfloat16 *attn,
@@ -83,6 +97,13 @@ void kernel_gdn_gated_norm(__nv_bfloat16 *out, const __nv_bfloat16 *x,
  */
 void kernel_silu_mul(__nv_bfloat16 *out, const __nv_bfloat16 *gate,
                      const __nv_bfloat16 *up, int n, cudaStream_t stream);
+
+/**
+ * Elementwise SiLU in place. This is the GDN conv activation (a separate region
+ * from the dense MLP's fused gate*up) and is exported so the region harness can
+ * drive it independently of the layer that happens to call it.
+ */
+void kernel_silu_inplace(__nv_bfloat16 *x, int n, cudaStream_t stream);
 
 /* ------------------------------------------------------------------ */
 /*  Embedding                                                         */

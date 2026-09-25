@@ -70,7 +70,7 @@ add_custom_command(
 
 add_library(engine SHARED
     engine.cu memory.cu safetensors_loader.cu safetensors.cpp model_desc.c manifest.c sha256.c
-    layer_dispatch.cu collective.cu moe.cu tap.cu
+    regions.c layer_dispatch.cu collective.cu moe.cu tap.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu kernels/mla.cu
@@ -115,6 +115,17 @@ add_test(NAME test_manifest_hashes COMMAND ${Python3_EXECUTABLE}
          "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_manifest_hashes.py"
          --emitter $<TARGET_FILE:test_manifest>)
 
+# CPU-only: the Stage-1 region inventory. It checks that the inventory covers the
+# plan's in-scope forward operations and nothing else, that it agrees with the
+# manifest registry in both directions (region names and the determinism that
+# backs an `exact` verdict), that every registered verdict carries the evidence it
+# needs, and that the trainer traversal cases are available from no region. No GPU
+# and no weights.
+add_executable(test_region_inventory ../tests/region_inventory_test.c
+               regions.c manifest.c sha256.c model_desc.c)
+target_include_directories(test_region_inventory PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME test_region_inventory COMMAND test_region_inventory)
+
 option(BUILD_TESTS "Build GPU numerical tests" OFF)
 if(BUILD_TESTS)
     add_executable(test_attention ../tests/kernels/test_attention.cu)
@@ -138,6 +149,12 @@ if(BUILD_TESTS)
     add_executable(test_mla ../tests/kernels/test_mla.cu)
     target_link_libraries(test_mla PRIVATE engine)
     add_test(NAME test_mla COMMAND test_mla)
+    # Stage-1 cross-case harness: identical inputs and persistent state under each
+    # applicable execution case, adjudicated against the committed inventory, plus
+    # the unsupported-shape/case rejections and the region entry-point cost.
+    add_executable(test_region_cases ../tests/kernels/test_region_cases.cu)
+    target_link_libraries(test_region_cases PRIVATE engine)
+    add_test(NAME test_region_cases COMMAND test_region_cases)
     # Initialization resource safety: a checkpoint that cannot be loaded must
     # leave no handle and no device memory behind. Skips itself when no GPU is
     # visible.

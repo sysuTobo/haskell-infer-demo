@@ -151,11 +151,35 @@ confirmed measurement.
 
 The table is deliberately conservative. `deterministic` is claimed only where the
 implementation is a single elementwise pass with no cross-thread reduction
-(embedding gather, RoPE, Q/gate de-interleave, the output gate, residual add,
-SiLU-multiply, the FP32 MoE combine, the host argmax). Everything whose reduction
-or tiling order comes from a library (FlashInfer, cuBLAS, the AOT FLA cubins) or
-crosses devices is `unverified`, and the backward regions are `not_implemented`
-rather than assumed. Stage 2's experiments are what would establish the rest.
+(embedding gather, RoPE, Q/gate de-interleave, the KV cache write, the output
+gate, residual add, SiLU-multiply, the GDN conv activation, the FP32 MoE combine,
+the host argmax). Everything whose reduction or tiling order comes from a library
+(FlashInfer, cuBLAS, the AOT FLA cubins) or crosses devices is `unverified`, and
+the backward regions are `not_implemented` rather than assumed. Stage 2's
+experiments are what would establish the rest.
+
+**The registry and the Stage-1 inventory are separate on purpose.** This table
+says what a *capture* ran (implementation plus determinism) and its digest is part
+of `numerical_policy_id`. [plan-numeric-contract.md](plan-numeric-contract.md)
+Stage 1 adds a second, larger table — `csrc/regions.c` — that says, per region,
+what it reads and writes, which persistent state it owns, which values a backward
+would need, which execution cases reach it, and for each *pair* of those cases
+whether the two are `exact`, a quantified `exception`, `unverified` or
+`not_applicable`. Keeping test claims out of `numerical_policy_id` matters: folding
+"which case pairs a fixture has established" into the identity would move every
+capture's numerical identity whenever a test is added, without strengthening any
+numeric gate. The two tables are kept consistent instead by `ctest
+test_region_inventory`, which requires every inventory region to be a manifest
+region, every manifest region to be inventoried or explicitly excluded (MLA, MoE
+and the TP/EP collectives), an `exact` pair to exist only where this table already
+says `deterministic`, and no manifest row to name the trainer traversal
+(`train_forward`, `eval_no_autograd`, `recompute`, `backward`) that has no API.
+
+A row's `cases` column is therefore "cases this build can reach", not an
+aspiration. Stage 1 removed six `train_forward` claims, one `recompute` claim and
+`gemm_bf16`'s `backward` claim for exactly that reason: the column's digest is part
+of the numerical policy, and a policy that claims coverage a region cannot be
+exercised for is wrong even when nothing reads it.
 
 ## Sampling
 
@@ -195,7 +219,8 @@ and a bitwise failure is a failure in every mode.
 | Piece | File |
 |---|---|
 | SHA-256, canonical writer, identities, region registry | `csrc/sha256.c`, `csrc/manifest.c`, `csrc/include/manifest.h` |
+| Stage-1 region inventory, case-pair verdicts, exclusions | `csrc/regions.c`, `csrc/include/regions.h` |
 | Build provenance generation | `csrc/gen_build_info.cmake`, `csrc/triton/build_aot.py` |
 | Engine query, descriptor/parameter digests, device facts | `csrc/engine.cu`, `csrc/include/engine.h` |
 | FFI, parse, diff, admission modes, CLI | `src/Infer/FFI/Engine.hs`, `src/Infer/Manifest.hs`, `src/Main.hs` |
-| Gates | `ctest test_manifest`, `ctest test_manifest_hashes` (CPU), `tests/ManifestSpec.hs` (`cabal test infer-tests`), `tests/test_manifest_compare_cli.py`, `tests/capture_logits.py` |
+| Gates | `ctest test_manifest`, `ctest test_manifest_hashes` (CPU), `ctest test_region_inventory` (CPU), `ctest test_region_cases` (GPU), `tests/ManifestSpec.hs` (`cabal test infer-tests`), `tests/test_manifest_compare_cli.py`, `tests/capture_logits.py` |

@@ -83,11 +83,18 @@ __global__ void deinterleave_qg_kernel(__nv_bfloat16 *__restrict__ q,
     gate[i] = raw[head * 2 * hd + hd + d];
 }
 
-__global__ void silu_inplace_kernel(__nv_bfloat16 *__restrict__ x, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float v = __bfloat162float(x[i]);
-    x[i] = __float2bfloat16(v / (1.0f + expf(-v)));
+void kernel_q_gate_split(__nv_bfloat16 *q, __nv_bfloat16 *gate,
+                         const __nv_bfloat16 *raw, int total, int head_dim,
+                         cudaStream_t stream) {
+    if (total < 0 || head_dim <= 0) {
+        throw std::invalid_argument("kernel_q_gate_split: invalid shape");
+    }
+    if (total == 0) return;
+    if (q == nullptr || gate == nullptr || raw == nullptr) {
+        throw std::invalid_argument("kernel_q_gate_split: null buffer");
+    }
+    deinterleave_qg_kernel<<<(total + 255) / 256, 256, 0, stream>>>(q, gate, raw, total, head_dim);
+    check_launch();
 }
 
 int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
@@ -220,7 +227,7 @@ int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
                          conv_state, C, tokens, dims->gdn_conv_kernel, stream);
     check_launch();
     // Convolution returns unfused BF16; preserve its rounding before SiLU.
-    silu_inplace_kernel<<<(tokens * C + 255) / 256, 256, 0, stream>>>(conv_out, tokens * C);
+    kernel_silu_inplace(conv_out, tokens * C, stream);
     check_launch();
     tap("gdn_conv", conv_out, C);
     kernel_fla_gdn(delta_out, conv_out, a, b, w->A_log, w->dt_bias,

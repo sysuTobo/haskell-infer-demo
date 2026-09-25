@@ -291,13 +291,16 @@ static const struct RegionInventoryEntry kInventory[] = {
 
     {"attention_core", 1, "families with full attention",
      "FlashInfer single prefill (kernels/attention.cu: kernel_attention); "
-     "split-KV disabled by a null workspace, LSE not returned",
+     "split-KV disabled by a null workspace; the entry point does not return the "
+     "LSE, although the kernel can (Stage 2 claim E)",
      "bf16 q[tokens,heads,head_dim]; bf16 kv_cache; seq_start,tokens,seq_len; "
      "scale = 1/sqrt(head_dim)",
      "bf16 out[tokens,heads,head_dim]",
      "reads the KV cache; writes no persistent state",
-     "nothing usable: LSE and the softmax probabilities are not returned "
-     "(Stage 2 claim E)",
+     "nothing usable today, and Stage 2 showed what a backward would need: this "
+     "entry point passes lse=nullptr, while the same FlashInfer dispatcher writes "
+     "a base-2 LSE of layout [qo_len, num_heads] f32 when asked, leaving the "
+     "output bitwise unchanged (Stage 2 claim E)",
      "chunked_prefill,tail1,decode", "none",
      N_PAIRS(kAttentionCorePairs), kAttentionCorePairs},
 

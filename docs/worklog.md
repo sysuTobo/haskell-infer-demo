@@ -16,12 +16,8 @@ Last updated: 2026-09-25.
 Everything below was run and passed on 2× A40 46 GB (sm_86) unless a line says
 otherwise. No GPU result here is implied by a document edit alone.
 
-The manifest, ctest, cargo and cabal rows, the golden capture and the
-capture-comparison rows below were run on 2026-09-25, the last group against the
-Stage-1 tree. `tests/test_engine.py` was re-run in that same session; the
-`test_longseq.py` and `test_tp.py` rows were last run on 2026-09-24, and the
-forward arithmetic they exercise was re-confirmed bitwise identical on 2026-09-25
-by the golden-capture row below.
+Every row below was re-run on 2026-09-25 against the Stage-1 tree. The sm_89 and
+sm_90a lines in "Placement and hardware" are the exceptions, and they say so.
 
 | Gate | Result |
 |---|---|
@@ -35,8 +31,8 @@ by the golden-capture row below.
 | Pre-refactor golden vs a fresh 27B capture | bitwise identical (`max_abs == 0` on every array) with verdict `legacy/unverified` (exit 2) — the older capture's numeric arrays are compared, but nothing about its identity is invented. Re-run against the Stage-1 tree on 2026-09-25, which is what shows the conv-activation export and the registry change are numerically inert |
 | Qwen3.8-27B golden capture | bitwise identical to the pre-refactor baseline (`max_abs == 0`) |
 | `tests/test_engine.py` (27B vs independent PyTorch logits) | 20/20 greedy tokens (one step is a BF16 tie the reference itself reports as equal-maximal); per-step logit RMS 0.015–0.038; descriptor round-trip and the invalid-input/capacity checks pass; chunk boundaries 129-token rms 1.06 and 64+64+1 rms 1.33, both top-1 stable |
-| `tests/test_longseq.py` | 433-token chunk-split self-consistency (RMS 0.029) and 128-token generation coherence |
-| `tests/test_tp.py --devices 0,1` (TP2) | identical greedy tokens, per-step logit RMS ≤ 0.05 |
+| `tests/test_longseq.py` | 433-token chunk-split self-consistency (top-1 271/271, RMS 0.029) and 128-token generation coherence (4-gram repetition 0.008) |
+| `tests/test_tp.py --devices 0,1` (TP2) | identical greedy tokens; per-step logit RMS 0.014–0.045 on the 10-token arm and 0.029–0.039 on its 129-token boundary arm (gate 0.05) |
 
 The manifest rows ran on the real 27B with `semantic_id`
 `890c5472…fabde`, `numerical_policy_id` `0b549229…470d8b`, `deployment_id`
@@ -94,9 +90,9 @@ claims rather than asserting them:
   case pair as `exact`, a quantified `exception`, `unverified` or
   `not_applicable`. MLA, MoE and the TP/EP collectives are listed as *excluded*
   with the reason, so "not inventoried" cannot be mistaken for "not applicable".
-- Two coverage claims in the Stage-0 `cases` column were not reachable and are
-  removed (six rows listed `train_forward`, one `recompute`, and `gemm_bf16` listed
-  `backward`). That column is hashed into `numerical_policy_id`, so advertising a
+- Eight cells of the Stage-0 `cases` column claimed something unreachable and are
+  removed: `train_forward` in six rows, `recompute` in one, and `backward` in
+  `gemm_bf16`. That column is hashed into `numerical_policy_id`, so advertising a
   traversal that does not exist is a policy claim, not a note;
   `test_region_inventory` now fails if any manifest row names a traversal case.
 - `ctest test_region_inventory` (CPU, no GPU and no weights) checks the two things
@@ -139,9 +135,13 @@ provenance is fully established, with two byte-identical queries and every diges
 re-derived independently by `tests/manifest_check.py`; the pre-refactor golden is
 still bitwise identical (`max_abs == 0` on every array, verdict
 `legacy/unverified`, exit 2), which is what shows exporting the conv activation and
-changing the registry are numerically inert; and `tests/test_engine.py` re-runs
-green against the independent PyTorch reference (20/20 greedy tokens, per-step
-logit RMS 0.015–0.038).
+changing the registry are numerically inert; and the model-only harnesses re-run
+green — `tests/test_engine.py` against the independent PyTorch reference (20/20
+greedy tokens, per-step logit RMS 0.015–0.038), `tests/test_longseq.py` (433-token
+chunk-split top-1 271/271, RMS 0.029) and `tests/test_tp.py --devices 0,1`
+(identical greedy tokens, RMS 0.014–0.045). The last two matter here because they
+are the model-level counterparts of the chunked-prefill and placement case pairs
+this stage inventories at region level.
 
 Two things about that table. A measured zero under `unverified` is *not* promoted
 to `exact`: `exact` requires the Stage-0 registry to say `deterministic` (no

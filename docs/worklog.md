@@ -393,9 +393,12 @@ under:
   result and no invented identity, exit 2).
 - The committed region registry records the implementation each region ran and, per
   region, determinism/mechanism/RNG-dependency separately (27 regions: 11
-  deterministic by construction, 13 unverified because a library or cross-device
-  reduction order is not established, 3 `not_implemented` — the backward region,
-  the proposed loss region and the proposed sampler).
+  deterministic by construction, 15 unverified because a library, a cross-device
+  reduction order or (Stage 4) an atomically-accumulated group sum is not established,
+  and 1 `not_implemented` — the proposed sampler). Stage 4 moved two rows out of
+  `not_implemented`: `masked_loss` (its masked reduction and backward landed) and
+  `backward`, whose determinism is now recorded with the reason it is only partly
+  pinned.
 - The canonical encoding is what makes the digests checkable elsewhere: keys sorted
   by byte value, no whitespace, integers bare, non-integer constants as decimal
   strings, printable ASCII only. `test_manifest` pins the identity matrix without a
@@ -466,15 +469,25 @@ CPU case pinning the behaviour.
   that compare the training forward against the inference forward at region level, and
   half-doing it would put a coverage claim in the registry that no fixture backs, so it
   is an open item rather than a partial edit.
-- **The training path has no backward, losses or optimizer yet.** Stage 3 delivers the
-  ownership objects, the teacher-forced forward and the retention a backward needs;
-  the masked loss reduction, the gradient kernels and the optimizer are Stage 4, which
-  is why the `masked_loss` region is still recorded as unfinished in the registry.
+- **The training path's gradient pairings are not bitwise, and that is Stage 6's.**
+  Stage 4 delivers the backward, the losses and the optimizer, but three pairings stop
+  short of bitwise and are recorded rather than glossed: attention's backward
+  recomputes P in FP32 while the forward's PV product rounds it to BF16 (dV carries
+  ~1e-3 for that reason, which Stage 2's claim E predicted); the GDN core backward
+  differentiates the recurrence rather than the cubin's `(I+A)^{-1}`/BF16-MMA
+  decomposition; and the attention dK/dV group sums accumulate with atomics, so they
+  are reported by the gate rather than required to be reproducible (dQ, which finishes
+  inside its own block, and the whole GDN core backward are bitwise).
+- **The GDN core backward's reduction is correct but not blocked.** Each coordinate
+  sums over the key range rather than tiling the way the forward's kernels do, so its
+  constant factor is the next thing to fix when training throughput (not correctness)
+  becomes the constraint. It is bitwise reproducible, which the gate checks.
 - **The FP32 masters are per-parameter, not sharded.** A store with training state for
   a 27B checkpoint would need ~54 GB of masters plus gradients and two optimizer slots
   on a 46 GB device, so the gate attaches training state for the synthetic model and
-  the 27B path is bookkeeping-only. Sharding or offloading the optimizer state is
-  Stage 4's problem and is stated here rather than discovered later.
+  the 27B path is bookkeeping-only. Stage 4 added the optimizer's FP32 master/m/v
+  triple, which does not change that shape, so sharding or offloading the optimizer
+  state is a Stage-5+ problem and is stated here rather than discovered later.
 - **No region has an established reduction order beyond the elementwise ones.** The
   registry marks 13 of 27 regions `unverified`, and the GEMM algorithm policy is
   recorded as `cublas_default_heuristic_unpinned`: an exact claim about that region
@@ -499,13 +512,20 @@ CPU case pinning the behaviour.
   scores the same way, which is a Stage-4 concern.
 - **The trainer traversal is registered as unavailable, not as implemented.**
   `train_forward`, `eval_no_autograd`, `recompute` and `backward` are reachable from
-  no region, and both new gates refuse a region that advertises them: registering a
-  case with no API would claim a trainer Stages 3-4 have not built.
+  no region, and both gates refuse a region that advertises them. Stage 4 makes that a
+  deliberate distinction rather than a stopgap: the backward *exists* now, but it is a
+  traversal of its own, so its coverage lives in the Stage-4 backward inventory
+  (`backward_region_info`, which the same gates check against the Stage-1 inventory)
+  instead of a per-region forward case. `train_forward` and `eval_no_autograd` still
+  have no API, and `recompute` is an attention-backward option rather than a case.
 - **`weights.content_sha256` is null** unless a caller chooses to hash 50 GiB of
   tensor data; the parameter-manifest digest over the tensor index is what strict
   admission compares.
-- **Backward regions do not exist**, so the registry records them as
-  `not_implemented` rather than assuming a determinism verdict for them.
+- **The backward's registry row is `unverified`, not `deterministic`.** Now that the
+  backward exists (Stage 4) the registry records *why* it is only partly pinned: the
+  elementwise, norm, RoPE and loss backwards reduce in a fixed order, while the scatter
+  and group-sum ones accumulate with atomics. The gate measures the split rather than
+  promoting the whole row.
 - **Expert-parallel equivalence re-run is pending.** The EP-vs-layer-split check
   after the FP32 merge landed was stopped before it finished. The gate is
   unchanged (`test_tp.py --ep 2`: identical greedy tokens, logit RMS ≤ 0.05).
@@ -526,5 +546,5 @@ CPU case pinning the behaviour.
 | [README.md](../README.md) | Build, test entry points, usage, phase status, model weights |
 | [design.md](design.md) | Architecture rationale, per-family layout differences, testing strategy |
 | [manifest-contract.md](manifest-contract.md) | The execution manifest: canonical encoding, field ownership and projections, the region determinism registry, and the comparison modes |
-| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stages 0-3 are implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
+| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stages 0-4 are implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
 | [reference-output.json](reference-output.json) | Transformers reference tokens for the 27B debugging prompt |

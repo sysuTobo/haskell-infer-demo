@@ -180,7 +180,7 @@ equal highest BF16 reference logits are treated as ties.
 
 ## Tests
 
-- `ctest --test-dir csrc/build-libs` runs five suites that need no GPU at all:
+- `ctest --test-dir csrc/build-libs` runs six suites that need no GPU at all:
   `test_model_desc` (descriptor parsing, structural validation, the
   engine-capability gate for the AOT GDN layout, canonical echo and the tp-role
   coverage rule), `test_safetensors` (malformed headers, offsets, shapes and
@@ -193,7 +193,12 @@ equal highest BF16 reference logits are treated as ties.
   `test_region_inventory`, which checks the plan's in-scope forward path is
   inventoried region by region, that the inventory and the manifest registry cannot
   drift apart, and that every registered case-pair verdict carries the evidence it
-  needs, and `test_train`, which checks the trainable runtime's ownership objects:
+  needs, `test_backward`, which checks the Stage-4 differentiation contract: the
+  Stage-4 region table against that same inventory in both directions, the losses and
+  AdamW against an independent FP64 implementation, the checkpoint's refusals, a
+  deterministic fixture that overfits to 32/32 and a resume that has to land on the
+  uninterrupted run's bits, and `test_train`, which checks the trainable runtime's
+  ownership objects:
   tying, frozen parameters with no training state, the borrow/update/free lifetime
   rules, publication with derived-copy refresh, the accumulation schedule, replicas and
   the teacher-forcing plan. The rest of ctest
@@ -209,7 +214,11 @@ equal highest BF16 reference logits are treated as ties.
   over head dims, GQA and KV lengths), `test_gemm_invariance` (one M-row call vs
   per-row and prefix splits at the real projection shapes) and `test_attention_lse`
   (the query that asks FlashInfer for the LSE a backward needs, and checks the
-  output is unchanged), `test_train_forward` (the Stage-3 gate on the synthetic
+  output is unchanged), `test_backward_kernels` (the Stage-4 gradient gate: every
+  backward against a double-precision definition or a central difference of one, the
+  attention backward against the analytic reading of the device's own base-2 LSE, the
+  GDN core backward with a nonzero initial state across one and three chunks, and the
+  run-to-run reproducibility of both paired kernels), `test_train_forward` (the Stage-3 gate on the synthetic
   checkpoint: all-position forward against a transformers forward, teacher-forced
   log-probabilities, tied roles, a synthetic update that must refresh both readers and
   the derived FP32 copy, and the training-step lifetime; it skips itself when the
@@ -232,7 +241,9 @@ equal highest BF16 reference logits are treated as ties.
 - `tests/attention_backward_feasibility.py` — the attention forward/backward pair
   (claim E): establishes the LSE convention a backward has to consume, checks the
   analytic backward against `torch.autograd`, and reports what a paired library
-  would cost in tolerance. Pure torch, no engine or checkpoint.
+  would cost in tolerance. Pure torch, no engine or checkpoint; the kernel half of the
+  pair (`kernel_attention_lse` + `kernel_attention_backward`, with the convention
+  re-established against the device's own LSE) is `ctest test_backward_kernels`.
 - `tests/test_tp.py` — placement equivalence on 2 GPUs: the layer-wise split
   against replicated tensor parallel (`--tp 2`) or expert parallel (`--ep 2`,
   with `--desc` and the MoE model), requiring identical greedy tokens and a

@@ -565,7 +565,10 @@ A number is carried only by a measured `exception`; an `unverified` pair reports
 what the fixture measured and claims nothing. And the trainer traversal
 (`train_forward`, `eval_no_autograd`, `recompute`, `backward`) is registered as
 *unavailable* from every region, because an inventory that lists a case with no API
-would claim a trainer that does not exist. The inventory is deliberately not
+would claim a trainer that does not exist. Stage 4 does not change that rule: the
+backward now exists, but it is a traversal rather than a forward case, so its coverage
+is a registry of its own (Stage 4's table, checked against this inventory in both
+directions) instead of an entry in a region's case list. The inventory is deliberately not
 projected into `numerical_policy_id`: which test claims have been made is not part
 of the numerical identity a capture observed. See
 [plan-numeric-contract.md](plan-numeric-contract.md) Stage 1 and
@@ -614,6 +617,44 @@ full-sequence schedule, with alias rules and per-consumer free points. Stage 4's
 backward consumes them; what Stage 3 fixes is that they exist, are accounted for, and
 cannot be freed while a consumer still holds them.
 
+### The backward, the losses and the optimizer
+
+Stage 4's shape is the same split as Stage 3: **C owns the contract and the
+arithmetic, and the things a derivative can silently get wrong are rejections rather
+than comments.** Four of them, in `csrc/include/backward.h` and `csrc/backward.c`:
+
+- *Which forward was differentiated.* The plan requires the GDN forward's rounding
+  boundaries to be documented before differentiating it, and the sub-section above is
+  that table. It matters because a derivative that consumes a differently-rounded
+  operand is the gradient of a different function: the output gate's gate-gradient uses
+  the exact sigmoid while its attention-gradient uses the BF16-rounded one, and the GDN
+  gated norm's weight gradient belongs to the BF16 source rather than Stage 3's FP32
+  derived copy.
+- *What a cast does.* A BF16 cast is a step function, so "identity for gradient
+  propagation" is a choice the engine reports (`backward_cast_mode`) and the gate pins
+  by comparing a whole fixture against a reference whose casts behave the same way. It
+  is not finite-differenced, because that would produce a number for a function with no
+  derivative there.
+- *What a backward is allowed to read.* Each region's saved values are a table
+  (`backward_required_values`), and a backward whose step did not retain — or cannot
+  recompute — them is refused by name. Stage 2 is why the distinction is explicit: the
+  attention core's natural saving is one base-2 LSE, and the probabilities are a
+  *recomputation* from it rather than a retained `[T,T]` tensor.
+- *What the optimizer's order is.* AdamW's bias correction, its decoupled decay and
+  the position of `eps` are all part of the step rather than implementation detail,
+  because each changes the result by more than the FP32 noise floor near a zero moment.
+  The gate compares the whole step — parameters, both moments and the published BF16 —
+  against an independent FP64 implementation of PyTorch's order.
+
+The two paired regions are where "pairing" stops being free, and the honest split is
+recorded rather than smoothed over: attention's backward recomputes P from the forward's
+base-2 LSE (so the probabilities are never retained) while the forward's PV product
+rounds P to BF16, which is the ~1e-3 residual the gate reports on dV; and the GDN core
+backward differentiates the recurrence the model's design specifies rather than the
+cubin's `(I+A)^{-1}`/BF16-MMA decomposition of it. Both are alignment work the plan
+assigns to Stage 6, and saying so is what keeps a passing gate from reading as a
+bitwise pairing.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:
@@ -639,6 +680,7 @@ stops at the first failure, so one command answers "is the tree green".
 | Checkpoint | `ctest -R test_safetensors` (CPU) | malformed headers, offsets, shapes and dtypes rejected without allocating; higher-rank tensors indexed; row-gather and slice capacity arithmetic |
 | Kernel | `ctest`: test_attention, test_gdn, test_collective, test_moe, test_norm, test_rope, test_mla, test_library_ops | vs CPU/PyTorch reference, BF16 tolerances; test_mla additionally re-cuts one sequence to catch block-shape-dependent defects; test_collective runs the same all-reduce once per element type |
 | Generation (CPU) | `cabal test infer-generation-tests` | budget/EOS/error semantics of the real generation loop, with a scriptable engine stub instead of a GPU |
+| Backward | `ctest -R test_backward` (CPU) + `test_backward_kernels` (GPU) | every Stage-4 region's backward against a double-precision definition or a central difference of it; the attention pair against an analytic reading of the device's own base-2 LSE; the GDN core backward with a nonzero initial state across one and three chunks; the losses and AdamW against independent FP64; and a checkpoint resume bitwise equal to an uninterrupted run |
 | Resource safety | `ctest -R test_engine_resources` | repeated failing creations return no handle, explain the error and move no device memory; a valid checkpoint still builds afterwards |
 | Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set; configured `--rms-tolerance` (default 0.1, family-specific overrides) |
 | Chunking | same prompt, different prefill splits | top-1 equal, rms ≤ 5 (state-loss guard) |

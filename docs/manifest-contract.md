@@ -156,9 +156,13 @@ implementation is a single elementwise pass with no cross-thread reduction
 (embedding gather, RoPE, Q/gate de-interleave, the KV cache write, the output
 gate, residual add, SiLU-multiply, the GDN conv activation, the FP32 MoE combine,
 the host argmax). Everything whose reduction or tiling order comes from a library
-(FlashInfer, cuBLAS, the AOT FLA cubins) or crosses devices is `unverified`, and
-the backward regions are `not_implemented` rather than assumed. Stage 2's
-experiments are what would establish the rest.
+(FlashInfer, cuBLAS, the AOT FLA cubins) or crosses devices is `unverified`. Stage 4
+moved the backward region out of `not_implemented` into `unverified`, and the row says
+which half is which: the elementwise, norm, RoPE and loss backwards reduce in a fixed
+order, while the scatter and group-sum ones (embedding, attention dK/dV, GDN core
+dQ/dK, prepare) accumulate with atomics whose order is not pinned. Promoting any of
+them to `deterministic` is a measurement, not an edit. The sampler is the one region
+still `not_implemented`.
 
 **The registry and the Stage-1 inventory are separate on purpose.** This table
 says what a *capture* ran (implementation plus determinism) and its digest is part

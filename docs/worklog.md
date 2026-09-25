@@ -157,8 +157,10 @@ layers, which is exactly why the region boundary is where attribution has to sta
 `region_ffi` also measures what a region boundary costs: host-side enqueue
 (argument validation plus the launch) against device time, on real enqueues with
 no host synchronization between them. For the tiny fixtures here the host side
-dominates — 1.9–5.5 µs per enqueue against 3.7–10.6 µs of device time, 67–99%
-host share — which is a statement about these fixtures and about the engine's
+dominates — 1.9–5.5 µs per enqueue against 3.7–10.0 µs of device time, 68–99%
+host share, and 7.0/7.1 µs per thread with two host threads enqueuing through their
+own handles and non-blocking streams — which is a statement about these fixtures
+and about the engine's
 Haskell FFI being *model-level* today: the number is the C region entry point, not
 a `ccall`, and Stage 3's region handles are what would make the two comparable.
 

@@ -157,13 +157,27 @@ instrument and the numbers rather than a guess:
   weight. Only the first is asserted, tightly: across the FFN shapes and M = 1/2/8/64,
   `max_rel <= 3e-3` and `rms_rel <= 5e-4` - inside the BF16 output's own rounding. The second is
   reported (max_abs 0.021-0.027, rms 0.0074 of |w| max ~0.38).
-- **the measurement blocks the routing, on purpose.** On one A40 at N=4096, K=5120 the kernel
-  reads its 10.8 MB of packed weight at **29.5 GB/s for M=1** (366.7 us) and 2.1 GB/s for
-  M=64 (5161 us), against ~700 GB/s available: one thread per output element gives each thread
-  a whole weight row, so a warp's loads walk different rows and are uncoalesced, and the kernel
-  would be several times *slower* than the BF16 GEMV it would replace. Routing it now would
-  regress the model, so the next step is a coalesced/tiled kernel, then the routing, the
-  F1-compatible packed-row layout and the model-quality gates.
+- **the measurement then decided a specialization, and the specialisation is the one the
+  first kernel lacked.** On one A40 at N=4096, K=5120, against *the same values in BF16*
+  measured through torch:
+
+  | path | median | packed-weight bandwidth | vs BF16 |
+  |---|---|---|---|
+  | M=1, warp-per-row GEMV (coalesced) | **52.1 us** | 207.6 GB/s | **2.25x faster** (117.2 us) |
+  | M=1, first one-thread-per-output kernel | 366.7 us | 29.5 GB/s | 3.1x slower |
+  | M=64, first kernel (batched) | 5090.9 us | 2.1 GB/s | **44x slower** (115.0 us) |
+
+  The first kernel's mapping was the fault: one thread per output element walks a whole weight
+  row per thread, so a warp's loads land on different rows and are uncoalesced. The rewritten
+  **warp-per-row GEMV** - lane t loads the 32-bit word at index t (consecutive lanes, consecutive
+  words) with the activation staged in shared memory once per block - is 7x faster than that
+  and **2.25x faster than BF16 on the same values**, which turns the format's advantage into a
+  measurement instead of a claim. It is not the theoretical 4x: the kernel reaches 208 GB/s of
+  the device's ~700, so latency hiding is still the limit.
+- **only the decode path is admissible.** The batched path is 44x *slower* than BF16 at M=64, so
+  routing it would regress prefill: it needs a shared-memory-tiled GEMM first. The routing
+  order is therefore the GEMV for M=1, the F1-compatible packed-row layout, then the tiled
+  kernel for M>1.
 - two fixture bugs the gate caught before the kernel was trusted: the test passed a float32
   activation where the kernel reads BF16, and wrote the BF16 output into a float32 buffer
   (which produced denormals whose signs tracked the reference - the giveaway). Both were in the
@@ -853,12 +867,11 @@ CPU case pinning the behaviour.
   and both gates then run. A stronger fix would store the fixture on the PVC next to the other
   models, or make a skip a distinct CTest status (`set_tests_properties(... SKIP_RETURN_CODE)`)
   so the count cannot hide it.
-- **The quantized GEMM is verified but not yet an optimization.** `gemm_int4_bf16` matches an
-  independently dequantized-weight reference within BF16 rounding (max_rel <= 3e-3), but its
-  row-per-thread mapping leaves it at 29.5 GB/s of packed weight at M = 1 against the device's
-  ~700 GB/s, i.e. several times slower than the BF16 GEMV it would replace. It is therefore not
-  routed into the dense FFN: a coalesced (warp-per-row) GEMV for M = 1 and a shared-memory-tiled
-  GEMM for batched M come first, then the routing and the model-quality gates.
+- **The quantized GEMM's batched path is not admissible yet, and nothing is routed.** The
+  warp-per-row GEMV is verified *and* measured 2.25x faster than BF16 at M = 1 (52.1 vs
+  117.2 us), so the decode case is ready for routing; the batched path (M = 64) is 44x slower
+  than BF16 and needs a shared-memory-tiled GEMM. Until that exists, `gemm_int4_bf16` is not
+  used by the model, so the dense FFN still runs cuBLAS BF16.
 - **Quantization stops at the format.** Q0's INT4 layout and its reference are implemented,
   gated and re-derived by a second implementation, but nothing consumes them yet: there is no
   converter (`scripts/quantize_weights.py`), no `weights.manifest.json` reader, no quantized

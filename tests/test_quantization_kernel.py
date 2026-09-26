@@ -181,9 +181,36 @@ def main():
                     runs.append((time.perf_counter() - start) * 1e6)
                 weight_bytes = n * k / 2 + n * (k // GROUP) * 2
                 median = sorted(runs)[len(runs) // 2]
-                print(f"timing M={m:<3} N={n} K={k}: median {median:.1f} us, "
-                      f"{weight_bytes / (median * 1e-6) / 1e9:.1f} GB/s of packed weight "
-                      f"({weight_bytes / 1e6:.1f} MB read; a BF16 weight would be 4x that)")
+                line = (f"timing M={m:<3} N={n} K={k}: median {median:.1f} us, "
+                        f"{weight_bytes / (median * 1e-6) / 1e9:.1f} GB/s of packed weight "
+                        f"({weight_bytes / 1e6:.1f} MB read)")
+                # The comparison that matters is against the *same values* in BF16, so the
+                # time gap is the format's and not the fixture's. torch is only needed here.
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        device = torch.device("cuda", int(args.devices.split(",")[0]))
+                        w_bf16 = torch.from_numpy(
+                            (bf16_round(dequant).astype(np.uint32) << 16).view(np.float32)
+                        ).to(device).to(torch.bfloat16)
+                        xb = torch.from_numpy(
+                            (bf16_round(x).astype(np.uint32) << 16).view(np.float32)
+                        ).to(device).to(torch.bfloat16)
+                        for _ in range(3):
+                            torch.matmul(xb, w_bf16.t())
+                        torch.cuda.synchronize()
+                        samples = []
+                        for _ in range(10):
+                            start = time.perf_counter()
+                            torch.matmul(xb, w_bf16.t())
+                            torch.cuda.synchronize()
+                            samples.append((time.perf_counter() - start) * 1e6)
+                        bf16_median = sorted(samples)[len(samples) // 2]
+                        line += (f"; the same values as BF16: {bf16_median:.1f} us "
+                                 f"(2x the bytes read, and {bf16_median / median:.2f}x the time)")
+                except ImportError:
+                    line += "; BF16 comparison skipped (no torch)"
+                print(line)
 
     if failures:
         print(f"test_quantization_kernel: {failures} check(s) failed")

@@ -1693,18 +1693,33 @@ The second is reported (max_abs 0.021-0.027, rms 0.0074 of a |w| max of ~0.38) b
 quantizer's quality is a model-level question the plan assesses with logits RMS, top-1
 agreement and held-out NLL once a kernel is actually routed.
 
-**The measurement is why it is not routed.** The plan asks for M = 1 and batched M to be
-measured separately before choosing specializations, and on one A40 at N = 4096, K = 5120 this
-first implementation reads its 10.8 MB of packed weight at **29.5 GB/s** for M = 1 (366.7 us)
-and 2.1 GB/s for M = 64 (5161 us). The device has roughly 700 GB/s, and a BF16 GEMV of the same
-shape would read 42 MB in about 60 us, so this kernel would be several times *slower* than what
-it replaces. The cause is the mapping, not the format: one thread per output element gives each
-thread a whole weight row, so a warp's loads walk different rows and are uncoalesced. Routing
-it now would regress the model, which is exactly what "only admit when the intended workload
-improves" forbids, so the next step is a coalesced/tiled kernel (a warp cooperating on a row
-for the M = 1 case, shared-memory tiling of the activation for batched M) and *then* the
-routing, the F1-compatible packed-row layout (the plan's "concatenate packed rows and scale
-rows consistently and preserve its activation layout") and the model-quality gates.
+**The measurement decides a specialization, which is why it is taken.** The plan asks for
+M = 1 and batched M to be measured *separately*, and on one A40 at N = 4096, K = 5120 the two
+paths come out opposite:
+
+| path | median | packed-weight bandwidth | against the same values in BF16 |
+|---|---|---|---|
+| M = 1, warp-per-row GEMV (coalesced) | **52.1 us** | 207.6 GB/s | **2.25x faster** (117.2 us) |
+| M = 1, first one-thread-per-output kernel | 366.7 us | 29.5 GB/s | 3.1x slower |
+| M = 64, first kernel (batched) | 5090.9 us | 2.1 GB/s | **44x slower** (115.0 us) |
+
+The first implementation's mapping was the problem, not the format: one thread per output
+element gives each thread a whole weight row, so a warp's loads walked different rows and were
+uncoalesced. The rewritten **warp-per-row GEMV** - lane t loads the 32-bit word at index t, so
+consecutive lanes read consecutive words, with the activation staged in shared memory once per
+block - is 7x faster than that first kernel and **2.25x faster than the same values in BF16**,
+which is the format's advantage showing up as a measurement rather than a claim (it is not the
+theoretical 4x: the kernel reaches 208 GB/s of the device's ~700, so latency hiding is still
+the limit).
+
+**Only the decode path is admissible, and only that one may be routed.** The batched path is
+44x *slower* than BF16 at M = 64, so routing it would regress prefill; it needs a
+shared-memory-tiled GEMM (the weight tile loaded once and reused across the M rows) before it
+is used anywhere. The plan's "Measure M = 1 and batched M separately before choosing
+specializations" is what produced that split, and the routing now means: the warp-per-row GEMV
+for M = 1, the F1-compatible packed-row layout (the plan's "concatenate packed rows and scale
+rows consistently and preserve its activation layout"), and the tiled kernel for M > 1 - in
+that order.
 
 **Q0 and Q1 status.** — the format, its reference, the converter and
 the sidecar; not yet a kernel consuming any of it.** `scripts/quantize_weights.py` converts a

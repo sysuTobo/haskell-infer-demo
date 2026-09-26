@@ -82,6 +82,49 @@ __global__ void gemm_int4_kernel(const __nv_bfloat16 *__restrict__ a,
     out[(size_t)col * (size_t)n + row] = __float2bfloat16(acc);
 }
 
+/* M = 1: one warp per weight row. Lane t loads the 32-bit word at index t, i.e. the eight
+ * codes of k = 8t..8t+7, so consecutive lanes read consecutive words and a warp's load is
+ * coalesced (the naive one-thread-per-output kernel walked a whole row per thread, which left
+ * a warp's loads on different rows - that is what the F0-style measurement caught). The
+ * activation slice is staged once per block into shared memory because every row's warp reads
+ * the same K values. */
+__global__ void gemv_int4_kernel(const __nv_bfloat16 *__restrict__ x,
+                                 const uint8_t *__restrict__ packed,
+                                 const __nv_bfloat16 *__restrict__ scales,
+                                 __nv_bfloat16 *__restrict__ out, int n, int k, int group) {
+    extern __shared__ __nv_bfloat16 x_shared[];
+    for (int i = threadIdx.x; i < k; i += blockDim.x) x_shared[i] = x[i];
+    __syncthreads();
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * (blockDim.x / 32) + warp;
+    if (row >= n) return;
+
+    const uint8_t *w_row = packed + (size_t)row * (size_t)(k / 2);
+    const __nv_bfloat16 *s_row = scales + (size_t)row * (size_t)(k / group);
+
+    float acc = 0.0f;
+    for (int base = 0; base < k; base += 256) {
+        const int first = base + 8 * lane;
+        if (first >= k) break;  /* k is a multiple of 8, so no lane straddles the end */
+        /* One 32-bit load carries this lane's eight codes; the group index follows from the
+         * lane's first k because 8 divides the group. */
+        const uint32_t word = *(const uint32_t *)(w_row + first / 2);
+        const float scale = __bfloat162float(s_row[(first) / group]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            acc = fmaf((float)int4_code(word, j) * scale,
+                       __bfloat162float(x_shared[first + j]), acc);
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) out[row] = __float2bfloat16(acc);
+}
+
 }  // namespace
 
 int gemm_int4_bf16(const __nv_bfloat16 *a, const uint8_t *packed, const __nv_bfloat16 *scales,
@@ -105,9 +148,30 @@ int gemm_int4_bf16(const __nv_bfloat16 *a, const uint8_t *packed, const __nv_bfl
                                     "one 32-bit load carries eight codes; got " +
                                     std::to_string(group));
     }
-    const dim3 block(16, 16);
-    const dim3 grid((unsigned)((M + 15) / 16), (unsigned)((N + 15) / 16));
-    gemm_int4_kernel<<<grid, block, 0, stream>>>(a, packed, scales, out, M, N, K, group);
+    if (M == 1) {
+        /* The decode path: one warp per row, which is where the measurement said the win is. */
+        const size_t shared_bytes = (size_t)K * sizeof(__nv_bfloat16);
+        if (shared_bytes > 96 * 1024) {
+            throw std::invalid_argument("gemm_int4_bf16: K=" + std::to_string(K) +
+                                        " needs more activation staging than one block has");
+        }
+        if (shared_bytes > 48 * 1024) {
+            cudaFuncSetAttribute(gemv_int4_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)shared_bytes);
+        }
+        constexpr int kWarpsPerBlock = 8;
+        const dim3 block(32 * kWarpsPerBlock);
+        const dim3 grid((unsigned)((N + kWarpsPerBlock - 1) / kWarpsPerBlock));
+        gemv_int4_kernel<<<grid, block, shared_bytes, stream>>>(a, packed, scales, out, N, K,
+                                                                group);
+    } else {
+        /* Batched M still uses the first implementation: it is *not* fast (measured at
+         * 2.1 GB/s of packed weight at M = 64 against the same 10.8 MB read), and a
+         * shared-memory-tiled GEMM is what this path needs before it is routed anywhere. */
+        const dim3 block(16, 16);
+        const dim3 grid((unsigned)((M + 15) / 16), (unsigned)((N + 15) / 16));
+        gemm_int4_kernel<<<grid, block, 0, stream>>>(a, packed, scales, out, M, N, K, group);
+    }
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("gemm_int4_bf16: ") + cudaGetErrorString(status));

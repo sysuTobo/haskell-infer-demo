@@ -893,10 +893,13 @@ weight-bandwidth-bound, so the format comes before more fusion.
   weight's bytes are read and nothing is expanded into memory. It is gated against an
   *independently dequantized-weight* reference (max_rel <= 3e-3, inside the BF16 output's
   rounding) and the quantizer's own error is reported separately, which is the plan's "these
-  are different comparisons". It is **not** routed into the FFN: at N=4096, K=5120 it reads
-  29.5 GB/s at M=1 against a device that can do ~700 GB/s, because one thread per output
-  element walks a whole weight row per thread and a warp's loads are uncoalesced. A coalesced
-  warp-per-row GEMV and a tiled batched GEMM come before the routing.
+  are different comparisons". Its **decode path** is a warp-per-row GEMV - lane t loads the
+  32-bit word at index t so a warp's loads are consecutive, with the activation staged in shared
+  memory once per block - and it is **2.25x faster than the same values in BF16** (52.1 vs
+  117.2 us at N=4096, K=5120), which is the format's advantage as a measurement. Its **batched
+  path** is still the first one-thread-per-output kernel and is 44x *slower* than BF16 at M=64,
+  so only the decode case is admissible; a shared-memory-tiled GEMM comes before prefill may use
+  it.
 
 The plan freezes the wire format "subject to a sm_86 kernel feasibility check": the format and
 its converter are gated, and Q2 now has a kernel admitted against the reference, but that

@@ -200,14 +200,30 @@ static void test_phases(void) {
     check(train_loop_enter(loop, TRAIN_PHASE_ROLLOUT, &version) == TRAIN_OK, "entering the rollout failed");
     check(train_store_begin_update(store) == TRAIN_ERR_BUSY,
           "an update was accepted while a rollout borrowed the version");
+    /* The plan's "retain optimizer state or explicitly offload it according to the
+     * budget" is a declaration the loop records, so the number is the caller's act and
+     * not a constant: a phase starts at nothing, a caller that shed bytes says so, a
+     * negative count or a declaration outside a phase is refused, and the boundary clears
+     * it so the next phase cannot inherit an answer. */
+    check(train_loop_optimizer_offloads(loop) == 0, "a fresh rollout reported offloaded state");
+    check(train_loop_declare_optimizer_offload(loop, -1) == TRAIN_ERR_RANGE,
+          "a negative offload count was accepted");
+    check(train_loop_declare_optimizer_offload(loop, 1LL << 30) == TRAIN_OK,
+          "declaring an offload failed: %s", train_loop_last_error());
+    check(train_loop_optimizer_offloads(loop) == (1LL << 30),
+          "the offload declaration did not round-trip (%lld)", train_loop_optimizer_offloads(loop));
     check(train_loop_leave(loop) == TRAIN_OK, "leaving the rollout failed");
-    /* The optimizer state is offloaded during a rollout: the budget's optimizer bytes
-     * are zero, and the loop reports that it holds none. */
     check(train_loop_optimizer_offloads(loop) == 0, "a closed loop reports offloaded state");
+    check(train_loop_declare_optimizer_offload(loop, 0) == TRAIN_ERR_STATE,
+          "an offload was declared outside a phase");
+    check(train_loop_enter(loop, TRAIN_PHASE_SFT, &version) == TRAIN_OK, "re-entering SFT failed");
+    check(train_loop_optimizer_offloads(loop) == 0, "a new phase inherited the last phase's count");
+    check(train_loop_leave(loop) == TRAIN_OK, "leaving SFT failed");
 
-    /* A phase boundary resets the sequence state, once per real entry: the SFT entry and
-     * the rollout entry are two (the refused double-entry is not a reset). */
-    check(train_loop_sequence_resets(loop) == 2, "the sequence resets are %d, expected 2",
+    /* A phase boundary resets the sequence state, once per real entry: the SFT entry, the
+     * rollout entry and the second SFT entry are three (a refused double-entry is not a
+     * reset). */
+    check(train_loop_sequence_resets(loop) == 3, "the sequence resets are %d, expected 3",
           train_loop_sequence_resets(loop));
 
     /* Publishing an update moves the version, and the old record becomes unreadable: the

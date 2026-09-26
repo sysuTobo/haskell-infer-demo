@@ -695,6 +695,21 @@ into a step, and the chaining is where the interesting decisions are:
   teacher-forced trainer path are the same weights through different code (a KV cache
   against a causal mask), so the gate measures the gap between their log-probabilities
   (4.8e-07 on the tiny fixture) instead of assuming the two denominators are one.
+- **A group is one version and one configuration, and the reward is the caller's.** G
+  completions of one prompt differ only in their seed, are recorded into one `TrainGroup`
+  whose version is pinned by its first member (the engine can generate a record under a newer
+  version and the group refuses it), and each carries a reward the caller's *deterministic*
+  verifier computes — no reward model exists to be trained. The advantages then come from
+  `backward_group_advantage` over those rewards, and the plan's degenerate case is a refusal
+  the caller has to waive explicitly (two members that scored the same are a zero-variance
+  group).
+- **Offloading the optimizer state is a declaration, not a guess.** `train_loop` can neither
+  move nor free the store's buffers, so the plan's "retain or explicitly offload it according
+  to the budget" is split: the *budget* says what a phase may hold (0 optimizer bytes for a
+  rollout, whose step reads none of it) and the *loop* records what a caller actually shed,
+  queryable at the boundary. A phase starts at nothing and the boundary clears it, so no
+  phase inherits another's answer. The engine does not move the buffers yet, which the plan's
+  Stage-5 limits state.
 
 The step is wired for the attention and dense-MLP path on one device; the GDN mixer's
 backward and the placements are named in the plan's Stage-5 status as the remaining work

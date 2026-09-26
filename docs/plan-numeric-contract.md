@@ -644,6 +644,22 @@ test_train_loop` (CPU). The gate below is met:
   sampler's by **4.768e-07** at most, i.e. a sequence-level ratio of 0.99999976. The
   generation path reads a KV cache and the trainer a causal mask, so this is exactly the
   cross-case deviation the plan asks to be reported separately rather than claimed bitwise.
+- **a group is one version, one configuration, one verifier.** Four completions of one prompt
+  (differing only in their seed) are recorded into one `TrainGroup`; the group refuses a
+  fifth generated *after* a publication even though the engine produced it. Each member's
+  reward comes from a deterministic check on the completion — the gate's is deliberately
+  trivial, because the point is that no reward model appears — the advantages reduce to
+  +1.000/−1.000/+1.000/−1.000 at a mean of 0.5 and a population std of 0.5, and the
+  degenerate case is a refusal the caller has to waive: two members that scored the same are
+  a zero-variance group, admitted only with `allow_zero_variance` and then giving zero
+  advantages. The sequence-level objective then consumes the engine's *own* record: ratio
+  exactly 1 at unchanged parameters, the gradient's sign following the advantage, and a
+  +0.25 nat/row move giving 1.284025 against the records' own 1.284025.
+- **offloading the optimizer state is a declaration.** The budget says a rollout's step reads
+  no optimizer state (`optimizer_bytes` is 0 against SFT's nonzero); the loop records what a
+  caller actually shed, refuses a negative count or a declaration outside a phase, and clears
+  the count at the boundary so no phase inherits another's answer. The engine does not move
+  the buffers itself, which the limits below state.
 - **the rollout half's rules hold as behaviour.** `test_train_loop` checks the phase
   budgets (only SFT holds optimizer state, activations and retained values), that a rollout
   *borrows* the store so an update is refused while it reads, that a phase boundary resets
@@ -663,10 +679,12 @@ and MLA stay outside the first trainer allowlist as Stage 1 says. Training is wi
 placement would have to reduce sharded ones, and both are refusals today. The rollout
 generates **one sequence per call and one record at a time**: the engine has no group
 entry point, so a caller collects a group's G completions by looping (the plan's "serial
-generation is sufficient for correctness"), and the record's `reward` slot is left for the
-caller's deterministic verifier — the engine does not invent one. And the phase budgets are
-an **estimate from the descriptor's shapes** rather than a measured allocation watermark,
-which is what a budget needs to be chosen from but not what proves a phase fits.
+generation is sufficient for correctness"), the reward is the caller's verifier rather than
+anything the engine computes, and the engine **does not move optimizer state off the device**
+itself — a caller that sheds it says so and the loop records the declaration, while the
+buffers stay allocated where they are. And the phase budgets are an **estimate from the
+descriptor's shapes** rather than a measured allocation watermark, which is what a budget
+needs to be chosen from but not what proves a phase fits.
 
 First bring up SFT after Stages 3–4; it does not wait for cross-case bitwise
 kernels. Then add phase-specific memory budgets and stochastic rollout. Reuse

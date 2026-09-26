@@ -141,13 +141,14 @@ TrainStatus train_loop_enter(TrainLoop *loop, TrainPhase phase, long long *out_v
     loop->phase = phase;
     loop->open = 1;
     /* Every phase enters with a clean sequence: the KV cache and the GDN state belong to
-     * the sequence that produced them. */
+     * the sequence that produced them. It also enters having declared nothing offloaded,
+     * so a count cannot leak from one phase into the next. */
     ++loop->sequence_resets;
+    loop->optimizer_offloaded_bytes = 0;
     /* A rollout reads the parameters, so it borrows the version and an update is refused
      * until it leaves; SFT owns the update window, so it holds no borrow of its own. */
     loop->version = train_store_version(loop->store);
     if (phase == TRAIN_PHASE_ROLLOUT) {
-        loop->optimizer_offloaded_bytes = 0;
         /* The borrow is what makes the store refuse an update while the rollout reads:
          * a recorded version would only be a promise. */
         loop->borrow = train_context_create(loop->store, /*is_rollout=*/1);
@@ -171,6 +172,9 @@ TrainStatus train_loop_leave(TrainLoop *loop) {
     }
     loop->open = 0;
     loop->version = -1;
+    /* A closed phase holds nothing, so a caller reading the count after the boundary sees
+     * what the phase ended with rather than what the next phase will declare. */
+    loop->optimizer_offloaded_bytes = 0;
     return TRAIN_OK;
 }
 
@@ -182,8 +186,24 @@ int train_loop_sequence_resets(const TrainLoop *loop) {
     return loop == NULL ? 0 : (int)loop->sequence_resets;
 }
 
+TrainStatus train_loop_declare_optimizer_offload(TrainLoop *loop, long long bytes) {
+    if (loop == NULL) {
+        return fail(TRAIN_ERR_ARG, "train_loop_declare_optimizer_offload: null loop");
+    }
+    if (!loop->open) {
+        return fail(TRAIN_ERR_STATE,
+                    "train_loop_declare_optimizer_offload: no phase is open");
+    }
+    if (bytes < 0) {
+        return fail(TRAIN_ERR_RANGE,
+                    "train_loop_declare_optimizer_offload: %lld bytes were not moved", bytes);
+    }
+    loop->optimizer_offloaded_bytes = bytes;
+    return TRAIN_OK;
+}
+
 long long train_loop_optimizer_offloads(const TrainLoop *loop) {
-    return loop == NULL ? 0 : loop->optimizer_offloaded_bytes;
+    return loop == NULL || !loop->open ? 0 : loop->optimizer_offloaded_bytes;
 }
 
 long long train_loop_version(const TrainLoop *loop) {

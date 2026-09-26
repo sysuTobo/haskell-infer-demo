@@ -118,7 +118,24 @@ def bind(lib):
                                                ctypes.POINTER(ctypes.c_float)]
         lib.train_loop_ratio.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                                          ctypes.POINTER(ctypes.c_double)]
+        lib.train_loop_declare_optimizer_offload.argtypes = [ctypes.c_void_p, ctypes.c_longlong]
+        lib.train_loop_optimizer_offloads.argtypes = [ctypes.c_void_p]
+        lib.train_loop_optimizer_offloads.restype = ctypes.c_longlong
         lib.train_loop_last_error.restype = ctypes.c_char_p
+    # The rollout's objective side (Stage 4's reduction and hinge), reached through the
+    # same library so the gate can compute over records the engine produced.
+    if hasattr(lib, "backward_group_advantage"):
+        lib.backward_group_advantage.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                                ctypes.c_float, ctypes.c_int, ctypes.c_void_p,
+                                                ctypes.POINTER(ctypes.c_double),
+                                                ctypes.POINTER(ctypes.c_double)]
+        lib.backward_clipped_objective.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                                   ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                                   ctypes.c_float, ctypes.c_float, ctypes.c_int,
+                                                   ctypes.c_void_p, ctypes.c_void_p,
+                                                   ctypes.POINTER(ctypes.c_double),
+                                                   ctypes.POINTER(ctypes.c_longlong)]
+        lib.backward_last_error.restype = ctypes.c_char_p
     if hasattr(lib, "model_desc_role_from_name"):
         lib.model_desc_role_from_name.argtypes = [ctypes.c_char_p]
         lib.model_desc_role_from_name.restype = ctypes.c_int

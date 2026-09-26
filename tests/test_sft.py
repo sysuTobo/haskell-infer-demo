@@ -196,6 +196,8 @@ TRAIN_LOOP_MAX_GROUP = 64
 TRAIN_PHASE_ROLLOUT = 1
 TRAIN_TERMINAL_EOS = 0
 TRAIN_TERMINAL_LENGTH = 1
+BACKWARD_CLIP_TOKEN = 0
+BACKWARD_CLIP_SEQUENCE = 1
 
 
 class BackwardRng(ctypes.Structure):
@@ -456,6 +458,191 @@ def rollout_section(lib, model_dir, desc):
         lib.engine_destroy(engine)
 
 
+def group_section(lib, model_dir, desc):
+    """The group-based generation the plan's RL shapes need, driven from the engine.
+
+    One prompt, one version, one sampling configuration, G completions, one deterministic
+    verifiable reward each, and then the group's advantages and the clipped objective
+    computed over the engine's *own* records. The verifier here is deliberately trivial (a
+    property of the sampled tokens) because what is under test is the plumbing rather than
+    the reward: the plan's point is that a deterministic check on the completion is enough to
+    start with, so no reward model appears anywhere in this section.
+    """
+    eos = eos_token_of(desc)
+    prompt = [3, 7, 11]
+    members = 4
+    # The group's seeds are part of the fixture, the way TOKENS and MASK are: they were
+    # picked so the trivial verifier below splits the group (two even first tokens, two odd
+    # ones), which is what gives the advantages both signs. The gate prints the rewards and
+    # the completions, so the split is visible rather than trusted.
+    seeds = [100, 104, 105, 106]
+    engine, store = make_engine(lib, model_dir, desc)
+    loop = lib.train_loop_create(store)
+    assert loop, lib.train_loop_last_error().decode()
+    version = ctypes.c_int64(-1)
+    assert lib.train_loop_enter(loop, TRAIN_PHASE_ROLLOUT, ctypes.byref(version)) == 0, \
+        lib.train_loop_last_error().decode()
+    group = TrainGroup()
+    records = []
+    rewards = []
+    try:
+        print(f"6. a group of {members} completions under one version")
+        for index, seed in enumerate(seeds):
+            status, record, error = sample(lib, engine, prompt, 4, eos, seed)
+            check(f"completion {index} was generated", status == 0, error)
+            if status != 0:
+                return
+            # The deterministic verifier: a property of the sampled tokens, no model.
+            record.reward = 1.0 if int(record.token_ids[0]) % 2 == 0 else 0.0
+            recorded = lib.train_loop_record(loop, ctypes.byref(group),
+                                             ctypes.byref(record)) == 0
+            check(f"completion {index} was recorded into the group", recorded,
+                  "" if recorded else lib.train_loop_last_error().decode())
+            records.append(record)
+            rewards.append(record.reward)
+        check("every member carries the group's version",
+              group.version == version.value == lib.engine_train_version(engine)
+              and group.count == members,
+              f"group {group.version}, store {lib.engine_train_version(engine)}, "
+              f"{group.count} records")
+        print("  rewards " + " ".join(f"{reward:.1f}" for reward in rewards)
+              + " for completions "
+              + " ".join(str([int(r.token_ids[i]) for i in range(min(3, int(r.tokens)))])
+                         for r in records))
+        check("the group separates at least two reward levels",
+              len(set(rewards)) > 1, f"rewards {rewards}")
+
+        read_back = []
+        for index in range(members):
+            reward = ctypes.c_float(0.0)
+            ok = lib.train_loop_read_reward(loop, ctypes.byref(group), index,
+                                            ctypes.byref(reward)) == 0
+            check(f"the group's reward {index} reads back", ok,
+                  "" if ok else lib.train_loop_last_error().decode())
+            read_back.append(reward.value)
+        check("the verifier's rewards round-trip through the group", read_back == rewards)
+
+        # The advantage reduction over the engine's completion rewards. Centred by
+        # construction: the population standard deviation is what "A_i = (r_i - mean)/std"
+        # means, and the plan's synchronous-update gate asks for both signs.
+        reward_arr = np.ascontiguousarray(rewards, dtype=np.float32)
+        advantages = np.zeros(members, dtype=np.float32)
+        mean = ctypes.c_double(0.0)
+        std = ctypes.c_double(0.0)
+        status = lib.backward_group_advantage(ptr(reward_arr), None, members, 1e-4, 0,
+                                              ptr(advantages), ctypes.byref(mean),
+                                              ctypes.byref(std))
+        check("the group's advantages reduce", status == 0,
+              "" if status == 0 else lib.backward_last_error().decode())
+        print(f"  mean {mean.value:.4f}, population std {std.value:.4f}, advantages "
+              + " ".join(f"{a:+.3f}" for a in advantages))
+        check("the advantages are centred", abs(float(advantages.sum())) < 1e-4)
+        check("a reward above the mean has a positive advantage and below it a negative one",
+              all((reward > mean.value) == (advantage > 0)
+                  for reward, advantage in zip(rewards, advantages)))
+
+        # A zero-variance group, made from the engine's own rewards: two members that scored
+        # the same, selected by the mask. The plan refuses it unless the caller says the
+        # degenerate case is intended.
+        equal = [(i, j) for i in range(members) for j in range(i + 1, members)
+                 if rewards[i] == rewards[j]]
+        check("two members scored the same, so a zero-variance subset exists", bool(equal))
+        if equal:
+            i, j = equal[0]
+            selected = np.zeros(members, dtype=np.uint8)
+            selected[i] = selected[j] = 1
+            degenerate = np.zeros(members, dtype=np.float32)
+            refused = lib.backward_group_advantage(ptr(reward_arr), ptr(selected), members,
+                                                   1e-4, 0, ptr(degenerate),
+                                                   ctypes.byref(mean), ctypes.byref(std)) != 0
+            check("a zero-variance group is refused", refused,
+                  "" if refused else "the degenerate group was admitted")
+            check("a zero-variance group is admitted when the caller says so",
+                  lib.backward_group_advantage(ptr(reward_arr), ptr(selected), members, 1e-4, 1,
+                                               ptr(degenerate), ctypes.byref(mean),
+                                               ctypes.byref(std)) == 0
+                  and float(np.abs(degenerate[i]).max()) == 0.0)
+
+        # The objective over a record the engine produced: SEQUENCE mode over the member
+        # with the largest advantage, at unchanged parameters. The ratio has to be exactly
+        # one from the record's own log-probabilities, and follow the mean log-ratio when
+        # they move - which is also what proves the Python view of the record matches the C
+        # struct's layout (a mismatch would feed the hinge garbage).
+        best = int(np.argmax(advantages))
+        record = records[best]
+        rows = int(record.tokens)
+        old_logp = np.array([record.logprobs[i] for i in range(rows)], dtype=np.float32)
+        new_logp = old_logp.copy()
+        advantage_row = np.full(rows, float(advantages[best]), dtype=np.float32)
+        mask_row = np.array([int(record.mask[i]) for i in range(rows)], dtype=np.uint8)
+        d_logp = np.zeros(rows, dtype=np.float32)
+        ratio_row = np.zeros(rows, dtype=np.float32)
+        objective = ctypes.c_double(0.0)
+        selected_count = ctypes.c_longlong(0)
+        status = lib.backward_clipped_objective(ptr(new_logp), ptr(old_logp), ptr(advantage_row),
+                                               ptr(mask_row), rows, 0.2, 0.2,
+                                               BACKWARD_CLIP_SEQUENCE, ptr(d_logp),
+                                               ptr(ratio_row), ctypes.byref(objective),
+                                               ctypes.byref(selected_count))
+        check("the objective consumes the engine's record", status == 0 and
+              selected_count.value == rows,
+              f"status {status}, {selected_count.value} of {rows} rows selected")
+        check("the sequence ratio at unchanged parameters is exactly 1",
+              float(ratio_row[0]) == 1.0, repr(float(ratio_row[0])))
+        check("a positive advantage pushes the completion's log-probability up",
+              float(d_logp[0]) < 0.0, f"{float(d_logp[0]):.6f}")
+        moved = (old_logp + np.float32(0.25)).astype(np.float32)
+        status = lib.backward_clipped_objective(ptr(moved), ptr(old_logp), ptr(advantage_row),
+                                               ptr(mask_row), rows, 0.2, 0.2,
+                                               BACKWARD_CLIP_SEQUENCE, ptr(d_logp),
+                                               ptr(ratio_row), ctypes.byref(objective),
+                                               ctypes.byref(selected_count))
+        expected = float(np.exp(np.mean(moved.astype(np.float64) -
+                                        old_logp.astype(np.float64))))
+        check("a moved log-probability gives the ratio the records imply",
+              status == 0 and abs(float(ratio_row[0]) - expected) < 1e-6,
+              f"{float(ratio_row[0]):.8f} against {expected:.8f}")
+        print(f"  ratio {float(ratio_row[0]):.6f} for +0.25 nats/row (advantage "
+              f"{float(advantages[best]):+.3f})")
+
+        # One group, one version: the engine can generate a record under a *newer* version,
+        # and the group refuses it. This is the plan's "all G completions for one prompt
+        # under one version and one sampling configuration" as a refusal rather than a note.
+        assert lib.train_loop_leave(loop) == 0, lib.train_loop_last_error().decode()
+        one_step(lib, engine, store, TOKENS, MASK, HYPER, 1, 64)
+        # The training step left the sequence at its last position, and a rollout refuses to
+        # start on a half-consumed one rather than clobbering it.
+        lib.engine_reset(engine)
+        assert lib.train_loop_enter(loop, TRAIN_PHASE_ROLLOUT, ctypes.byref(version)) == 0, \
+            lib.train_loop_last_error().decode()
+        status, fresh, error = sample(lib, engine, prompt, 4, eos, 100)
+        check("a completion under the new version is generated", status == 0, error)
+        check("the new completion carries the new version", fresh.version == version.value,
+              f"record {fresh.version}, loop {version.value}")
+        refused = lib.train_loop_record(loop, ctypes.byref(group), ctypes.byref(fresh)) != 0
+        check("the group refuses a completion from another version", refused,
+              "" if refused else "a record from version {} joined a version {} group".format(
+                  fresh.version, group.version))
+        check("the refused record did not enter the group", group.count == members,
+              f"{group.count} records")
+
+        # The offload declaration is what makes "retain or explicitly offload" a number at
+        # the boundary: a rollout starts at nothing, the caller records what it shed, and
+        # leaving clears it.
+        check("a fresh rollout holds nothing declared",
+              lib.train_loop_optimizer_offloads(loop) == 0)
+        declared = lib.train_loop_declare_optimizer_offload(loop, 1 << 30) == 0
+        check("the caller's offload declaration is recorded",
+              declared and lib.train_loop_optimizer_offloads(loop) == (1 << 30),
+              "" if declared else lib.train_loop_last_error().decode())
+        assert lib.train_loop_leave(loop) == 0
+        check("the phase boundary clears the offload count",
+              lib.train_loop_optimizer_offloads(loop) == 0)
+    finally:
+        lib.train_loop_destroy(loop)
+        lib.engine_destroy(engine)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", required=True)
@@ -572,6 +759,7 @@ def main():
     print("5. the rollout")
     if hasattr(lib, "engine_rollout_sample"):
         rollout_section(lib, args.model_dir, desc)
+        group_section(lib, args.model_dir, desc)
     else:
         print("  (the library has no rollout entry point; skipped)")
 

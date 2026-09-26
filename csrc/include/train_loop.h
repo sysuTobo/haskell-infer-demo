@@ -104,13 +104,26 @@ void train_loop_destroy(TrainLoop *loop);
 
 /* Enter a phase: a rollout borrows the store's current version (so an update is refused
  * until it leaves), and either phase starts with a clean sequence. Returning to the same
- * phase without leaving is a refusal. */
+ * phase without leaving is a refusal. A phase also starts having declared no optimizer
+ * bytes offloaded. */
 TrainStatus train_loop_enter(TrainLoop *loop, TrainPhase phase, long long *out_version);
 TrainStatus train_loop_leave(TrainLoop *loop);
 
 TrainPhase train_loop_phase(const TrainLoop *loop);
 int train_loop_sequence_resets(const TrainLoop *loop);   /* at each phase boundary */
-long long train_loop_optimizer_offloads(const TrainLoop *loop); /* bytes offloaded, or kept */
+
+/* The optimizer state a phase holds, as the plan's "retain optimizer state or explicitly
+ * offload it according to the budget" wants it to be: a number, not an intention.
+ *
+ * The budget already says what a phase *may* hold (`optimizer_bytes` is nonzero for SFT
+ * and 0 for a rollout, whose step reads none of it), but the loop cannot move anything
+ * itself -- the master and moment buffers belong to the engine's store -- so this is a
+ * *declaration*: a caller that has actually shed N bytes records them here, and a phase
+ * that declared nothing reports 0. A negative count or a declaration outside a phase is
+ * refused, and leaving the phase clears the count, so "how much did this rollout shed"
+ * is answerable at the boundary rather than inferred from a budget. */
+TrainStatus train_loop_declare_optimizer_offload(TrainLoop *loop, long long bytes);
+long long train_loop_optimizer_offloads(const TrainLoop *loop); /* declared, 0 when nothing */
 
 /* The version this loop is running under, or -1 when no phase is open. */
 long long train_loop_version(const TrainLoop *loop);

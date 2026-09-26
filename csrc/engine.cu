@@ -2032,9 +2032,27 @@ int engine_train_write_master(EngineHandle *eng, int logical, const float *host_
         return ENGINE_ERR_WEIGHTS;
     }
     const long long elements = train_store_elements(eng->train_store, logical);
-    check_cuda(cudaSetDevice(train_param_device(eng, logical)), "Select training device");
-    check_cuda(cudaMemcpy(master, host_values, (size_t)elements * sizeof(float),
-                          cudaMemcpyHostToDevice), "Upload master weight");
+    /* The upload runs on the engine's own stream and is synchronised before returning.
+     * A blocking cudaMemcpy from pageable host memory only guarantees the bytes reached
+     * the driver's staging buffer, not the destination; the final DMA is ordered in the
+     * calling thread's stream, and every kernel that reads the master runs on a context
+     * stream instead. The publication could therefore cast a half-written master - the
+     * perturbation was occasionally published as garbage while a no-op write, whose
+     * master already equalled the loaded weight, hid it. `engine_train_import_state`
+     * already used this stream-ordered form; this writer is the one that did not. */
+    const int device = train_param_device(eng, logical);
+    int ci = 0;
+    for (int i = 0; i < eng->num_devices; ++i) {
+        if (eng->ctx[i].device_id == device) {
+            ci = i;
+            break;
+        }
+    }
+    check_cuda(cudaSetDevice(device), "Select training device");
+    check_cuda(cudaMemcpyAsync(master, host_values, (size_t)elements * sizeof(float),
+                               cudaMemcpyHostToDevice, eng->ctx[ci].stream),
+               "Upload master weight");
+    check_cuda(cudaStreamSynchronize(eng->ctx[ci].stream), "Finish master upload");
     return ENGINE_OK;
 }
 

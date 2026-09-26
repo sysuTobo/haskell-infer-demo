@@ -107,6 +107,36 @@ greedy-token agreement — never a relaxation of the top-1 check.
 
 ## Recently completed
 
+**The flaky tied publication was a real ordering bug, not a tolerance** (found and fixed
+2026-09-26, while checking the Q1/Q2 increment). Stage 3's `test_train_forward` had been
+failing roughly half of its runs at the post-update comparison, and it was recorded as "the
+engine's training forward is not bitwise reproducible". That was wrong in an important way,
+and the fix is one call.
+
+- **The evidence.** Repeated runs were fingerprinted: the torch reference and the host inputs
+  were bitwise identical across processes while the engine's post-update logits took several
+  different values (`5ba7e0bb...`, `3701bbaa...`, ... against the correct `ce660ab5...` as an
+  independently computed `bf16(edited)` hash). Two forwards with the same weights agreed
+  bitwise *within* a process, so the forward was not the variable. `engine_train_export_state`
+  showed the master already equal to the perturbation, and a dump at the end of
+  `engine_train_publish` showed the BF16 readers holding the right bytes - yet a dump inside
+  the cast loop, immediately after the copy, caught one reader holding **neither** the old nor
+  the new weight. An identical re-publish always landed correct.
+- **The cause.** `engine_train_write_master` used a blocking `cudaMemcpy` from a pageable host
+  array. That call only guarantees the bytes reached the driver's staging buffer; the final DMA
+  is ordered in the *calling thread's* stream, while every kernel that reads the master runs on
+  a context stream. The publication could therefore cast a half-written master. A no-op write
+  hid it completely, because its master already equalled the loaded weight, so even a partial
+  read produced the right bytes - which is why only the perturbed path flaked.
+  `engine_train_import_state` had always used the stream-ordered form (`cudaMemcpyAsync` on the
+  engine's stream plus `cudaStreamSynchronize`); this writer was the one that did not.
+- **The fix** makes the upload run on the master's own context stream and synchronize it. Eight
+  consecutive runs now produce one value (`5ba7e0bb...`, rms 0.00399, top-1 12/12) where before
+  there were five outcomes and about half failed. No tolerance was touched: the gate had been
+  working, and the bug was what it was catching. The same class of mistake is invisible in the
+  successful path, so it is worth stating plainly - **a blocking H2D copy does not order the
+  destination DMA against kernels on another stream**.
+
 **F0: the costed baseline for the inference-optimization track** (plan F0, verified
 2026-09-26).
 The plan's fusion milestones all start by asking where the time goes, so F0 delivers the
@@ -142,6 +172,26 @@ instrument and the numbers rather than a guess:
   one, so the pool is now created per device - and an earlier zero-initialised slot map made
   a NULL handle look valid on device 0, which poisoned the stream and aborted the 2-device
   forward at the third scope.
+
+**Q1+Q2: the F1-compatible pair artifact** (plan Q2's "concatenate packed rows and scale rows
+consistently", verified 2026-09-26).
+
+- The Q2 routing names the F1 layout, and F1's `forward_mlp` takes **one** `[2I, H]` weight with
+  the row-interleaved `[T, 2I]` activation, so the converter now emits a **pair artifact** per
+  dense layer with both members quantized: `mlpGateUp_layer{L}.packed` is the gate's packed rows
+  followed by the up's, and `.scales` is the same row order - the engine reads one operand and
+  does not need to know the pair's internal split.
+- The manifest gains a `pairs` section (`name`, `layer`, `members`, `rule`, `logical_shape`, the
+  artifact hashes and the group), and `--verify` requires the pair to equal its members' bytes in
+  order with `logical_shape == [sum(rows), k]`. The gate re-derives that from the **entries
+  located by role**, not from the pair's own member list, so a pair consistent with itself but
+  not with the quantized members fails.
+- On the synthetic checkpoint this is 2 pairs (`[512, 128]`, 32768 packed bytes and 512 scales
+  each); the verification prints "2 F1 pair(s) match their members' rows", and the three negative
+  cases (corrupted payload, foreign group width, missing artifact) still fail as required.
+- **not done**: the engine-side manifest reader that loads these artifacts, the smoke dispatch
+  that selects the INT4 GEMV for the decode (M=1) path, and the model-quality gates (logits RMS,
+  top-1 agreement, held-out NLL against the BF16 baseline).
 
 **Q2: the weight-only INT4 GEMM, verified numerically and measured (plan Q2, first half,
 2026-09-26).**
@@ -903,22 +953,19 @@ CPU case pinning the behaviour.
   `Double` lists per selected token. The plan's memory note says not to retain a
   vocabulary-sized buffer per generated token *merely to record the logprobs*, which this
   does not do, but it does allocate them transiently and the cost is not measured.
-- **The trainer forward is not bitwise reproducible on the Qwen3-Next synth fixture.**
-  `test_train_forward`'s tied-update comparison against its torch reference is a *draw*:
-  measured on 2026-09-26, the reference is bitwise stable across runs
-  (`|logits|_1 = 3748.8913574219` every time) while the engine's own forward varies
-  (`|logits|_1` = 3703.94, 3707.13, 3721.08, 3729.44, 3738.60, 3747.87, 3747.87 — sometimes
-  repeating, sometimes not, which is the signature of a race), so the comparison's rms
-  ranges **0.00399 to 0.05386** against a tolerance of **0.05** and the test fails roughly a
-  quarter of the time. Attribution came from printing both sides' L1 sums, not from
-  guessing: the reference never moves, so this is an engine property and not a cuBLAS
-  algorithm choice in the reference. The top-1 count is 12/12 in every draw, so the
-  fixture's *decisions* are stable while its magnitudes are not. The likely home is the MoE
-  path this fixture carries (the plan keeps MoE outside the first trainer allowlist, and the
-  Stage-5 dense fixture's forward *is* bitwise reproducible), but that is a hypothesis until
-  a kernel is named. The gate was **not** loosened and the tolerance was **not** retuned: the
-  honest reading is that the rms band is currently a flaky check sitting inside a real
-  engine nondeterminism, and the nondeterminism is the thing to fix.
+- **The trainer forward's flakiness was found and fixed (2026-09-26).** It was recorded here as
+  "the engine's training forward is not bitwise reproducible on the Qwen3-Next synth fixture",
+  with the measured draw (rms 0.00399 to 0.05386 against a 0.05 tolerance, failing about a
+  quarter of runs), the observation that the reference never moved, and the guess that the MoE
+  path was the home. The guess was wrong: the forward *is* reproducible (two forwards with the
+  same weights agree bitwise), and the variable was the **published weight**, because
+  `engine_train_write_master`'s blocking `cudaMemcpy` from pageable memory does not order the
+  destination DMA against kernels launched on the engine's context streams - so the publication
+  could cast a half-written master. A no-op write hid it (its master already equalled the loaded
+  weight), which is why only the perturbed comparison drew. Fixed by making the upload run on
+  the master's context stream and synchronizing it, the form `engine_train_import_state` already
+  used; eight consecutive runs now give one value. The tolerance was never retuned, and the
+  bullet's own conclusion - "the nondeterminism is the thing to fix" - was the right one.
 - **The SFT step's layer wiring covers the attention and dense-MLP path.** The GDN
   mixer's backward (prepare, conv and core - Stage 4's kernels) is not yet chained into
   the walk, and MoE and MLA remain outside the first trainer allowlist as Stage 1 says, so

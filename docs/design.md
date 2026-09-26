@@ -618,6 +618,16 @@ walks every alias: writing one and not the other would leave the model with two
 versions of one weight, which is exactly the failure the tie is supposed to make
 impossible.
 
+The writer's own ordering is part of that contract. A master upload runs on the
+engine's context stream and is synchronized there before the publication casts it,
+because a blocking `cudaMemcpy` from pageable host memory only promises the bytes
+reached the driver's staging buffer - the destination DMA is ordered in the calling
+thread's stream, not in the stream the readers run on. Getting this wrong is invisible
+whenever the master already equals the loaded weight (a no-op write reads correctly even
+from a half-written buffer) and appears only once a real perturbation is published, which
+is how it survived: the tie check failed about half the time, and the failure was first
+misread as an irreproducible forward.
+
 The same section's retention rules are the other half. A training step keeps the
 mixer, ffn and residual activations of every layer (the residual stream is updated in
 place, so "read it later" is not an option) and the GDN chunk-boundary states under a
@@ -885,6 +895,13 @@ weight-bandwidth-bound, so the format comes before more fusion.
 - **the manifest records the precision map, not just the quantized entries**: one cell for
   every `(role, layer)` of the descriptor, marking int4 or bf16, so a loader cannot silently
   miss a role or invent one.
+- **the F1 layout is emitted, not derived by the reader.** The plan requires the converter to
+  "concatenate packed rows and scale rows consistently and preserve its activation layout" when
+  F1 is active, so it writes a **pair artifact** per dense layer whose packed rows are the gate's
+  followed by the up's (`[2I, H]`, exactly F1's merged operand) with the scales in the same row
+  order, and records the pair in the manifest's `pairs` section. The verification requires the
+  pair to equal its members' bytes in order and the gate re-derives that from the entries
+  **located by role**, so a pair consistent with itself but not with the quantized members fails.
 
 - **the first kernel is verified, and measured before it is trusted.**
   `csrc/kernels/gemm_quant.cu` is the weight-only INT4 GEMM (`C = A*B^T`, BF16 activation,

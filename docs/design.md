@@ -902,6 +902,19 @@ weight-bandwidth-bound, so the format comes before more fusion.
   order, and records the pair in the manifest's `pairs` section. The verification requires the
   pair to equal its members' bytes in order and the gate re-derives that from the entries
   **located by role**, so a pair consistent with itself but not with the quantized members fails.
+- **the sidecar has a reader that is a validator.** `csrc/quant_manifest.c` parses
+  `weights.manifest.json` and refuses what it can re-derive differently: a version it does not
+  speak, a format block that is not the frozen format, an entry whose recorded byte and scale
+  counts disagree with its shape, a pair whose rows are not its members', a precision map that
+  does not describe the same cells as the entries, a malformed digest, a duplicate key or a
+  truncated document. Two boundaries make it a validator rather than a decoder: an entry's shape
+  goes through `linear_layout_init`, the function the quantizer and the kernel gate also use, so
+  "K is not a whole number of groups" is the *format's* error and cannot be described two ways;
+  and `quant_artifact_read` binds the payload to the manifest by size, dtype and SHA-256 rather
+  than trusting the manifest's claim about its own artifacts. The CPU gate
+  (`ctest test_quant_manifest`) mutates a hand-written fixture into seventeen refusals, checking
+  that each mutation actually applied, and `test_quantization_converter` runs the reader over the
+  sidecar the converter just wrote so the schema, its writer and its reader cannot drift.
 
 - **the first kernel is verified, and measured before it is trusted.**
   `csrc/kernels/gemm_quant.cu` is the weight-only INT4 GEMM (`C = A*B^T`, BF16 activation,

@@ -164,6 +164,20 @@ add_test(NAME test_quantization_format_python COMMAND ${Python3_EXECUTABLE}
          "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_quantization_format.py"
          --emitter $<TARGET_FILE:test_quantization_format>)
 
+# CPU-only: the reader and validator for the Q1 sidecar (plan Q2's "a loader can validate the
+# artifact before a GPU sees it"). A reader is only a validator if it can refuse, so the gate
+# mutates a hand-written fixture into seventeen refusals - a version it does not speak, a format
+# block that is not the frozen one, a group axis that is not K, a K that is not a whole number of
+# groups, extents that disagree with the shape or with a pair's members, a malformed digest, a
+# duplicate key, a truncated document and a precision map that does not match the entries - and
+# each mutant is checked to have actually applied. `--manifest/--root` let it read a real sidecar,
+# which is how the converter's gate below ties the schema to its only writer.
+add_executable(test_quant_manifest ../tests/quant_manifest_test.c quant_manifest.c
+    linear_weight.cpp sha256.c)
+target_include_directories(test_quant_manifest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(test_quant_manifest PRIVATE m)
+add_test(NAME test_quant_manifest COMMAND test_quant_manifest)
+
 # CPU-only: the Stage-6 numerical-alignment decision. The verdicts are derived from the
 # Stage-1 inventory (so the two cannot drift), an exception must carry a finite measured
 # bound, an unverified region must name the work that would remove it, and a policy
@@ -301,9 +315,13 @@ if(BUILD_TESTS)
     # Q1's gate (plan Q1): the converter writes a verifiable weights.manifest.json over the
     # synthetic dense checkpoint without touching it, and the conversion's own verification
     # rejects a corrupted payload, a manifest claiming a foreign format and a missing artifact.
+    # The sidecar is then handed to the C reader (`--reader`), so a manifest the converter writes
+    # has to be one the engine's reader accepts - and that reader re-verifies an artifact's digest
+    # from the bytes on disk.
     add_test(NAME test_quantization_converter COMMAND ${Python3_EXECUTABLE}
              "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_quantization_converter.py"
              --reference $<TARGET_FILE:test_quantization_format>
+             --reader $<TARGET_FILE:test_quant_manifest>
              --model-dir "${ENGINE_SFT_MODEL_DIR}"
              --desc "${CMAKE_CURRENT_SOURCE_DIR}/../descriptors/qwen3-dense-synth.json")
 

@@ -40,6 +40,9 @@ def main():
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--desc", required=True)
     parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--reader", default=None,
+                        help="the C sidecar reader (test_quant_manifest); when given, the "
+                             "sidecar the converter just wrote must be one it accepts")
     args = parser.parse_args()
 
     if not os.path.isdir(args.model_dir):
@@ -135,6 +138,24 @@ def main():
         failures += 1
     else:
         print(verification.stdout.strip())
+
+    # The C reader the engine will load with, over the same sidecar and while the artifacts are
+    # still intact. This is what ties the schema to its only writer: a manifest the converter
+    # writes has to be one the reader accepts, and the reader re-verifies an artifact's digest
+    # from the bytes on disk rather than from the manifest's own claim.
+    if args.reader is not None:
+        if not os.path.exists(args.reader):
+            print(f"test_quantization_converter: FAIL: no reader at {args.reader}")
+            failures += 1
+        else:
+            reading = run([args.reader, "--manifest", manifest_path, "--root", out_dir])
+            if not check(reading.returncode == 0,
+                         f"the C reader refused the converter's sidecar: "
+                         f"{reading.stdout}{reading.stderr}"):
+                failures += 1
+            else:
+                for line in reading.stdout.strip().splitlines():
+                    print(f"  {line}")
 
     # A validator that cannot fail is not a gate: corrupt the payload and require a refusal.
     first = manifest["entries"][0]

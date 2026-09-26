@@ -1739,8 +1739,9 @@ means the warp-per-row GEMV for M = 1 plus the F1-compatible packed-row layout, 
 batched path left in the tree, verified, and recorded as inadmissible at these shapes rather
 than routed.
 
-**Q0 and Q1 status.** — the format, its reference, the converter and
-the sidecar; not yet a kernel consuming any of it.** `scripts/quantize_weights.py` converts a
+**Q0 and Q1 status.** — the format, its reference, the converter, the sidecar and its reader;
+the Q2 kernel consumes the format, and the engine does not yet consume the sidecar.**
+`scripts/quantize_weights.py` converts a
 checkpoint's admitted roles (the dense FFN gate/up/down, per Q's initial scope) into a
 separate output directory without touching the BF16 checkpoint, and writes a versioned
 `weights.manifest.json` carrying exactly the fields Q1 lists: the source directory with a
@@ -1771,8 +1772,28 @@ its members' bytes in order and its `logical_shape` to be `[sum(rows), k]`; the 
 that from the **entries located by role**, not from the pair's own member list, so a pair that
 agreed with itself but not with the quantized members would fail. On the synthetic checkpoint
 this is 2 pairs (`[512, 128]`, 32768 packed bytes and 512 scales each) and the verification
-reports "2 F1 pair(s) match their members' rows". The engine-side reader that consumes these is
-the next piece, not this one.
+reports "2 F1 pair(s) match their members' rows". The engine-side reader that consumes these now
+exists as the sidecar validator above (`csrc/quant_manifest.c`, gated by `test_quant_manifest`
+and driven over the converter's own output by `test_quantization_converter`); what it does not yet
+do is load them onto a device or route the decode path to the INT4 GEMV.
+
+**The sidecar has a reader, and the reader is a validator.** `csrc/quant_manifest.c` parses
+`weights.manifest.json` and refuses what it cannot re-derive: a version it does not speak, a
+format block that is not the frozen format (group 128, q ∈ [-7, 7], zero-point 0, `-8` reserved,
+`u8`/`bf16`), a group axis that is not K, an entry whose extents disagree with its shape, a pair
+whose rows are not its members', a precision map that does not describe the same cells as the
+entries, a malformed digest, a duplicate key, a truncated document. **The format's refusals are not
+re-implemented** - an entry's shape goes through `linear_layout_init`, the same function the
+quantizer and the Q2 kernel gate use, so a K that is not a whole number of groups is the format's
+error rather than this reader's opinion. `quant_artifact_read` ties the bytes to the digest the
+manifest recorded (byte count, dtype and SHA-256) rather than trusting the manifest's claim about
+its own artifacts. `ctest test_quant_manifest` is the CPU gate: a hand-written fixture, seventeen
+refusals produced by textual surgery on it - each mutant checked to have actually applied, so a
+renamed fixture cannot turn the set into silent passes - and a temp-file artifact that is read,
+then refused for a flipped byte, a wrong size, a wrong dtype and a missing file.
+`test_quantization_converter` now runs this binary over the sidecar the converter just wrote, so
+the schema, its only writer and its reader are tied to each other: that run parses 6 entries and 2
+pairs from the synthetic checkpoint and re-verifies a 16384-byte artifact from disk.
 
 One trap this stage walked into and then closed: **both this gate and Stage 5's `test_sft`
 skip themselves when the node-local synthetic checkpoint is absent, and a skip reports as
@@ -1814,12 +1835,15 @@ below) and `ctest test_quantization_format_python`.
   On that fixture it reports block max_abs error 0.0186 and rms 0.0109 against values of
   magnitude ~0.25.
 
-Not done, and the gate that must run first: the plan's Q0 says the wire format is frozen
-"subject to a sm_86 kernel feasibility check", and that check has **not** been run, so the
-format is implemented and gated but not yet exercised by a kernel. Q1 (the converter, the
-manifest and ownership) and Q2 (real weight-only execution and the model-quality gates) are
-untouched: there is no `scripts/quantize_weights.py`, no `weights.manifest.json` reader and no
-quantized GEMM.
+The status of what this section opened has moved on, and the Q2 section below is the record: Q1's
+converter and sidecar exist, the sidecar now has a reader (`csrc/quant_manifest.c`) that validates
+it before a GPU sees it, and Q2's kernel is implemented and measured. The plan's "subject to a
+sm_86 kernel feasibility check" resolved into a *measurement* rather than a check - the
+warp-per-row GEMV is 2.25x faster than BF16 at M = 1 on sm_86 while the batched path is 8-30x
+slower, which is why "weight-only INT4 with BF16 activations" turns out to be a decode-time
+specialization. Still not done: the device-side load of the artifacts into the engine, the routing
+of the decode path to that GEMV, and the model-quality gates (logits RMS, top-1 agreement,
+held-out NLL) that compare a quantized model against the BF16 baseline.
 
 
 

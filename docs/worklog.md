@@ -34,7 +34,7 @@ and hardware" are the exceptions, and they say so.
 | Gate | Result |
 |---|---|
 | `cargo test --locked --offline` | 11/11 |
-| `ctest --test-dir csrc/build-libs` | 28/28 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_backward`, `test_train_loop`, `test_alignment`, `test_gspo`, `test_rollout_queue`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_backward_kernels`, `test_sft`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops` (on a **shared** GPU `test_engine_resources` reads the device's free memory before and after four failing `engine_create` rounds, so it needs a quiescent device: 2026-09-26 a co-tenant holding 28 GB on device 0 moved the reading by 736 MiB and failed a 16 MiB slack, the same test passed on the idle device 1, and the suite's second run of the day — with the device free — was 25/25) |
+| `ctest --test-dir csrc/build-libs` | 33/33 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_backward`, `test_train_loop`, `test_alignment`, `test_gspo`, `test_rollout_queue`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_backward_kernels`, `test_sft`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops`, `test_quantization_format`, `test_quantization_format_python`, `test_quant_manifest`, `test_quantization_converter`, `test_quantization_kernel` (on a **shared** GPU `test_engine_resources` reads the device's free memory before and after four failing `engine_create` rounds, so it needs a quiescent device: 2026-09-26 a co-tenant holding 28 GB on device 0 moved the reading by 736 MiB and failed a 16 MiB slack, the same test passed on the idle device 1, and the suite's second run of the day — with the device free — was 25/25) |
 | `ctest test_backward` (CPU, Stage 4) | the Stage-4 region table against the Stage-1 inventory in both directions; masked CE, reverse KL, the token/sequence clipped objective and the group advantage reduction against an independent FP64 implementation with its gradient checked by central difference; AdamW against FP64 in PyTorch's own order (including the bias-correction/eps ordering) plus the BF16 publication; the checkpoint round-trip with every failure mode refused; a deterministic fixture overfitting 32/32 through this stage's own loss and optimizer, and a 12+8 resumed run landing bitwise on the uninterrupted 20-step parameters, moments and cursor |
 | `ctest test_backward_kernels` (Stage 4, 2× A40) | every backward against a double-precision definition or a central difference of one: elementwise gates, residual branches, plain/Gemma RMSNorm, the GDN L2 norm, the gated norm, embedding (repeated ids summed), RoPE (the transposed rotation inverting the forward's), the Q/gate re-interleave, GEMM dX/dW, masked CE, AdamW, conv1d (d_x, d_weight, d_bias, d_state_in), GDN prepare (d_conv_out, d_a, d_b, d_A_log, d_dt_bias) — all 1e-8…1e-6 except the finite-difference rows at 1e-7…1e-3; attention forward+LSE vs the definition (2.1e-3 BF16 out, 1.5e-3 LSE) and its backward vs the FD of the definition (dQ 2.5e-4, dK 2.8e-4, dV 1.0e-3), with an analytic double reading of the device LSE reproducing the FD, so the base-2 convention is pinned; the GDN core backward with a nonzero initial state and a nonzero final-state gradient, one chunk and three chunks both matching the same reference (≤1.0e-7), d_state_start included; dQ and the whole GDN core backward bitwise reproducible, dK/dV reported (atomics) |
 | `ctest test_sft` (Stage 5, A40/L20) | SFT on the tiny dense checkpoint (0.72M params, tied embeddings, prompt-masked target) against a `transformers` training run: the first step's loss matches to 6.3e-05 relative; the tied parameter's gradient (after one large-lr AdamW step, where the move's sign *is* the gradient's) has cosine **0.9990** over all 131072 elements; the engine overfits 7.0322 → 0.6084 and the reference 7.0318 → 0.5652; the forward is bitwise reproducible run to run; the training state (FP32 masters and both optimizer moments) round-trips through export/import bitwise; and a pipeline/TP placement, an optimizer step during a live step and a NaN logit are each refused. The rollout section drives `engine_rollout_sample`: the record's fields, the seed reproducing a completion bitwise and a shorter rollout being its prefix, EOS vs the length limit, **20000 draws** whose mean `-log p` is 6.90837 ± 0.00162 against the distribution's entropy of 6.90495 (+2.11 sigma) with all 415 counted bins inside 4.5 sigma (worst 2.94), the record's version being the one the engine *read* (a +1 stamp refused) and an optimizer step refused while the borrow is live, and — for the same completion — the trainer's FP32 denominator differing from the sampler's FP64 one by 4.768e-07 (ratio 0.99999976), with the recorded denominator bitwise unchanged after a publish. Its **group** section generates four completions of one prompt (seeds as part of the fixture), gives each a reward from a deterministic check on the completion, records them into one `TrainGroup` whose version is pinned (a fifth completion generated *after* a publication is refused), reads the rewards back, reduces the advantages (+1.000/−1.000/+1.000/−1.000 at mean 0.5 and population std 0.5), refuses a zero-variance subset unless the caller waives it, runs the **sequence-level objective over the engine's own record** (ratio exactly 1 at unchanged parameters, the gradient's sign following the advantage, +0.25 nat/row giving 1.284025 against the records' 1.284025), and checks the offload declaration round-trips and is cleared at the boundary |
@@ -106,6 +106,37 @@ greedy-token agreement — never a relaxation of the top-1 check.
   (`cuobjdump`) only — there is no H200 here.
 
 ## Recently completed
+
+**The `weights.manifest.json` reader, as a validator** (plan Q1's sidecar, consumed by Q2;
+verified 2026-09-26).
+
+- `csrc/include/quant_manifest.h` + `csrc/quant_manifest.c`: a CUDA-free parser for the sidecar
+  the converter writes. It is a *validator*, not a decoder: `quant_manifest_parse` refuses a
+  version it does not speak, a format block that is not the frozen format (group 128, q ∈ [-7, 7],
+  zero-point 0, `-8` reserved, `u8`/`bf16`), a group axis that is not K, an entry whose recorded
+  packed bytes / scale count disagree with its shape, a pair whose rows are not its members', a
+  precision map that does not describe the same cells as the entries, a malformed digest, a
+  duplicate key and a truncated document.
+- **The format's refusals are not re-implemented.** An entry's shape goes through
+  `linear_layout_init` - the same function the quantizer and the Q2 kernel gate use - so "K is not
+  a whole number of groups" is the format's error rather than the reader's opinion, and a foreign
+  group cannot be described two ways.
+- `quant_artifact_read` ties the bytes to the digest the manifest recorded: it requires the file's
+  size, the recorded dtype and the recorded SHA-256, so the payload the manifest talks about is the
+  payload on disk. It returns a fresh buffer rather than a view, because the caller owns it.
+- `ctest test_quant_manifest` (CPU, and locally buildable with gcc/g++) holds a hand-written
+  fixture and **seventeen refusals** produced by textual surgery on it - each mutant checked to have
+  actually applied, so a renamed fixture cannot turn the set into silent passes - plus a temp-file
+  artifact that is read and then refused for a flipped byte, a wrong size, a wrong dtype and a
+  missing file.
+- `test_quantization_converter` now runs the binary over the sidecar it just wrote
+  (`--reader $<TARGET_FILE:test_quant_manifest>`), which ties the schema to its only writer and its
+  reader: that run parses 6 entries and 2 pairs from the synthetic checkpoint and re-verifies a
+  16384-byte artifact against its digest. The suite is 33 tests, all passing.
+- **not done**: the engine does not load these artifacts yet. Loading them into owned device
+  buffers and routing the decode (M = 1) path to the INT4 GEMV is the next piece, after which the
+  model-quality gates (logits RMS, top-1 agreement, held-out NLL against the BF16 baseline) have
+  something to measure.
 
 **The flaky tied publication was a real ordering bug, not a tolerance** (found and fixed
 2026-09-26, while checking the Q1/Q2 increment). Stage 3's `test_train_forward` had been
@@ -927,16 +958,22 @@ CPU case pinning the behaviour.
   and both gates then run. A stronger fix would store the fixture on the PVC next to the other
   models, or make a skip a distinct CTest status (`set_tests_properties(... SKIP_RETURN_CODE)`)
   so the count cannot hide it.
-- **The quantized GEMM's batched path is not admissible yet, and nothing is routed.** The
+- **The quantized GEMM's batched path is not admissible, and nothing is routed.** The
   warp-per-row GEMV is verified *and* measured 2.25x faster than BF16 at M = 1 (52.1 vs
-  117.2 us), so the decode case is ready for routing; the batched path (M = 64) is 44x slower
-  than BF16 and needs a shared-memory-tiled GEMM. Until that exists, `gemm_int4_bf16` is not
-  used by the model, so the dense FFN still runs cuBLAS BF16.
-- **Quantization stops at the format.** Q0's INT4 layout and its reference are implemented,
-  gated and re-derived by a second implementation, but nothing consumes them yet: there is no
-  converter (`scripts/quantize_weights.py`), no `weights.manifest.json` reader, no quantized
-  GEMM to admit against the reference, and the plan's sm_86 kernel feasibility check - which
-  Q0 says the wire format waits on - has not been run.
+  117.2 us), so the decode case is ready for routing; the batched path was built as a
+  shared-memory-tiled GEMM and is verified correct, but measured 8-30x *slower* than BF16
+  (M=2 924 us, M=128 3316 us against BF16's flat ~115 us) because at these shapes BF16 is
+  weight-bandwidth-bound while a SIMT int4 kernel is instruction-bound on the nibble unpack.
+  Reaching that regime needs the int tensor cores, i.e. int8 activations, which the plan scopes
+  out. Until the decode path is routed, `gemm_int4_bf16` is not used by the model, so the dense
+  FFN still runs cuBLAS BF16.
+- **Quantization stops short of the engine.** Q0's format and reference, Q1's converter and
+  sidecar and its reader (`csrc/quant_manifest.c`), and Q2's kernels are implemented, gated and
+  measured; what remains is the piece between them: loading the artifacts into owned device
+  buffers, routing the decode (M = 1) path to the warp-per-row GEMV, and the model-quality gates
+  (logits RMS, top-1 agreement, held-out NLL against the BF16 baseline) that only make sense once
+  something is routed. The plan's sm_86 kernel feasibility question was answered by measurement
+  rather than by a check - see the Q2 rows below.
 - **F0's memory-traffic and host-synchronization columns are not measured.** The plan's F0
   asks for four quantities per region; this repository now measures two of them (CUDA time
   and launch count). Per-region **memory traffic** and **host-synchronization counts** need a

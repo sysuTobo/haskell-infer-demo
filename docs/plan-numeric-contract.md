@@ -261,10 +261,14 @@ not exported at all (a `__global__` local to `layers.cu`), so no region harness
 could have reached it — it is now `kernel_silu_inplace` alongside the other region
 entry points. The other two are kinds of coverage claim the registry should not
 have made — eight cells in total: `train_forward` in six rows, `recompute` in one,
-and `backward` in `gemm_bf16`, all for a traversal that does not exist. That column is hashed into
+and `backward` in `gemm_bf16`, none of which any region could be exercised for. That column is hashed into
 `numerical_policy_id`, so it must not advertise coverage a region cannot be
 exercised for; those claims are removed, and `test_region_inventory` now refuses a
-manifest row that names a traversal case.
+manifest row that names a traversal case. The traversal itself has since been built —
+Stages 3–5 deliver the teacher-forced forward, the step, the backward, the losses and the
+synchronous rollout — so `train_forward` is reachable in principle now, and what is
+missing is the region-level train-vs-inference fixtures a cell would have to stand on.
+That is an open item the gap list records; the cell stays out until a fixture can back it.
 
 Inventory the initial **dense/dense-hybrid** path, not a supposed thirteen-region
 vocabulary covering the whole framework:

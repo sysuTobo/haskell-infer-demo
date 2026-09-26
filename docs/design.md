@@ -566,11 +566,17 @@ that by requiring bitwise equality of output *and* persistent state, and
 A number is carried only by a measured `exception`; an `unverified` pair reports
 what the fixture measured and claims nothing. And the trainer traversal
 (`train_forward`, `eval_no_autograd`, `recompute`, `backward`) is registered as
-*unavailable* from every region, because an inventory that lists a case with no API
-would claim a trainer that does not exist. Stage 4 does not change that rule: the
-backward now exists, but it is a traversal rather than a forward case, so its coverage
-is a registry of its own (Stage 4's table, checked against this inventory in both
-directions) instead of an entry in a region's case list. The inventory is deliberately not
+*unavailable* from every region, because these cases are the inference engine's four
+traversals and the trainer's is not one of them: an inventory cell for it would claim
+coverage this registry's harnesses cannot produce. That is now a statement about
+fixtures rather than about the API — Stages 3–5 built the traversal (the teacher-forced
+forward, the SFT step, the backward, the losses and the synchronous rollout), and its
+coverage is registered where its fixtures are instead of in a region's case list
+(Stage 4's region table, walked against this inventory in both directions, and Stage 5's
+step and rollout gates). Registering `train_forward` per region would need fixtures that
+compare the training forward against the inference forward region by region, which do
+not exist yet and which the gap list names rather than this column advertising. The
+inventory is deliberately not
 projected into `numerical_policy_id`: which test claims have been made is not part
 of the numerical identity a capture observed. See
 [plan-numeric-contract.md](plan-numeric-contract.md) Stage 1 and
@@ -638,10 +644,15 @@ than comments.** Four of them, in `csrc/include/backward.h` and `csrc/backward.c
   is not finite-differenced, because that would produce a number for a function with no
   derivative there.
 - *What a backward is allowed to read.* Each region's saved values are a table
-  (`backward_required_values`), and a backward whose step did not retain — or cannot
-  recompute — them is refused by name. Stage 2 is why the distinction is explicit: the
+  (`backward_required_values`), and a caller that runs a region's backward declares its
+  retained set and is refused **by name** (`backward_check_retained`) when a value is
+  neither retained nor recomputable — the CPU gate drives that refusal directly, which is
+  the contract a region harness runs under. Stage 2 is why the distinction is explicit: the
   attention core's natural saving is one base-2 LSE, and the probabilities are a
-  *recomputation* from it rather than a retained `[T,T]` tensor.
+  *recomputation* from it rather than a retained `[T,T]` tensor. The trainer's own step does
+  not consult that table: it keeps Stage 3's retention plan and the SFT gate is what
+  exercises it, so routing the step's plan through the table is an open item (named in the
+  gaps list) rather than a property this bullet should claim.
 - *What the optimizer's order is.* AdamW's bias correction, its decoupled decay and
   the position of `eps` are all part of the step rather than implementation detail,
   because each changes the result by more than the FP32 noise floor near a zero moment.

@@ -361,8 +361,11 @@ claims rather than asserting them:
 - Eight cells of the Stage-0 `cases` column claimed something unreachable and are
   removed: `train_forward` in six rows, `recompute` in one, and `backward` in
   `gemm_bf16`. That column is hashed into `numerical_policy_id`, so advertising a
-  traversal that does not exist is a policy claim, not a note;
-  `test_region_inventory` now fails if any manifest row names a traversal case.
+  case no region could be exercised for is a policy claim, not a note;
+  `test_region_inventory` now fails if any manifest row names a traversal case. (The
+  traversal has since been built — Stages 3–5 — so `train_forward` is reachable in
+  principle; the cell stays out until region-level train-vs-inference fixtures exist, which
+  the gaps list records.)
 - `ctest test_region_inventory` (CPU, no GPU and no weights) checks the two things
   a reader cannot: that the plan's bullet list maps onto the inventory region by
   region and that nothing else is invented, and that the inventory cannot drift
@@ -531,13 +534,23 @@ CPU case pinning the behaviour.
   is not queryable per kernel, so the manifest reports what the build's target
   lists plus the device's compute capability select for it, and the field names say
   `selected`.
+- **The retained-value contract is exercised by the gate, not by the trainer's step.**
+  `backward_required_values` and `backward_check_retained` are the by-name contract a region
+  harness runs under, and `ctest test_backward` drives the refusals directly. The SFT step
+  keeps Stage 3's retention plan instead (`layerN.mixerOut` / `ffnOut` / `residual` plus the
+  GDN chunk states, a different vocabulary from the table's), so nothing refuses a step whose
+  plan went stale — the SFT gate would show it as a wrong loss or gradient rather than as a
+  named refusal. Routing the step's plan through the table (one vocabulary for both, or an
+  explicit mapping) is an open item.
 - **The forward regions are not yet registered under the `train_forward` case.**
-  Stage 3 added `engine_train_forward` (one sequence, all positions, teacher-forced),
-  so that case is now reachable in principle, while the Stage-1 inventory still lists
-  the trainer traversal as unavailable everywhere. Registering the case means fixtures
-  that compare the training forward against the inference forward at region level, and
-  half-doing it would put a coverage claim in the registry that no fixture backs, so it
-  is an open item rather than a partial edit.
+  The traversal now exists in full — Stage 3 added `engine_train_forward`, Stage 4 the
+  backward, the losses and the optimizer, Stage 5 the step and the synchronous rollout — so
+  the case is reachable in principle, while the Stage-1 inventory still lists the trainer
+  traversal as unavailable everywhere. Registering the case means fixtures that compare the
+  training forward against the inference forward at region level, and half-doing it would
+  put a coverage claim in the registry that no fixture backs, so it is an open item rather
+  than a partial edit. The registry's `masked_loss` row is what the trainer's arrival *did*
+  change: it moved out of `not_implemented` into `unverified`.
 - **The training path's gradient pairings are not bitwise, and that is Stage 6's.**
   Stage 4 delivers the backward, the losses and the optimizer, but three pairings stop
   short of bitwise and are recorded rather than glossed: attention's backward

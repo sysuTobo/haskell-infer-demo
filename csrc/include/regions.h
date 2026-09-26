@@ -65,15 +65,19 @@ extern "C" {
  * recurrent_prefill   the same tokens one at a time (recurrent GDN path)
  * tail1               the trailing one-token chunk of a chunked prefill
  * decode              a single-token forward with the cache/state carried
- * train_forward       teacher-forced trainer forward (Stage 3-4; absent)
- * eval_no_autograd    the same forward without saved activations (absent)
- * recompute           activation recomputation for backward (absent)
- * backward            gradient computation (absent)
+ * train_forward       teacher-forced trainer forward (engine reachable; no region
+ *                     registers it)
+ * eval_no_autograd    the same forward without saved activations (no region registers it)
+ * recompute           activation recomputation for backward (no region registers it)
+ * backward            gradient computation (no region registers it)
  *
- * The four absent cases are the trainer traversal the plan's Stages 3-4
- * introduce. Stage 3 gave the engine a single-sequence teacher-forced forward, but
- * not the traversal a trainer needs (a per-step schedule, recomputation, a backward),
- * so registering these as reachable would still claim an API that does not exist. */
+ * The last four are the trainer traversal, and Stages 3-5 built it: the single-sequence
+ * teacher-forced forward, the step's retention schedule, the recomputation the layer walk
+ * does from its three retained boundaries, and the backward. So the API exists; what does
+ * not is a *per-region fixture* that exercises a region under a trainer traversal and
+ * compares it with the inference case, which is what a `cases` cell would have to stand on.
+ * Registering them without that fixture would put a coverage claim in a table whose digest
+ * enters `numerical_policy_id`, so the cells stay out and worklog.md records the gap. */
 #define REGION_CASE_CHUNKED_PREFILL "chunked_prefill"
 #define REGION_CASE_RECURRENT_PREFILL "recurrent_prefill"
 #define REGION_CASE_TAIL1 "tail1"

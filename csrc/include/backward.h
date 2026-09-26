@@ -25,9 +25,12 @@
  *
  *   3. `backward_check_retained` - the values a region's backward consumes. Stage 2
  *      established that the attention core's *natural* saving is a base-2 LSE and
- *      nothing else, and Stage 1 recorded what each region can save. A backward that
- *      arrives without them is refused here instead of reading whatever happened to
- *      be in the buffer.
+ *      nothing else, and Stage 1 recorded what each region can save. A caller that runs
+ *      a region's backward declares its retained set and is refused by name here rather
+ *      than reading whatever happened to be in the buffer. The trainer's step does not
+ *      consult this table - it keeps Stage 3's retention plan and the SFT gate (Stage 5)
+ *      is what exercises that - so routing the step's plan through these names is an open
+ *      item rather than a property of the trainer today.
  *
  * This file is CUDA-free, like train.h: the losses, the optimizer, the accumulation
  * schedule and the checkpoint format are pure FP32 arithmetic over host or device

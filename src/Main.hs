@@ -69,6 +69,10 @@ data GenOptions = GenOptions
   , genSeed        :: Maybe String
   , genDraftModelDir :: Maybe FilePath
   , genSpecK         :: Maybe String
+  , genSpecStats     :: Bool
+  , genProfile       :: Bool
+  , genW4a16Dir      :: Maybe FilePath
+  , genDraftW4a16Dir :: Maybe FilePath
   }
 
 -- | The manifest has no request-level state, so there is no prompt or token
@@ -188,6 +192,30 @@ generateCmd = Generate <$> (GenOptions
      <> metavar "K"
      <> help ("Propose K tokens per speculative round (1..16). Explicitly a T=0 experiment: "
               ++ "the draft and target must share a token space, and the run is greedy")
+      ))
+  <*> switch
+      ( long "spec-stats"
+     <> help ("Print one line per speculative round (proposals, confirmed, committed, seconds) "
+              ++ "and a summary to stderr, for the plan's S performance gate")
+      )
+  <*> switch
+      ( long "profile"
+     <> help ("Report the per-region CUDA timing table to stderr after the run (off by "
+              ++ "default; recording never synchronizes)")
+      )
+  <*> optional (strOption
+      ( long "w4a16-dir"
+     <> metavar "DIR"
+     <> help ("Load the packed INT4 dense-FFN operands from a converted sidecar into the "
+              ++ "target before generating. A quantized target needs its own target-only "
+              ++ "baseline, which is this flag with the same request and no --speculative-k")
+      ))
+  <*> optional (strOption
+      ( long "draft-w4a16-dir"
+     <> metavar "DIR"
+     <> help ("The same, for the draft. A packed draft is a realistic source of rejections: its "
+              ++ "proposals differ from the target's wherever the quantized logits move a "
+              ++ "near-tie, which is what the acceptance histogram is measured on")
       )))
 
 helloGpuCmd :: Parser Command
@@ -585,6 +613,18 @@ runGenerate opts = do
                   exitFailure
       else return ()
 
+    case genW4a16Dir opts of
+      Nothing -> return ()
+      Just dir -> do
+        loaded <- engineLoadQuantizedFfn engine dir
+        case loaded of
+          Left err -> do
+            putStrLn $ "ERROR: loading the packed operands failed: " ++ err
+            exitFailure
+          Right () -> hPutStrLn stderr ("quantized: loaded the sidecar from " ++ dir)
+
+    if genProfile opts then profileSetEnabled True else return ()
+
     putStrLn "Tokenizing prompt..."
     promptTokens <- encode tok (genPrompt opts)
     putStrLn $ "  " ++ show (length promptTokens) ++ " tokens"
@@ -602,10 +642,21 @@ runGenerate opts = do
     outcome <- tryIOError $ case specCfgBase of
       Just base -> bracket (initRuntime draftCfg) shutdownRuntime $ \draftRt -> do
         rollbackMode <- checkDraftCompatibility rt draftRt (genPrompt opts)
+        case genDraftW4a16Dir opts of
+          Nothing -> return ()
+          Just dir -> do
+            loadedDraft <- engineLoadQuantizedFfn (runtimeEngine draftRt) dir
+            case loadedDraft of
+              Left err -> do
+                putStrLn $ "ERROR: loading the packed operands into the draft failed: " ++ err
+                exitFailure
+              Right () -> hPutStrLn stderr ("quantized draft: loaded the sidecar from " ++ dir)
         let spec = base { spRollback = rollbackMode }
-        toks <- generateSpeculative spec (runtimeEngine draftRt) (rtVocabSize draftRt)
-                                   engine vocab (dEosTokens desc) promptTokens
-                                   (genMaxTokens opts)
+        (toks, stats) <- generateSpeculativeWithStats spec (runtimeEngine draftRt)
+                                                        (rtVocabSize draftRt) engine vocab
+                                                        (dEosTokens desc) promptTokens
+                                                        (genMaxTokens opts)
+        if genSpecStats opts then hPutStrLn stderr (renderSpecStats stats) else return ()
         text <- decode tok toks
         putStrLn text
         return toks
@@ -625,6 +676,13 @@ runGenerate opts = do
         putStrLn $ "ERROR: generation failed: " ++ ioeGetErrorString err
         exitFailure
       Right toks -> return toks
+
+    if genProfile opts
+      then do
+        table <- profileReport
+        hPutStrLn stderr table
+        profileSetEnabled False
+      else return ()
 
     putStrLn "---"
     putStrLn $ "Generated " ++ show (length outputTokens) ++ " tokens"
@@ -669,6 +727,29 @@ checkDraftCompatibility target draft promptText = do
     refuse message = do
       putStrLn ("ERROR: " ++ message)
       exitFailure
+
+-- | One line per round plus the summary the plan's S performance gate asks for: what was
+-- proposed, what the target confirmed, what was committed, and the useful tokens per
+-- verification those imply. It is stderr, like the other request metadata.
+renderSpecStats :: SpecStats -> String
+renderSpecStats stats = unlines $
+  [ unwords [ "spec-round:", show index
+            , "proposals=" ++ show (rsProposals round_)
+            , "confirmed=" ++ show (rsAccepted round_)
+            , "committed=" ++ show (rsCommitted round_)
+            , "ms=" ++ show (round (rsSeconds round_ * 1000)) ]
+  | (index, round_) <- zip [0 :: Int ..] rounds ]
+  ++ [ unwords [ "spec-stats:", "rounds=" ++ show (length rounds)
+               , "proposed=" ++ show proposed
+               , "confirmed=" ++ show confirmed
+               , "committed=" ++ show committed
+               , "useful_per_verification=" ++ show rate ] ]
+  where
+    rounds = ssRounds stats
+    proposed = sum (map rsProposals rounds)
+    confirmed = sum (map rsAccepted rounds)
+    committed = sum (map rsCommitted rounds)
+    rate = if proposed == 0 then 0 else fromIntegral committed / fromIntegral proposed
 
 -- | Give a stochastic request a concrete seed: an explicit one is used as given and an
 -- omitted one is drawn once from the OS. A greedy request keeps whatever it was given (and

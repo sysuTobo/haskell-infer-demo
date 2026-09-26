@@ -879,6 +879,20 @@ before them must not be restored after. The mode is chosen where the descriptor 
 attention-only runtime keeps S1's free truncation, and a runtime with a recurrent layer pays for
 the copy, which is the admission the plan reserved for this stage.
 
+S3 is the stage that decides whether any of this is worth keeping, and its answer here is no -
+measured, not assumed. The gates pass: the batched verification decides what serial execution
+decides (2.4e-7 max_abs, every argmax equal, reported with each row's margin so the tightest
+decision is visible), a checkpoint restore on a recurrent model is bitwise exact, and a real
+16-token request's speculative output is byte-identical to its target-only output. But the plan's
+S performance gate asks a different question - what did the acceleration cost - and the answer is
+that a draft the same size as the target spends as much per proposal as the target spends per
+decode, so the rounds take **0.53x** of the serial time (0.478 s against 0.254 s for the same 15
+committed tokens with an identical BF16 draft) and **0.49x** with a packed-INT4 draft that
+actually rejects (1.071 useful tokens per verification). That is the plan's own warning
+("the draft's weights/cache are part of the cost, not free work") showing up as a measurement, and
+it is the reason the window is left at its prototype value and a smaller admissible draft is named
+as the prerequisite rather than guessed at.
+
 ### Instrumentation for the optimization track
 
 The plan's fusion and quantization milestones both start by asking where the time actually

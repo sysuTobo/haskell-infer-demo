@@ -1978,9 +1978,11 @@ int engine_checkpoint_save(EngineHandle *eng) {
                     check_cuda(cudaMalloc(&entry.copy, entry.bytes),
                                "Allocate checkpoint buffer");
                     next.bytes += (long long)entry.bytes;
+                    { PROFILE_SCOPE("checkpoint.save", ctx.stream);
                     check_cuda(cudaMemcpyAsync(entry.copy, entry.target, entry.bytes,
                                                cudaMemcpyDeviceToDevice, ctx.stream),
                                "Save checkpoint buffer");
+                    }
                 }
             }
         }
@@ -2039,9 +2041,11 @@ int engine_checkpoint_restore(EngineHandle *eng) {
         for (const CheckpointBuffer &buffer : eng->checkpoint.buffers) {
             DeviceCtx &ctx = eng->ctx[buffer.ctx_index];
             check_cuda(cudaSetDevice(ctx.device_id), "Select checkpoint device");
+            { PROFILE_SCOPE("checkpoint.restore", ctx.stream);
             check_cuda(cudaMemcpyAsync(buffer.target, buffer.copy, buffer.bytes,
                                        cudaMemcpyDeviceToDevice, ctx.stream),
                        "Restore checkpoint buffer");
+            }
         }
         for (int d = 0; d < eng->num_devices; ++d) {
             DeviceCtx &ctx = eng->ctx[d];

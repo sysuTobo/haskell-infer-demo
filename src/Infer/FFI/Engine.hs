@@ -20,6 +20,7 @@ module Infer.FFI.Engine
     -- * Inference
   , enginePrefill
   , engineDecode
+  , engineLoadQuantizedFfn
   , engineVerifyRows
   , engineTruncate
   , engineCheckpointSave
@@ -27,6 +28,9 @@ module Infer.FFI.Engine
   , engineCheckpointRelease
   , engineCheckpointBytes
   , engineReset
+    -- * Profiling (opt-in per-region timing, plan F0)
+  , profileSetEnabled
+  , profileReport
     -- * Queries
   , engineVocabSize
   , engineSeqLen
@@ -106,6 +110,15 @@ foreign import ccall unsafe "engine.h engine_manifest_version"
 
 foreign import ccall unsafe "engine.h engine_manifest"
   c_engine_manifest :: Ptr EngineHandle -> CString -> CInt -> IO CInt
+
+foreign import ccall unsafe "engine.h engine_load_quantized_ffn"
+  c_engine_load_quantized_ffn :: Ptr EngineHandle -> CString -> IO CInt
+
+foreign import ccall unsafe "profile.h profile_set_enabled"
+  c_profile_set_enabled :: CInt -> IO ()
+
+foreign import ccall unsafe "profile.h profile_report"
+  c_profile_report :: CString -> CInt -> IO CInt
 
 foreign import ccall unsafe "engine.h engine_last_error"
   c_engine_last_error :: IO CString
@@ -195,6 +208,32 @@ engineTruncate h retainLen = do
 
 engineReset :: Ptr EngineHandle -> IO ()
 engineReset = c_engine_reset
+
+-- | Install the packed INT4 operands for the dense FFN roles from a converted sidecar (plan
+-- Q2). The engine keeps its BF16 weights; decode reads the packed ones and prefill keeps
+-- reading BF16.
+engineLoadQuantizedFfn :: Ptr EngineHandle -> FilePath -> IO (Either String ())
+engineLoadQuantizedFfn h dir = withCString dir $ \cDir -> do
+    rc <- c_engine_load_quantized_ffn h cDir
+    if rc == 0
+      then return (Right ())
+      else do
+        err <- engineLastError
+        return (Left err)
+
+-- | Turn the engine's opt-in per-region timing on or off. Recording never synchronizes, so an
+-- ordinary run is unaffected while it is off (the default), and the region table costs one
+-- report at the end.
+profileSetEnabled :: Bool -> IO ()
+profileSetEnabled enabled = c_profile_set_enabled (if enabled then 1 else 0)
+
+-- | The per-region table, one report per call (the single synchronization point).
+profileReport :: IO String
+profileReport = allocaBytes capacity $ \buf -> do
+    written <- c_profile_report buf (fromIntegral capacity)
+    if written <= 0 then return "" else peekCStringLen (buf, fromIntegral written)
+  where
+    capacity = 64 * 1024
 
 -- | Save the engine's per-sequence state as its one live round checkpoint (plan S2). The
 -- engine refuses a second save while one is live, and refuses outright after a failed forward.

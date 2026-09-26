@@ -426,6 +426,27 @@ int engine_hello_gpu(int device, int value) {
     return value;
 }
 
+
+int engine_load_quantized_ffn(EngineHandle *engine, const char *manifest_dir) {
+    (void)engine; (void)manifest_dir;
+    set_error("stub: the generation stub has no packed operands");
+    return ENGINE_ERR_WEIGHTS;
+}
+
+/* --- profiling (plan F0): the stub reports an empty table --- */
+
+static int g_profile_enabled;
+
+void profile_set_enabled(int enabled) { g_profile_enabled = enabled; }
+int profile_enabled(void) { return g_profile_enabled; }
+void profile_reset(void) {}
+int profile_report(char *buf, int buf_len) {
+    if (buf_len > 0) buf[0] = '\0';
+    return 0;
+}
+int profile_scope_count(void) { return 0; }
+int profile_scope_overflowed(void) { return 0; }
+
 /* --- tokenizer ABI --------------------------------------------------- */
 
 /* One character per id, so a streamed chunk is easy to predict. */

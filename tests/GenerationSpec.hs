@@ -488,6 +488,25 @@ main = hspec $ do
         restores <- stubRestoreCallsH target
         restores `shouldBe` 0
 
+    it "reports what each round proposed, confirmed and committed" $ do
+      -- The plan's S performance gate reports an acceptance histogram and the useful tokens per
+      -- verification, so the loop has to carry those numbers out; this pins them on the agreeing
+      -- and rejecting cases, where the answer is known.
+      let scriptT = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+      withPair scriptT scriptT $ \draft target -> do
+        (tokens, stats) <- generateSpeculativeWithStats (specWindow 2) draft 64 target 64 [] [1] 4
+        tokens `shouldBe` [1, 2, 3, 4]
+        map rsProposals (ssRounds stats) `shouldBe` [2]
+        map rsAccepted (ssRounds stats) `shouldBe` [2]
+        map rsCommitted (ssRounds stats) `shouldBe` [3]
+      withPair scriptT [0, 1, 9, 9, 9, 9, 9, 9, 9, 9] $ \draft target -> do
+        (tokens, stats) <- generateSpeculativeWithStats (specWindow 2) draft 64 target 64 [] [1] 3
+        tokens `shouldBe` [1, 2, 3]
+        -- The first round rejected both proposals and corrected, the second had no legal window
+        -- left, so it committed one token with none proposed.
+        map rsProposals (ssRounds stats) `shouldBe` [1, 0]
+        map rsCommitted (ssRounds stats) `shouldBe` [1, 1]
+
     it "refuses a draft whose vocabulary differs from the target's" $ do
       withPair [0, 1, 2] [0, 1, 2] $ \draft target ->
         shouldReport "vocabularies differ"

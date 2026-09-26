@@ -2009,7 +2009,7 @@ CMake configuration. No CUDA pointers cross the Haskell boundary.
   retained inputs in the admitted execution case. A single final SSM state
   cannot be inverted into an intermediate one, and one pre-round snapshot does
   not make acceptance-prefix restoration O(1). Restore draft state too.
-- [ ] **S3 — Admit acceleration only after cross-case and continuation gates.**
+- [x] **S3 — Admit acceleration only after cross-case and continuation gates.**
   Compare every target verification row against serial execution with identical
   prefixes, including nearly tied logits; compare retained cache/state and
   several subsequent decode steps after each rejection. Stage 2 already warns
@@ -2078,6 +2078,30 @@ is the device gate: n = 1 must be **bitwise** a decode (one execution case), n >
 row-by-row with every argmax required to match serial execution, the rollback must leave the batch
 engine where the serial one is, and a short buffer, a window past max_chunk, a truncation past the
 sequence and a recurrent model must all be refused.
+
+**S3 status (2026-09-26): the gates pass and the measurement declines to admit - which is the
+deliverable, not a failure.** The cross-case and continuation gates are met: the target's batched
+verification agrees with serial execution to 2.4e-7 max_abs with **every argmax equal, including
+the tightest decision** (a 2.0e-2 margin, reported beside the perturbation), the rollback leaves
+the batch engine exactly where a clean prompt is, and a few-token restore on a model with GDN
+layers is **bitwise** what a straight-through engine produces. The plan's greedy-equivalence claim
+is then checked end to end: on a real 4B, a 16-token speculative request's output is
+**byte-identical** to the target-only output in both a fully-accepting configuration and one with
+real rejections. `tests/benchmark_speculative.py` reports the plan's S performance gate, and the
+answer at the drafts this repository can admit is **no**: with an identical BF16 draft (11
+proposals, 11 confirmed, 15 committed over 4 rounds, 1.364 useful tokens per verification) the
+rounds take **0.478 s against 0.254 s** of serial decoding for the same tokens, **0.53x**; with a
+packed-INT4 draft as a realistic source of rejections (14 proposals, 10 confirmed over 5 rounds
+with a fully rejected one, 1.071 useful tokens per verification) it is **0.521 s against
+0.253 s, 0.49x**. Both are slower for the reason the plan names: the draft's own decoding is part
+of the cost, and a draft the same size as the target cannot pay for itself - the acceptance rate
+would have to exceed the draft's own per-token cost, which it cannot. The fixed window k = 3 is
+therefore not promoted, no adaptive window is considered, and the honest statement is that
+speculative decoding here needs a *much* smaller admissible draft than this repository has (the
+only smaller checkpoints on hand have a different vocabulary or an unsupported recurrent shape,
+and the engine refuses both). The measurement also reports what a future decision would need:
+per-phase region rows for the batched verification's LM head and D2H against the ordinary decode,
+the checkpoint copies, useful tokens per second, and peak device memory.
 
 #### Round protocol and failure semantics
 

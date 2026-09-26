@@ -107,6 +107,42 @@ greedy-token agreement — never a relaxation of the top-1 check.
 
 ## Recently completed
 
+**S3: the cross-case gates pass, and the measurement declines to admit the acceleration** (plan
+S3; verified 2026-09-26).
+
+- The gates the plan asks for are met. The target's batched verification agrees with serial
+  execution to **2.4e-7 max_abs with every argmax equal**, reported row by row *with each row's
+  margin* so the agreement is visible at the tightest decision (2.0e-2 there) and not only where
+  the top two are far apart; the rollback leaves the batch engine exactly where a clean prompt is;
+  and a restore on a model with GDN layers is **bitwise** what a straight-through engine produces.
+- The claim is then checked end to end rather than per-kernel: on Qwen3-4B a 16-token speculative
+  request's output is **byte-identical to the target-only output**, in both a fully-accepting
+  configuration and one with real rejections. A rejected round that left the wrong state would
+  show up as different text, so this is the continuation-after-rollback gate at full scale.
+- **The performance gate says no, and that is the finding.** `tests/benchmark_speculative.py`
+  measures what the plan lists: with an **identical BF16 draft** (11 proposals, 11 confirmed, 15
+  committed over 4 rounds, 1.364 useful tokens per verification, histogram 3:3 and 2:1) the rounds
+  take **0.478 s against the serial 0.254 s for the same 15 tokens - 0.53x**; with a **packed-INT4
+  draft** as a realistic rejection source (14 proposals, 10 confirmed, histogram 3:2, 2:2, 0:1 with
+  one fully rejected round, 1.071 useful tokens per verification) it is **0.521 s against
+  0.253 s, 0.49x**. Both are *slower*, for exactly the reason the plan warns about: "the draft's
+  weights/cache are part of the cost, not free work" - a draft the same size as the target spends
+  as much per proposal as the target spends per decode, so no acceptance rate can pay for it.
+- So the fixed k = 3 is not promoted, no adaptive window is considered, and the honest scope
+  statement is that the method needs a far smaller *admissible* draft than this repository has:
+  the only smaller checkpoints on hand (Qwen3.5-0.8B) have a different vocabulary *and* a GDN head
+  count the AOT kernels do not cover, and the engine refuses both - which the CLI reports before
+  loading anything.
+- The runner also reports what a later decision would need: the per-phase region rows (the batched
+  verification's final norm/LM head/D2H against the ordinary decode's single-row LM head, and the
+  checkpoint copies), the acceptance histogram, useful tokens per second, the serial/speculative
+  ratio for the tokens actually committed, and peak device memory. `--w4a16-dir` and
+  `--draft-w4a16-dir` are what make a quantized target or draft measurable, since the plan gives a
+  quantized target its own target-only baseline.
+- **Not done**: nothing in S3's scope; S2/S1/S0 are its dependencies and all three are gated. Two
+  process notes: the benchmark needed its own flag plumbing for the draft's sidecar, and the
+  repeated-rejection arm only became possible once the packable draft existed.
+
 **S2: round checkpoints, which admit a model with a recurrent layer** (plan S2; verified
 2026-09-26).
 

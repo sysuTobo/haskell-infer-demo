@@ -14,6 +14,9 @@ module Infer.Generation
   ( generate
   , generateStreaming
   , generateSpeculative
+  , generateSpeculativeWithStats
+  , SpecStats(..)
+  , RoundStats(..)
   , decideRound
   , proposalWindow
   , takeConfirmed
@@ -24,6 +27,7 @@ import Control.Exception (finally, throwIO)
 import Control.Monad (when)
 import Data.Int (Int64)
 import Foreign.Ptr (Ptr)
+import GHC.Clock (getMonotonicTime)
 import System.IO (hFlush, stdout)
 
 import Infer.Config
@@ -118,6 +122,20 @@ generateStreaming engine vocab eosTokens stream prompt maxNew sampling
 -- Speculative decoding (plan S0)
 -- ---------------------------------------------------------------------------
 
+-- | What one round did, for the plan's S performance gate: what it proposed, what the target
+-- confirmed, what it committed, and how long the round took. A round with no legal window
+-- commits one token with no proposals, which is why the fields are counted rather than inferred.
+data RoundStats = RoundStats
+  { rsProposals :: Int
+  , rsAccepted  :: Int
+  , rsCommitted :: Int
+  , rsSeconds   :: Double
+  } deriving (Eq, Show)
+
+data SpecStats = SpecStats
+  { ssRounds :: [RoundStats]
+  } deriving (Eq, Show)
+
 -- | The longest prefix of @proposals@ the target confirmed, and the token the target's next
 -- row selects. @choices@ is the target's argmax for each of the @length proposals + 1@ rows:
 -- row @i@ predicts @proposals !! i@, and the last row is the bonus row. Checking stops at the
@@ -181,13 +199,30 @@ generateSpeculative
   -> [Int64]            -- ^ prompt
   -> Int                -- ^ maximum new tokens
   -> IO [Int64]
-generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt maxNew
+generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt maxNew =
+  fst <$> generateSpeculativeWithStats spec draft draftVocab target targetVocab eosTokens
+                                      prompt maxNew
+
+-- | The same run, with the per-round statistics the plan's S performance gate reports.
+generateSpeculativeWithStats
+  :: SpecConfig
+  -> Ptr EngineHandle
+  -> Int
+  -> Ptr EngineHandle
+  -> Int
+  -> [Int]
+  -> [Int64]
+  -> Int
+  -> IO ([Int64], SpecStats)
+generateSpeculativeWithStats spec draft draftVocab target targetVocab eosTokens prompt maxNew
   | draftVocab /= targetVocab =
       throwIO (userError ("speculative: the draft and target vocabularies differ ("
                           ++ show draftVocab ++ " and " ++ show targetVocab
                           ++ "); S0 requires one token space"))
-  | maxNew <= 0 = return []
-  | otherwise = run `finally` releaseCheckpoints
+  | maxNew <= 0 = return ([], SpecStats { ssRounds = [] })
+  | otherwise = do
+      (tokens, rounds) <- run `finally` releaseCheckpoints
+      return (tokens, SpecStats { ssRounds = rounds })
   where
     isEos token = fromIntegral token `elem` eosTokens
     vocab = targetVocab
@@ -201,8 +236,8 @@ generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt ma
       firstLogits <- consumeSequentially target vocab prompt
       let first = argmax firstLogits
       if isEos first
-        then return [first]
-        else go [first] prompt first (maxNew - 1)
+        then return ([first], [])
+        else go [] [first] prompt first (maxNew - 1)
 
     -- A run's checkpoints do not outlive it: a live one would refuse the next run's save.
     releaseCheckpoints = do
@@ -238,20 +273,26 @@ generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt ma
               logits' <- decodeLogits draft y vocab
               step (n - 1) (y : acc) logits'
 
-    -- emitted-so-far, the consumed prefix, the pending confirmed token, the budget left
-    go emitted consumed pending remaining
-      | remaining <= 0 = return (reverse emitted)
+    -- rounds-so-far, emitted-so-far, the consumed prefix, the pending confirmed token, the
+    -- budget left
+    go rounds emitted consumed pending remaining
+      | remaining <= 0 = return (reverse emitted, reverse rounds)
       | window <= 0 = do
           -- No legal window: one ordinary target step, so the run still finishes. The draft
           -- consumes the same token - its logits are discarded - because the two runtimes have
           -- to hold the same prefix for the next round to propose from the right position.
+          started <- getMonotonicTime
           logits <- decodeLogits target pending vocab
           _ <- decodeLogits draft pending vocab
-          let next = argmax logits
+          ended <- getMonotonicTime
+          let plain = RoundStats { rsProposals = 0, rsAccepted = 0, rsCommitted = 1
+                                 , rsSeconds = ended - started }
+              next = argmax logits
           if isEos next
-            then return (reverse (next : emitted))
-            else go (next : emitted) (consumed ++ [pending]) next (remaining - 1)
+            then return (reverse (next : emitted), reverse (plain : rounds))
+            else go (plain : rounds) (next : emitted) (consumed ++ [pending]) next (remaining - 1)
       | otherwise = do
+          started <- getMonotonicTime
           -- S2's checkpoint is taken before anything consumes, so a rejection can be undone;
           -- S1's mode needs nothing here because its cache can be moved back.
           when checkpoints saveBothCheckpoints
@@ -263,17 +304,19 @@ generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt ma
               confirmed = take accepted proposals
               (thisRound, stopped) = takeConfirmed isEos (confirmed ++ [correction])
               emitted' = reverse thisRound ++ emitted
+          ended <- getMonotonicTime
+          let entry = RoundStats { rsProposals = length proposals, rsAccepted = accepted
+                                 , rsCommitted = length thisRound
+                                 , rsSeconds = ended - started }
           if stopped
-            then return (reverse emitted')
+            then return (reverse emitted', reverse (entry : rounds))
             else do
-              -- Retain exactly P + [x] + y[1:r]. The target's batch consumed [x] ++ proposals,
-              -- so it is truncated back; the draft consumed only through y(k-1), so it is either
-              -- truncated too or - on full acceptance - made to consume its missing yk. The
+              -- Retain exactly P + [x] + y[1:r], by whichever rollback the mode admits; the
               -- correction becomes the new pending token and is not consumed here, precisely so
               -- it is not decoded twice.
               let retained = consumed ++ [pending] ++ confirmed
               rollback (length consumed) (accepted < window) retained
-              go emitted' retained correction (remaining - length thisRound)
+              go (entry : rounds) emitted' retained correction (remaining - length thisRound)
       where
         window = proposalWindow k remaining (length consumed) (spMaxSeqLen spec)
 

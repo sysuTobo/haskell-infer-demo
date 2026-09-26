@@ -149,14 +149,24 @@ def main():
     if not check(rows.shape == reference.shape, "the batch returned a different number of rows"):
         return 1
 
-    print("  row   max_abs      rms        batch argmax  serial argmax  agree")
+    # The margin is reported because the plan asks for agreement "including nearly tied logits":
+    # an argmax that agrees where the top two are far apart proves little, so the row with the
+    # smallest margin is where the claim is actually tested, and it is still required to agree.
+    print("  row   max_abs      rms        margin     batch argmax  serial argmax  agree")
     agree = 0
+    margins = []
     for i in range(len(window)):
         same = int(rows[i].argmax()) == int(reference[i].argmax())
         agree += same
+        ordered = np.sort(reference[i])
+        margin = float(ordered[-1] - ordered[-2])
+        margins.append(margin)
         print(f"  {i:3d}   {float(np.abs(rows[i] - reference[i]).max()):.3e}  "
-              f"{flat_rms(rows[i], reference[i]):.3e}  {int(rows[i].argmax()):12d}  "
+              f"{flat_rms(rows[i], reference[i]):.3e}  {margin:.3e}  {int(rows[i].argmax()):12d}  "
               f"{int(reference[i].argmax()):12d}  {'yes' if same else 'NO'}")
+    tightest = int(np.argmin(margins))
+    print(f"  the tightest decision is row {tightest} with a {margins[tightest]:.3e} margin "
+          f"(agreement there: {'yes' if int(rows[tightest].argmax()) == int(reference[tightest].argmax()) else 'NO'})")
     if not check(agree == len(window),
                  f"the batch decided differently from serial execution in "
                  f"{len(window) - agree} of {len(window)} rows"):

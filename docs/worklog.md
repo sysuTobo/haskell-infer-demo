@@ -14,9 +14,10 @@ runtime's parameter lifecycle (`csrc/include/train.h`, `src/Infer/Trainer.hs`), 
 backward/loss/optimizer layer and the synchronous SFT/rollout baseline
 (`csrc/include/backward.h`, `csrc/include/train_loop.h`), the numerical-alignment
 decision (`csrc/include/alignment.h`), the GSPO/GRPO group objectives and the bounded
-rollout queue (`csrc/include/rollout_queue.h`). All are described below. The rest of
-Stage 8, the temperature-sampling migration (T0-T4) and the inference-optimization
-track (F/Q/S) are proposals and unimplemented.
+rollout queue (`csrc/include/rollout_queue.h`), and the temperature-sampling migration
+(`src/Infer/Sampling.hs`, T0-T4). All are described below. What remains a proposal is the
+asynchronous GPU half of Stage 8 (snapshots, device leases, publication transfer, throughput
+measurement) and the inference-optimization track (F/Q/S).
 
 Last updated: 2026-09-26.
 
@@ -49,7 +50,7 @@ and hardware" are the exceptions, and they say so.
 | `tests/attention_backward_feasibility.py` (claim E backward) | the analytic backward from `(q,k,v,LSE)` reproduces torch.autograd in float64 to 1.7e-16; consuming the LSE without the log2 conversion moves `dv` by 3.04; a paired library (torch SDPA bf16) differs by 3.2e-3 forward / 2.8e-2 on gradients |
 | `ctest -R test_region_inventory` (CPU) | the inventory covers the plan's 21 in-scope regions and nothing else, agrees with the manifest registry in both directions, and every `exact` pair is backed by that registry's `deterministic` |
 | `ctest -R test_region_cases` (2× A40) | 18/18 registered `exact`/`unverified` pairs adjudicated; 8 `exact` pairs bitwise (output and persistent state); 7 unsupported shapes/cases rejected with a named reason; no trainer case offered by any of the 21 regions |
-| `cabal test all --enable-tests` | `infer-tests` 66/66, `infer-generation-tests` 15/15, `infer-trainer-tests` 9/9 (the Haskell and C teacher-forcing plans must agree) |
+| `cabal test all --enable-tests` | `infer-tests` 66/66, `infer-generation-tests` 54/54 (15 generation-loop plus 35 temperature-sampling plus 4 loop-level sampling), `infer-trainer-tests` 9/9 (the Haskell and C teacher-forcing plans must agree) |
 | `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12868-byte canonical document over 27 recorded regions carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, no unestablished provenance path, and every digest re-derived independently by `tests/manifest_check.py`. The byte count and the identities are the ones the *pre-Stage-4* registry produced; Stage 4 edits three registry rows (`attention_core`'s LSE, `masked_loss`'s stage, and `backward` from `not_implemented` to the backward inventory), which is a numerical-policy change: `ctest test_manifest`'s identity matrix is the gate that says only `numerical_policy_id` (and the `regions_sha256` inside it) moves, and the literals are re-derived by the same command |
 | Two independent 27B captures, strict comparison | bitwise identical (`max_abs == 0` on every array) and verdict `admitted` (exit 0) — the identities, parameter identity and provenance all agree, over the two captures' own `numerical_policy_id` (`012c264c…314f0e`, taken before Stage 4's registry edit) |
 | Pre-refactor golden vs a fresh 27B capture | bitwise identical (`max_abs == 0` on every array) with verdict `legacy/unverified` (exit 2) — the older capture's numeric arrays are compared, but nothing about its identity is invented. Re-run against the Stage-1 tree and again after Stage 3's engine changes, which is what shows the conv-activation export, the registry change and the training runtime are all numerically inert on the inference path |
@@ -105,6 +106,57 @@ greedy-token agreement — never a relaxation of the top-1 check.
   (`cuobjdump`) only — there is no H200 here.
 
 ## Recently completed
+
+**The temperature-sampling migration** (plan T0-T4, verified 2026-09-26).
+The plan's generation track is independent of the trainer and was the last unimplemented
+piece of the document; the CLI now samples from `softmax(logits/T)` by default:
+
+- `src/Infer/Sampling.hs` is the pure selector and the request RNG. The arithmetic is the
+  plan's: logits widen to `Double` before the subtraction and the division, `a_i =
+  (z_i - m)/tau`, `w_i = exp(a_i)`, `Z` a left fold in token order, `ell_sampler = a_i -
+  log Z` and `ell_model` only when the record is requested; the inverse CDF takes the first
+  *positive-weight* token whose ordered prefix exceeds `u*Z`, so a zero-mass leading token
+  cannot be taken at `u = 0`. The four greedy `argmax` call sites are gone: one
+  `stepToken` serves both generation entry points, at temperature 0 it is the lowest-id
+  argmax with **no draw consumed**, and above 0 it is one draw per selected token.
+- **the RNG is splitmix64 in-module rather than a pinned dependency.** What the plan's
+  "version-pinned dependency" protects is the algorithm's behaviour across builds, so the
+  module pins the published gamma and mix constants and `tests/SamplingSpec.hs` freezes the
+  seed-to-word vectors (seed 0's first word is the published `0xe220a8397b1dcdaf`) - which
+  is strictly more stable than a version bound and keeps a new Hackage package out of the
+  build. The API is Word64-in/Word64-out and the mapping is the plan's `(x >> 11) * 2^-53`.
+- `src/Infer/Config.hs` owns the configuration and its refusals: a negative nonzero
+  temperature even when its magnitude would underflow, a nonzero literal that underflows to
+  zero, an overflow to infinity, literal `-0` canonicalised to greedy, and a seed outside
+  `[0, 2^64-1]`. `Main` validates **before** any model or tokenizer allocation, resolves an
+  omitted seed once from `/dev/urandom` (a missing source is an error, not a fixed seed) and
+  reports `temperature`, `seed` and the sampler version on **stderr**, so stdout stays text.
+- **the greedy regression fixtures now select T=0 explicitly**, as the plan requires: the
+  fifteen pre-existing generation fixtures pass unchanged with an explicit greedy config,
+  and a request that omits `--temperature` samples at 1.0.
+- gates: `tests/SamplingSpec.hs` (frozen RNG vectors, the CDF boundaries, exact hits and
+  zero-mass bins, shift invariance, overflow/underflow, the draw-count contract, same-seed
+  stream/non-stream parity, a shorter request as a prefix) and `tests/test_sampling_cli.py`
+  (32 CLI checks, every one of them early validation against a non-existent model
+  directory). Plus the fixed-seed and greedy real-model smoke runs recorded below.
+- **three bugs the gate caught**: the rewritten `argmax` lost the infinite-list `..` in
+  `zip xs ([0 ..] :: [Int])`, so every greedy token came out 0 - the pre-existing greedy
+  fixtures failed loudly, which is what they are for; a spec expectation of
+  `uniformFromWord 0x0008000000000000` was written as `2^-13`'s reciprocal; and
+  `ell_model` was computed from `a_i = (z_i - m)/tau`, which is the raw-model offset only at
+  `tau = 1`, so any selection at another temperature recorded a wrong raw-model
+  log-probability - and the test that should have caught it had picked a `u` that selected
+  the row's maximum token, where `z_i = m` collapses both normalisations to the same value.
+  The assertion now uses a non-maximum token and requires the two log-probabilities to
+  differ at `tau /= 1`.
+- **one rule could not be reached, and that is recorded rather than hidden.** The plan's
+  endpoint correction ("if floating multiplication rounds `r` up to `Z`, select the last
+  positive-weight token") is defensive here: `Z` is at most the vocabulary size and
+  `u <= 1-2^-53`, so `u*Z < Z` always and the scan always finds a bin. The reachable half
+  of the rule is asserted instead - the largest admitted `u` cannot pick an arbitrary final
+  entry, because a trailing zero-mass token is skipped for the last positive one.
+- **not done: the performance half of T4.** Host selection time, allocations/GC, TTFT and
+  tokens/s are not measured; there is no benchmark runner in this repository yet.
 
 **Stage 6's alignment decision, Stage 7's group objectives and Stage 8's lag-zero
 protocol** (plan Stages 6-8, verified 2026-09-26).
@@ -631,14 +683,31 @@ CPU case pinning the behaviour.
   stale-data objective (`J_decoupled`) and every throughput/lag-distribution/per-device
   memory measurement are **not implemented**, which is what the plan's "start only after a
   synchronous algorithm and parameter publication protocol pass all relevant gates" defers.
-- **`test_train_forward`'s tied-update rms is marginal at its 0.05 tolerance.** On
-  2026-09-26 one full-suite run failed it at rms 0.05093 (top-1 still 12/12) while three
-  immediate re-runs of the same binary passed, and the same library re-ran green; the
-  likely mechanism is cuBLAS selecting a different algorithm/workspace for the projection
-  when another process holds device memory, which is exactly the module-level difference
-  Stage 2's claim D measured. The gate was not loosened — the observation is recorded, and
-  the check should be read as "within band at the time of the run" rather than as a stable
-  two-decimal guarantee.
+- **The sampling migration's performance is unmeasured.** The plan's T4 asks for host
+  selection time, allocations/GC, TTFT and tokens/s; none is measured, and the vocabulary
+  sized scratch the selector allocates per row (the `a_i` and `w_i` lists) is transient but
+  unquantified. A benchmark runner (`benchmark_inference.py`, proposed in the plan's
+  optimization track) is the natural home for it.
+- **The sampler's per-row scratch is an unquantified allocation.** `prepare` builds two
+  `Double` lists per selected token. The plan's memory note says not to retain a
+  vocabulary-sized buffer per generated token *merely to record the logprobs*, which this
+  does not do, but it does allocate them transiently and the cost is not measured.
+- **The trainer forward is not bitwise reproducible on the Qwen3-Next synth fixture.**
+  `test_train_forward`'s tied-update comparison against its torch reference is a *draw*:
+  measured on 2026-09-26, the reference is bitwise stable across runs
+  (`|logits|_1 = 3748.8913574219` every time) while the engine's own forward varies
+  (`|logits|_1` = 3703.94, 3707.13, 3721.08, 3729.44, 3738.60, 3747.87, 3747.87 — sometimes
+  repeating, sometimes not, which is the signature of a race), so the comparison's rms
+  ranges **0.00399 to 0.05386** against a tolerance of **0.05** and the test fails roughly a
+  quarter of the time. Attribution came from printing both sides' L1 sums, not from
+  guessing: the reference never moves, so this is an engine property and not a cuBLAS
+  algorithm choice in the reference. The top-1 count is 12/12 in every draw, so the
+  fixture's *decisions* are stable while its magnitudes are not. The likely home is the MoE
+  path this fixture carries (the plan keeps MoE outside the first trainer allowlist, and the
+  Stage-5 dense fixture's forward *is* bitwise reproducible), but that is a hypothesis until
+  a kernel is named. The gate was **not** loosened and the tolerance was **not** retuned: the
+  honest reading is that the rms band is currently a flaky check sitting inside a real
+  engine nondeterminism, and the nondeterminism is the thing to fix.
 - **The SFT step's layer wiring covers the attention and dense-MLP path.** The GDN
   mixer's backward (prepare, conv and core - Stage 4's kernels) is not yet chained into
   the walk, and MoE and MLA remain outside the first trainer allowlist as Stage 1 says, so
@@ -728,9 +797,11 @@ CPU case pinning the behaviour.
 - **Long context is not supported.** The MLA attention kernel's shared-memory
   budget caps the cached sequence length (a 16K context does not fit) and both
   `engine_create` and the kernel entry reject anything longer.
-- **Greedy decoding only.** There is no temperature/seed sampling, no top-k/top-p
-  and no batching; a CPU sampler migration is proposed in
-  plan-numeric-contract.md (milestones T0–T4) but not implemented.
+- **No top-k/top-p, batching or a GPU sampler.** Temperature sampling landed
+  (`src/Infer/Sampling.hs`, milestones T0-T4: binary64 softmax/CDF with a request-owned
+  splitmix64 RNG, the default is T=1 and greedy is the explicit T=0 mode), but there is no
+  truncation, no batched or GPU-side sampler, and the migration's performance is
+  unmeasured - see the temperature-sampling entry under Recently completed.
 - **Performance is not optimized** (correctness-first): decode is a single-token
   full forward, and the logits are computed for the last position only.
 
@@ -741,5 +812,5 @@ CPU case pinning the behaviour.
 | [README.md](../README.md) | Build, test entry points, usage, phase status, model weights |
 | [design.md](design.md) | Architecture rationale, per-family layout differences, testing strategy |
 | [manifest-contract.md](manifest-contract.md) | The execution manifest: canonical encoding, field ownership and projections, the region determinism registry, and the comparison modes |
-| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stages 0-5 are implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
+| [plan-numeric-contract.md](plan-numeric-contract.md) | **Partly implemented** — Stages 0-8 as far as they reach without the asynchronous GPU half, plus the temperature-sampling migration (T0-T4); the bounded-staleness async GPU scheduler, OPD/DAPO/PPO and the inference-optimization track (fusion, W4A16, speculative decoding) are proposals |
 | [reference-output.json](reference-output.json) | Transformers reference tokens for the 27B debugging prompt |

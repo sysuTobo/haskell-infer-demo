@@ -35,6 +35,13 @@ static int g_tokenizer_loads;
 static int g_tokenizer_frees;
 static int g_stream_new_calls;
 static int g_stream_free_calls;
+/* The values a scripted row is built from. The default row is the one every pre-existing
+ * fixture assumes: +1 at the scripted winner and -1 everywhere else. A test that needs a
+ * *decided* draw sets a wider gap, which is what makes a sampled selection deterministic
+ * enough to assert (the plan's "extend the C stub to supply arbitrary per-step vocabulary
+ * rows"). */
+static float g_winner_value = 1.0f;
+static float g_other_value = -1.0f;
 static int64_t g_script[STUB_MAX_SCRIPT];
 static int g_script_len;
 static int g_script_pos;
@@ -47,6 +54,8 @@ void stub_reset(void) {
     g_destroy_calls = 0;
     g_create_fails = 0;
     g_vocab = 64;
+    g_winner_value = 1.0f;
+    g_other_value = -1.0f;
     g_prefill_status = 0;
     g_decode_status = 0;
     g_tokenizer_loads = 0;
@@ -59,6 +68,11 @@ void stub_reset(void) {
 }
 
 void stub_set_vocab(int n) { g_vocab = n; }
+
+void stub_set_row_values(float winner, float other) {
+    g_winner_value = winner;
+    g_other_value = other;
+}
 
 void stub_set_script(const int64_t *tokens, int count) {
     if (count < 0) count = 0;
@@ -107,8 +121,8 @@ void engine_destroy(EngineHandle *engine) {
 }
 
 static void fill_logits(float *out_logits, int64_t token) {
-    for (int i = 0; i < g_vocab; ++i) out_logits[i] = -1.0f;
-    if (token >= 0 && token < g_vocab) out_logits[token] = 1.0f;
+    for (int i = 0; i < g_vocab; ++i) out_logits[i] = g_other_value;
+    if (token >= 0 && token < g_vocab) out_logits[token] = g_winner_value;
 }
 
 int engine_prefill(EngineHandle *engine, const int64_t *token_ids, int num_tokens,

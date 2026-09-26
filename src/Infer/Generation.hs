@@ -1,7 +1,11 @@
--- | Greedy decoding loop with streaming output.
+-- | The generation loop: prefill → decode, EOS detection, and token-by-token output.
 --
--- Manages the prefill → decode cycle, EOS detection, and token-by-token
--- text output via the tokenizer.
+-- Token selection goes through "Infer.Sampling"'s one selector, so the greedy path and the
+-- sampled path differ only in the 'Infer.Config.SamplingConfig' they are handed: at
+-- temperature 0 the selector is the lowest-id 'argmax' and consumes no random word, and
+-- above temperature 0 it draws once per selected token from the request's own generator.
+-- Both entry points below thread the same generator state through the same call, which is
+-- what makes a seed replay the same tokens with or without @--stream@.
 --
 -- Failure policy: a zero or negative token budget generates nothing and never
 -- touches the engine; any engine error is thrown to the caller instead of being
@@ -14,66 +18,79 @@ module Infer.Generation
 
 import Control.Exception (throwIO)
 import Data.Int (Int64)
-import Data.List (foldl')
-import Data.Ord (comparing)
 import Foreign.Ptr (Ptr)
 import System.IO (hFlush, stdout)
 
+import Infer.Config
 import Infer.FFI.Engine
+import Infer.Sampling (Drawn(..), argmax, newRng, stepToken)
 import Infer.Tokenizer
 
--- | Find the index of the maximum value in a list.
-argmax :: [Float] -> Int64
-argmax [] = 0
-argmax xs = fromIntegral (fst (maximumBy' (comparing snd) (zip [0..] xs)))
-  where
-    maximumBy' _ [] = error "argmax: empty list"
-    maximumBy' cmp (x:xs') = foldl' (\acc y -> if cmp acc y == LT then y else acc) x xs'
-
--- | Generate tokens greedily (non-streaming, returns all tokens at once).
+-- | Generate tokens (non-streaming, returns all tokens at once).
 -- The vocabulary size comes from 'Infer.FFI.Engine.engineVocabSize'.
 --
 -- At most @maxNew@ tokens are produced, counting the first token decoded from
 -- the prefill logits; the budget stop and the EOS stop apply to both the first
 -- and the later tokens.
-generate :: Ptr EngineHandle -> Int -> [Int] -> [Int64] -> Int -> IO [Int64]
-generate engine vocab eosTokens prompt maxNew
+--
+-- The record the selector produces (the token's sampler and raw-model
+-- log-probabilities) is available to a caller that wants a trajectory; this entry
+-- point does not collect one, because the plan's ordinary CLI output need not, and
+-- a caller that needs it for a learner update must request it before the update
+-- rather than reconstruct it later.
+generate :: Ptr EngineHandle -> Int -> [Int] -> [Int64] -> Int -> SamplingConfig -> IO [Int64]
+generate engine vocab eosTokens prompt maxNew sampling
   | maxNew <= 0 = return []
   | otherwise = do
       engineReset engine
       logits <- prefillLogits engine prompt vocab
-      let firstToken = argmax logits
+      (firstToken, rng1) <- draw logits (newRng (streamSeed sampling))
       if isEos firstToken
         then return [firstToken]
-        else go [firstToken] firstToken (maxNew - 1)
+        else go rng1 [firstToken] firstToken (maxNew - 1)
   where
     isEos token = fromIntegral token `elem` eosTokens
-    go acc _ remaining | remaining <= 0 = return (reverse acc)
-    go acc lastTok remaining = do
+
+    draw logits rng = case stepToken False sampling rng logits of
+      Left err -> throwIO (userError ("sampling failed: " ++ err))
+      Right (drawn, rng') -> return (drawnToken drawn, rng')
+
+    go _ acc _ remaining | remaining <= 0 = return (reverse acc)
+    go rng acc lastTok remaining = do
       logits <- decodeLogits engine lastTok vocab
-      let nextTok = argmax logits
+      (nextTok, rng') <- draw logits rng
       if isEos nextTok
         then return (reverse (nextTok : acc))
-        else go (nextTok : acc) nextTok (remaining - 1)
+        else go rng' (nextTok : acc) nextTok (remaining - 1)
 
 -- | Generate tokens with streaming output (prints each token as it's decoded).
 --
 -- The text of a token is produced by the incremental decoder, so a character
 -- whose UTF-8 bytes span several tokens is only printed once complete. The
 -- caller owns the stream handle (create it with 'newDecodeStream').
-generateStreaming :: Ptr EngineHandle -> Int -> [Int] -> DecodeStream -> [Int64] -> Int -> IO [Int64]
-generateStreaming engine vocab eosTokens stream prompt maxNew
+--
+-- A sampled EOS takes the same stop path as a greedy one, and the two paths
+-- consume the same generator words for the same seed: the selector call is
+-- identical and its position in the loop is identical.
+generateStreaming :: Ptr EngineHandle -> Int -> [Int] -> DecodeStream -> [Int64] -> Int
+                  -> SamplingConfig -> IO [Int64]
+generateStreaming engine vocab eosTokens stream prompt maxNew sampling
   | maxNew <= 0 = return []
   | otherwise = do
       engineReset engine
       logits <- prefillLogits engine prompt vocab
-      let firstToken = argmax logits
+      (firstToken, rng1) <- draw logits (newRng (streamSeed sampling))
       emitToken stream firstToken
       if isEos firstToken
         then finish [firstToken]
-        else go [firstToken] firstToken (maxNew - 1)
+        else go rng1 [firstToken] firstToken (maxNew - 1)
   where
     isEos token = fromIntegral token `elem` eosTokens
+
+    draw logits rng = case stepToken False sampling rng logits of
+      Left err -> throwIO (userError ("sampling failed: " ++ err))
+      Right (drawn, rng') -> return (drawnToken drawn, rng')
+
     finish acc = do
       -- Flush a trailing partial character before closing the line, so the
       -- last token is never silently dropped.
@@ -81,15 +98,16 @@ generateStreaming engine vocab eosTokens stream prompt maxNew
       putStr tailText
       putStrLn ""  -- newline after streaming
       return (reverse acc)
-    go acc _ remaining | remaining <= 0 = finish acc
-    go acc lastTok remaining = do
+
+    go _ acc _ remaining | remaining <= 0 = finish acc
+    go rng acc lastTok remaining = do
       logits <- decodeLogits engine lastTok vocab
-      let nextTok = argmax logits
+      (nextTok, rng') <- draw logits rng
       if isEos nextTok
         then finish (nextTok : acc)
         else do
           emitToken stream nextTok
-          go (nextTok : acc) nextTok (remaining - 1)
+          go rng' (nextTok : acc) nextTok (remaining - 1)
 
 -- | Prefill, propagating the engine's error instead of returning no logits.
 prefillLogits :: Ptr EngineHandle -> [Int64] -> Int -> IO [Float]

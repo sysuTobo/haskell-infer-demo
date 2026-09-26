@@ -35,6 +35,7 @@ executable haskell-infer-demo
                       Infer.Placement
                       Infer.Runtime
                       Infer.Generation
+                      Infer.Sampling
                       Infer.Manifest
                       Infer.Tokenizer
                       Infer.FFI.Engine
@@ -75,6 +76,7 @@ test-suite infer-generation-tests
   c-sources:          tests/generation_engine_stub.c
   include-dirs:       csrc/include
   other-modules:
+                      SamplingSpec
                       Infer.Config
                       Infer.Descriptor
                       Infer.Descriptor.Adapter
@@ -87,6 +89,7 @@ test-suite infer-generation-tests
                       Infer.Placement
                       Infer.Runtime
                       Infer.Generation
+                      Infer.Sampling
                       Infer.Manifest
                       Infer.Tokenizer
                       Infer.FFI.Engine

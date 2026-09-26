@@ -448,16 +448,20 @@ static const struct RegionInventoryEntry kInventory[] = {
      "as one",
      0, NULL},
 
-    {"sampler_softmax_cdf", 0, "generation only (proposed)",
-     "proposed host binary64 softmax/CDF with a request-owned RNG (plan T0-T4)",
+    {"sampler_softmax_cdf", 0, "generation only",
+     "src/Infer/Sampling.hs: host binary64 softmax/CDF with a request-owned splitmix64 "
+     "RNG (plan T0-T4)",
      "fp32 logits[vocab_size]; temperature; the request's PRNG state",
      "sampled int token_id and its log-probability",
      "a request-owned PRNG state",
      "nothing: generation only",
      "none",
-     "unimplemented: greedy is the only sampler in this release, and the plan "
-     "registers this as a separate generation-only region rather than equating "
-     "it with masked_loss",
+     "implemented by the temperature-sampling migration. ctest cannot reach it (it is "
+     "Haskell), so its gate is cabal test infer-generation-tests, which runs "
+     "tests/SamplingSpec.hs, and tests/test_sampling_cli.py checks the CLI options and their "
+     "early validation. The plan registers this as a separate generation-only region rather "
+     "than equating it with masked_loss, and greedy stays an explicit mode (temperature 0) "
+     "of the same selector rather than a second implementation",
      0, NULL},
 };
 

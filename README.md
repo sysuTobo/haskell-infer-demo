@@ -20,7 +20,9 @@ targeting **Qwen3.8-27B** (hybrid Full-Attention + GatedDeltaNet architecture).
   references; Mixtral shares their adapter and snapshot layout) and multi-head
   latent attention (DeepSeek-V2-Lite, verified). `descriptors/` carries a
   snapshot per family.
-- **Single-request greedy decoding**: CLI with streaming token output decoded
+- **Single-request temperature sampling**: categorical draws from `softmax(logits/T)`
+  with a request-owned splitmix64 RNG and a reported, replayable seed (default `T=1`;
+  `--temperature 0` is the explicit greedy mode), plus streaming output decoded
   incrementally, so a character whose bytes span several tokens is emitted once
   complete.
 - **Three-language build**: Haskell (Cabal) + C/CUDA (CMake) + Rust (Cargo), with
@@ -292,7 +294,10 @@ equal highest BF16 reference logits are treated as ties.
   `descriptors/*.json`) and `infer-generation-tests`, which drives the real
   generation loop and tokenizer wrapper against a scriptable C stub of the engine
   — token budgets, first/later EOS, prefill/decode failures and the cleanup that
-  follows them. `infer-trainer-tests` links `csrc/train.c` directly and requires the
+  follows them — plus `SamplingSpec` for the temperature selector: the frozen splitmix64
+  vectors, the CDF boundaries and endpoint rules, the draw-count contract, and same-seed
+  stream/non-stream parity. `tests/test_sampling_cli.py` checks the sampling options and
+  their early validation against the built executable (it needs the binary, not a gate). `infer-trainer-tests` links `csrc/train.c` directly and requires the
   Haskell teacher-forcing plan and the C implementation of the same schedule to agree
   across shifts, masks, forced labels and explicit positions.
 - `ctest` also runs `test_norm` (both RMSNorm variants) and `test_rope` (partial
@@ -321,6 +326,37 @@ cabal run haskell-infer-demo -- generate \
   --stream \
   -p "Explain why the sky is blue."
 ```
+
+### Sampling
+
+`generate` samples from `softmax(logits/T)` at temperature `T > 0` and decodes greedily at
+`--temperature 0`. **The default is `--temperature 1.0`, not greedy** (plan
+`docs/plan-numeric-contract.md`, "Temperature-sampling migration"); the resolved
+temperature, seed and sampler version are reported on **stderr** before generation, so the
+generated text on stdout stays clean. A seed omitted with `--temperature 1.0` is drawn once
+from the OS and reported, which is what makes a run replayable after the fact:
+
+```bash
+# Greedy: reproducible by construction, no random word consumed
+cabal run haskell-infer-demo -- generate --model-dir "$MODEL_DIR" --gpus 0,1 \
+  -p "Hello" --max-tokens 16 --temperature 0
+
+# Categorical sampling at T=1 with a fixed seed: the same prompt and seed replay the same tokens
+cabal run haskell-infer-demo -- generate --model-dir "$MODEL_DIR" --gpus 0,1 \
+  -p "Hello" --max-tokens 16 --temperature 1.0 --seed 42
+
+# The same request with --stream selects the same tokens; an omitted seed prints one that
+# replays the request when supplied explicitly
+cabal run haskell-infer-demo -- generate --model-dir "$MODEL_DIR" --gpus 0,1 \
+  -p "Hello" --max-tokens 16 --temperature 0.7 --stream
+```
+
+A negative, non-finite or unrepresentable temperature and a seed outside `[0, 2^64-1]` are
+configuration errors reported **before** any model or tokenizer is loaded. A seed supplied
+with `--temperature 0` is accepted and reported as unused, because greedy consumes no draw.
+There is deliberately no top-k, top-p, repetition penalty or beam search in this migration;
+`tests/SamplingSpec.hs` (run by `cabal test infer-generation-tests`) and
+`tests/test_sampling_cli.py` are its gates.
 
 ## Model Weights
 

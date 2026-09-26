@@ -762,6 +762,37 @@ carries its own honest remainder:
   transfer — is deliberately absent, because the plan defers it until after the
   lag-zero protocol passes.
 
+### Temperature sampling and the request RNG
+
+The plan's temperature-sampling migration moved the default generation policy from greedy
+to categorical (T0-T4 implemented), and it is deliberately the *only* place that decides how
+a token is picked:
+
+- **one selector, two configurations.** `Infer.Sampling.stepToken` is the contract the two
+  generation entry points call. At temperature 0 it is the lowest-id `argmax` and consumes
+  no random word; above 0 it draws once per selected token from the request's own generator
+  and takes the first positive-weight token whose ordered prefix exceeds `u*Z`. Because the
+  call is the same and its position in the loop is the same, a seed replays the same tokens
+  with or without `--stream`.
+- **the arithmetic is a stated policy, not an implementation detail.** The logits widen to
+  `Double` before the subtraction and the division, the exponentials and the CDF accumulate
+  in binary64 in token order, and the two log-probabilities the plan distinguishes
+  (`ell_sampler` under the temperature, `ell_model` under the raw model) are computed from
+  the original logits in log space. That is a *choice* recorded next to the selection it
+  makes, so the sampler's numbers are reproducible against a rule rather than against
+  whatever the device did - the CUDA logits and the trainer's FP32 reductions are separate
+  numerical policies on purpose.
+- **the RNG is request-owned and version-pinned by its algorithm.** One splitmix64 state is
+  threaded through the request, seeded once, never reset per token; the module pins the
+  published constants and the test freezes the seed-to-word vectors, which is what
+  "version-pinned" was protecting, without adding a Hackage dependency to the build.
+- **configuration is validated before anything is loaded.** `Infer.Config` owns the
+  parsing and the refusals (a negative nonzero temperature even when it underflows, a
+  nonzero literal that underflows to zero, an overflow to infinity, a seed outside
+  `[0, 2^64-1]`), and `Main` resolves the seed - an explicit one, or one drawn from the OS -
+  and reports `temperature`, `seed` and the sampler version on stderr so the generated text
+  stays clean.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:
@@ -792,6 +823,7 @@ stops at the first failure, so one command answers "is the tree green".
 | Alignment | `ctest -R test_alignment` (CPU) | every Stage-1 region resolves to a verdict derived from the inventory rather than restated beside it; a declared exception carries a finite measured bound, a pending region names its tracked work, a policy change or a sampler difference is refused as a numerical comparison, and an exact-by-construction region is not checked by a tolerance |
 | Group objective | `ctest -R test_gspo` (CPU) | the GSPO and GRPO objectives match an independent FP64 reference and its central difference on an unequal-length group; both advantage signs and both clip boundaries; masks, zero-variance and truncated groups; and the unclipped analytic gradient `A_i s_i / T_i` |
 | Rollout admission | `ctest -R test_rollout_queue` (CPU) | whole completed groups only; bounds in groups, tokens and live behavior versions; lag enforced at admission; a consumed group cannot be re-enqueued; and lag zero reproduces the synchronous objective and gradient bitwise while larger lag is reported as a policy change |
+| Sampling | `cabal test infer-generation-tests` (CPU, `tests/SamplingSpec.hs`) + `tests/test_sampling_cli.py` | the frozen splitmix64 vectors; the CDF boundaries, exact hits and zero-mass bins; shift invariance; overflow/underflow refusal; the draw-count contract (greedy none, a positive temperature one per selected token); same-seed stream/non-stream parity and a shorter request as a prefix; and, through the CLI runner, that every invalid temperature or seed is refused *before* any model is loaded |
 | Resource safety | `ctest -R test_engine_resources` | repeated failing creations return no handle, explain the error and move no device memory; a valid checkpoint still builds afterwards |
 | Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set; configured `--rms-tolerance` (default 0.1, family-specific overrides) |
 | Chunking | same prompt, different prefill splits | top-1 equal, rms ≤ 5 (state-loss guard) |

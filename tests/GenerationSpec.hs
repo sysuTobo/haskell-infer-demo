@@ -12,11 +12,12 @@ module Main (main) where
 
 import Control.Exception (SomeException, bracket, throwIO, try)
 import Data.Int (Int64)
-import Foreign.C.Types (CInt (..))
+import Foreign.C.Types (CFloat (..), CInt (..))
 import Foreign.Marshal.Array (withArray)
 import Foreign.Ptr (Ptr, nullPtr)
 import System.Exit (ExitCode (..))
 import Test.Hspec
+import qualified SamplingSpec
 
 import Infer.Config
 import Infer.Descriptor
@@ -24,6 +25,12 @@ import Infer.FFI.Engine
 import Infer.Generation
 import Infer.Runtime
 import Infer.Tokenizer
+
+-- | The greedy baseline the pre-existing generation fixtures assert. The plan requires the
+-- greedy regression fixtures to select temperature 0 explicitly rather than inherit a
+-- stochastic default, so every call below says so.
+greedy :: SamplingConfig
+greedy = SamplingConfig { scTemperature = 0, scSeed = Nothing }
 
 -- ---------------------------------------------------------------------------
 -- Stub control surface (tests/generation_engine_stub.c)
@@ -34,6 +41,9 @@ foreign import ccall unsafe "stub_reset"
 
 foreign import ccall unsafe "stub_set_vocab"
   stubSetVocab :: CInt -> IO ()
+
+foreign import ccall unsafe "stub_set_row_values"
+  stubSetRowValues :: CFloat -> CFloat -> IO ()
 
 foreign import ccall unsafe "stub_set_script"
   stubSetScript :: Ptr Int64 -> CInt -> IO ()
@@ -91,10 +101,11 @@ shouldReport needle action = do
 
 main :: IO ()
 main = hspec $ do
+  SamplingSpec.spec
   describe "generate without streaming" $ do
     it "generates nothing and never touches the engine on a zero budget" $ do
       script [10, 11, 12]
-      tokens <- generate stubEngine vocab [] [1, 2, 3] 0
+      tokens <- generate stubEngine vocab [] [1, 2, 3] 0 greedy
       tokens `shouldBe` []
       stubResetCalls `shouldReturn` 0
       stubPrefillCalls `shouldReturn` 0
@@ -102,27 +113,27 @@ main = hspec $ do
 
     it "treats a negative budget as no work" $ do
       script [10, 11, 12]
-      tokens <- generate stubEngine vocab [] [1, 2, 3] (-3)
+      tokens <- generate stubEngine vocab [] [1, 2, 3] (-3) greedy
       tokens `shouldBe` []
       stubPrefillCalls `shouldReturn` 0
       stubDecodeCalls `shouldReturn` 0
 
     it "stops before decoding when the first token is EOS" $ do
       script [7, 8, 9]
-      tokens <- generate stubEngine vocab [7] [1] 5
+      tokens <- generate stubEngine vocab [7] [1] 5 greedy
       tokens `shouldBe` [7]
       stubPrefillCalls `shouldReturn` 1
       stubDecodeCalls `shouldReturn` 0
 
     it "stops at a later EOS token, including it in the result" $ do
       script [1, 2, 9, 3]
-      tokens <- generate stubEngine vocab [9] [1] 10
+      tokens <- generate stubEngine vocab [9] [1] 10 greedy
       tokens `shouldBe` [1, 2, 9]
       stubDecodeCalls `shouldReturn` 2
 
     it "produces exactly the budget when no EOS arrives" $ do
       script [1, 2, 3, 4]
-      tokens <- generate stubEngine vocab [] [1] 3
+      tokens <- generate stubEngine vocab [] [1] 3 greedy
       tokens `shouldBe` [1, 2, 3]
       stubPrefillCalls `shouldReturn` 1
       stubDecodeCalls `shouldReturn` 2
@@ -130,12 +141,12 @@ main = hspec $ do
     it "reports a prefill failure instead of an empty result" $ do
       script [1, 2]
       stubSetPrefillStatus (-3)
-      shouldReport "prefill failed" (generate stubEngine vocab [] [1] 2)
+      shouldReport "prefill failed" (generate stubEngine vocab [] [1] 2 greedy)
 
     it "reports a decode failure instead of a partial result" $ do
       script [1, 2]
       stubSetDecodeStatus (-3)
-      result <- try (generate stubEngine vocab [] [1] 3) :: IO (Either SomeException [Int64])
+      result <- try (generate stubEngine vocab [] [1] 3 greedy) :: IO (Either SomeException [Int64])
       case result of
         Left err -> show err `shouldContain` "decode failed"
         Right tokens -> expectationFailure ("expected a failure, produced " ++ show tokens)
@@ -145,7 +156,7 @@ main = hspec $ do
       script [1, 2, 3]
       Just tok <- loadTokenizer "/nonexistent/tokenizer.json"
       tokens <- bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
-        generateStreaming stubEngine vocab [] stream [1] 0
+        generateStreaming stubEngine vocab [] stream [1] 0 greedy
       tokens `shouldBe` []
       stubPrefillCalls `shouldReturn` 0
       stubDecodeCalls `shouldReturn` 0
@@ -155,7 +166,7 @@ main = hspec $ do
       script [5, 6, 7]
       Just tok <- loadTokenizer "/nonexistent/tokenizer.json"
       tokens <- bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
-        generateStreaming stubEngine vocab [5] stream [1] 4
+        generateStreaming stubEngine vocab [5] stream [1] 4 greedy
       tokens `shouldBe` [5]
       stubDecodeCalls `shouldReturn` 0
 
@@ -163,7 +174,7 @@ main = hspec $ do
       script [1, 2, 8, 3]
       Just tok <- loadTokenizer "/nonexistent/tokenizer.json"
       tokens <- bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
-        generateStreaming stubEngine vocab [8] stream [1] 10
+        generateStreaming stubEngine vocab [8] stream [1] 10 greedy
       tokens `shouldBe` [1, 2, 8]
       stubDecodeCalls `shouldReturn` 2
 
@@ -171,7 +182,7 @@ main = hspec $ do
       script [1, 2, 3]
       Just tok <- loadTokenizer "/nonexistent/tokenizer.json"
       tokens <- bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
-        generateStreaming stubEngine vocab [] stream [1] (-2)
+        generateStreaming stubEngine vocab [] stream [1] (-2) greedy
       tokens `shouldBe` []
       stubPrefillCalls `shouldReturn` 0
       stubDecodeCalls `shouldReturn` 0
@@ -182,7 +193,7 @@ main = hspec $ do
       Just tok <- loadTokenizer "/nonexistent/tokenizer.json"
       result <- try $
         bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
-          generateStreaming stubEngine vocab [] stream [1] 3
+          generateStreaming stubEngine vocab [] stream [1] 3 greedy
       case result :: Either SomeException [Int64] of
         Left err -> show err `shouldContain` "prefill failed"
         Right tokens -> expectationFailure ("expected a failure, produced " ++ show tokens)
@@ -193,10 +204,40 @@ main = hspec $ do
       Just tok <- loadTokenizer "/nonexistent/tokenizer.json"
       result <- try $
         bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
-          generateStreaming stubEngine vocab [] stream [1] 3
+          generateStreaming stubEngine vocab [] stream [1] 3 greedy
       case result :: Either SomeException [Int64] of
         Left err -> show err `shouldContain` "decode failed"
         Right tokens -> expectationFailure ("expected a failure, produced " ++ show tokens)
+
+  describe "sampling through the loop" $ do
+    it "keeps temperature 0 on the scripted greedy tokens" $ do
+      script [10, 11, 12, 13]
+      greedyRun <- generate stubEngine vocab [] [1] 4 greedy
+      greedyRun `shouldBe` [10, 11, 12, 13]
+
+    it "stops at a sampled EOS through the same stop path as greedy" $ do
+      -- A decided row (the scripted winner dominates), so the first draw lands on the EOS
+      -- token with probability 1 - O(1e-25) and the loop must stop there without decoding.
+      script [7]
+      stubSetRowValues 30 (-30)
+      sampled <- generate stubEngine vocab [7] [1] 5 (SamplingConfig 1.0 (Just 42))
+      sampled `shouldBe` [7]
+      stubDecodeCalls `shouldReturn` 0
+
+    it "gives the same tokens for the same seed with and without streaming" $ do
+      script [10, 11, 12, 13]
+      plain <- generate stubEngine vocab [] [1] 4 (SamplingConfig 1.0 (Just 7))
+      Just tok <- loadTokenizer "/nonexistent/tokenizer.json"
+      withStream <- bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
+        generateStreaming stubEngine vocab [] stream [1] 4 (SamplingConfig 1.0 (Just 7))
+      withStream `shouldBe` plain
+
+    it "makes a shorter request a prefix of a longer one under the same seed" $ do
+      script [10, 11, 12, 13, 14]
+      short <- generate stubEngine vocab [] [1] 2 (SamplingConfig 1.0 (Just 5))
+      long <- generate stubEngine vocab [] [1] 4 (SamplingConfig 1.0 (Just 5))
+      short `shouldBe` take 2 long
+      length short `shouldBe` 2
 
   describe "initRuntime" $ do
     it "releases the tokenizer when engine_create fails" $ do

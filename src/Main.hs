@@ -2,6 +2,8 @@
 --
 -- Usage:
 --   haskell-infer-demo generate --model-dir /path/to/Qwen3.8-27B --gpus 0,1 -p "Hello"
+--   haskell-infer-demo generate ... -p "Hello" --temperature 0              # greedy
+--   haskell-infer-demo generate ... -p "Hello" --temperature 1.0 --seed 42 # replayable
 --   haskell-infer-demo show-config --descriptor descriptors/qwen38-27b.json
 --   haskell-infer-demo descriptor --model-dir /path/to/model [--write FILE]
 --   haskell-infer-demo manifest --model-dir /path/to/model [--write FILE] [--check]
@@ -9,12 +11,15 @@
 --   haskell-infer-demo hello-gpu -d 0 -v 42
 module Main (main) where
 
-import Control.Exception (bracket)
+import Control.Exception (bracket, throwIO)
+import Data.Bits (shiftL, (.|.))
 import qualified Data.ByteString as BS
 import Data.List (intercalate)
+import Data.Word (Word64)
 import qualified Data.Text as T
 import Options.Applicative
 import System.Exit (ExitCode(..), exitFailure, exitSuccess, exitWith)
+import System.IO (IOMode(..), hPutStrLn, stderr, withBinaryFile)
 import System.IO.Error (ioeGetErrorString, tryIOError)
 import Text.Read (readMaybe)
 
@@ -26,6 +31,7 @@ import Infer.Manifest
 import Infer.Model
 import Infer.Placement
 import Infer.Runtime
+import Infer.Sampling (samplerVersion)
 import Infer.Tokenizer
 
 -- -----------------------------------------------------------------------
@@ -59,6 +65,8 @@ data GenOptions = GenOptions
   , genPrompt    :: String
   , genStreaming :: Bool
   , genCheckDesc :: Bool
+  , genTemperature :: Maybe String
+  , genSeed        :: Maybe String
   }
 
 -- | The manifest has no request-level state, so there is no prompt or token
@@ -153,7 +161,19 @@ generateCmd = Generate <$> (GenOptions
   <*> switch
       ( long "check-descriptor"
      <> help "Round-trip the descriptor through the engine and compare"
+      )
+  <*> optional (strOption
+      ( long "temperature"
+     <> metavar "T"
+     <> help ("Sampling temperature: 0 is greedy; a positive value samples from "
+              ++ "softmax(logits/T) (default 1.0)")
       ))
+  <*> optional (strOption
+      ( long "seed"
+     <> metavar "S"
+     <> help ("Unsigned 64-bit seed for the request's random stream "
+              ++ "(default: drawn once from the OS and reported on stderr)")
+      )))
 
 helloGpuCmd :: Parser Command
 helloGpuCmd = HelloGpu
@@ -467,6 +487,17 @@ runCompareManifestFiles opts = do
 
 runGenerate :: GenOptions -> IO ()
 runGenerate opts = do
+  -- Sampling is validated before anything is loaded, so an invalid temperature or seed
+  -- cannot get as far as a model or tokenizer allocation (plan T0/T3).
+  parsed <- case parseSampling (genTemperature opts) (genSeed opts) of
+    Left err -> do
+      putStrLn $ "ERROR: " ++ err
+      exitFailure
+    Right sampling -> return sampling
+  sampling <- resolveSampling (genMaxTokens opts) parsed
+  -- Request metadata goes to stderr, keeping the generated stdout text clean.
+  hPutStrLn stderr (samplingSummary sampling ++ ", sampler=" ++ samplerVersion)
+
   let cfg = RuntimeConfig
         { rcModelDir  = genModelDir opts
         , rcDescriptor = genDesc opts
@@ -476,6 +507,7 @@ runGenerate opts = do
         , rcMaxSeqLen = genMaxSeqLen opts
         , rcMaxTokens = genMaxTokens opts
         , rcPrompt    = genPrompt opts
+        , rcSampling  = sampling
         }
 
   -- bracket: the tokenizer and the engine are released on every exit path,
@@ -523,9 +555,11 @@ runGenerate opts = do
     -- that exits 0.
     outcome <- tryIOError $ if genStreaming opts
       then bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
-        generateStreaming engine vocab (dEosTokens desc) stream promptTokens (genMaxTokens opts)
+        generateStreaming engine vocab (dEosTokens desc) stream promptTokens
+                          (genMaxTokens opts) (rcSampling cfg)
       else do
-        toks <- generate engine vocab (dEosTokens desc) promptTokens (genMaxTokens opts)
+        toks <- generate engine vocab (dEosTokens desc) promptTokens
+                         (genMaxTokens opts) (rcSampling cfg)
         text <- decode tok toks
         putStrLn text
         return toks
@@ -538,6 +572,30 @@ runGenerate opts = do
 
     putStrLn "---"
     putStrLn $ "Generated " ++ show (length outputTokens) ++ " tokens"
+
+-- | Give a stochastic request a concrete seed: an explicit one is used as given and an
+-- omitted one is drawn once from the OS. A greedy request keeps whatever it was given (and
+-- reports it as unused), and a zero-budget request touches no entropy at all because it
+-- never generates.
+resolveSampling :: Int -> SamplingConfig -> IO SamplingConfig
+resolveSampling maxNew sampling
+  | scTemperature sampling == 0 = return sampling
+  | maxNew <= 0 = return sampling
+  | otherwise = case scSeed sampling of
+      Just _ -> return sampling
+      Nothing -> do
+        seed <- systemEntropy
+        return sampling { scSeed = Just seed }
+
+-- | Eight bytes from the OS entropy source. A missing or short source is an error rather
+-- than a silently fixed seed, which is the plan's "do not silently retry with another
+-- seed" applied to the seed source itself.
+systemEntropy :: IO Word64
+systemEntropy = do
+  bytes <- withBinaryFile "/dev/urandom" ReadMode (\h -> BS.hGet h 8)
+  if BS.length bytes /= 8
+    then throwIO (userError "could not read 8 bytes of entropy from /dev/urandom")
+    else return $! BS.foldl' (\acc b -> (acc `shiftL` 8) .|. fromIntegral b) 0 bytes
 
 -- -----------------------------------------------------------------------
 -- Main

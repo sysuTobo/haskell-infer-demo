@@ -26,10 +26,10 @@ asynchronous RL. The first implementation target is a small dense or dense-hybri
 model, on one device or with layer-wise placement; not every existing inference
 family becomes trainable in the first release.
 
-A [temperature-sampling migration](#temperature-sampling-migration) changes the
-planned default generation policy from greedy to categorical sampling, while
-retaining explicit greedy regression. It can be implemented without training or
-CUDA changes and supplies the sampling foundation for Stage 5.
+A [temperature-sampling migration](#temperature-sampling-migration) moved the default
+generation policy from greedy to categorical sampling (**implemented**, T0-T4), while
+retaining explicit greedy regression at temperature 0. It needed no training or CUDA
+changes and supplies the sampling foundation the Stage-5 rollout's warm-up described.
 
 A separate [inference optimization track](#inference-optimization-track) covers
 operator fusion, weight-only quantization and speculative decoding. It shares
@@ -80,7 +80,7 @@ debuggability and attributable experiments, not promised reward or speed gains.
 | Fusion | FlashInfer attention, SiLU-multiply and GDN gated norm; dense gate/up still separate GEMMs | Combined projection layouts, residual-add/norm fusion and measured end-to-end benefit |
 | Quantization | Weight-role loading requires BF16; GEMM uses BF16 inputs with FP32 compute | Packed low-bit weights, scales, format validation, quantized GEMM and quality gates |
 | Speculative decoding | Batched prefill internally, but only final-row logits; reset clears all sequence state | Draft/target orchestration, per-position verification, prefix rollback and GDN state snapshots |
-| Sampling | Four argmax call sites in streaming/non-streaming generation; host `[Float]` logits; no temperature/seed options or RNG dependency | Shared token selector, temperature categorical distribution, request-owned RNG, sampler logprobs and distribution/replay gates |
+| Sampling | One `stepToken` at both generation entry points; temperature categorical sampling in binary64 with a request-owned splitmix64 RNG; `--temperature`/`--seed` with early validation; greedy is the explicit temperature-0 mode; sampler and raw-model logprobs recorded per selection (T0-T4) | A GPU or batched sampler, top-k/top-p truncation, and the migration's performance (host selection time, GC, TTFT, tokens/s) |
 | Training | The parameter lifecycle, the backward/loss/AdamW layer and the SFT bring-up, with checkpoint/resume and independent gradient tests (Stages 3-5) | OPD/DAPO/PPO, an online RL loop, and more than one device |
 | Rollout | Greedy single-request inference; an engine-driven stochastic rollout bound to a borrowed version, group objectives (GSPO/GRPO) and a bounded admission queue (Stages 5-8) | An online RL loop, asynchronous GPU scheduling (snapshots, device leases, publication transfer) and throughput measurement |
 
@@ -1157,19 +1157,66 @@ for controlled replay tests.
 
 ### Target behavior and scope
 
-**Status: proposed and unimplemented.** No part of T0-T4 exists in this repository:
-the CLI still has neither a temperature nor a seed option, `src/Infer/Sampling.hs` and
-its test modules are not present, and the milestones below remain unchecked. The
-`sampler_softmax_cdf` region in `regions.c` is what a later revision would fill in.
+**Status: T0-T4 are implemented and the CLI default is temperature 1, 2026-09-26.** The
+selector and the RNG are `src/Infer/Sampling.hs`; the shared configuration and its
+validation are `src/Infer/Config.hs` (`SamplingConfig`, `parseSampling`); the generation
+loop takes one `SamplingConfig` through one `stepToken` at both entry points; `Main` adds
+`--temperature`/`--seed`, validates them **before** any model or tokenizer allocation and
+reports the resolved temperature, seed and sampler version on stderr. Gates:
+`cabal test infer-generation-tests` (which now runs `tests/SamplingSpec.hs`: the frozen
+splitmix64 vectors, the CDF boundaries, the endpoint rules, shift invariance, overflow and
+underflow, the draw-count contract, and the four loop-level checks the stub's arbitrary
+rows made possible) and `tests/test_sampling_cli.py` (32 CLI checks, all of them early
+validation against a non-existent model directory). The delivery notes:
 
-The current implementation is **greedy decoding**, not stochastic sampling:
-`src/Infer/Generation.hs::generate` and `generateStreaming` select argmax at
-prefill and every decode step. `src/Infer/Config.hs` and `src/Main.hs` have no
-temperature or seed fields. `src/Infer/FFI/Engine.hs` already returns host FP32
-logits as `[Float]`; the first sampler therefore belongs in Haskell and needs no
-C ABI, CUDA kernel, weight format or architecture-descriptor change.
+- **the arithmetic is the plan's.** Each `Float` logit widens to `Double` before the
+  subtraction and the division; `a_i = (z_i - m)/tau`, `w_i = exp(a_i)`, `Z` a left fold in
+  token order, `ell_sampler = a_i - log Z` and `ell_model = (z_i - m) - log(sum exp(z_j - m))`
+  computed only when the record is requested. The inverse CDF takes the first
+  *positive-weight* token whose ordered prefix exceeds `u*Z`, so a zero-mass leading token
+  cannot be taken at `u = 0` and an exact boundary belongs to the following bin. The four
+  greedy call sites are gone: both entry points select through `stepToken`, at temperature
+  0 that is the lowest-id `argmax` with **no draw consumed**, and above 0 it is one draw per
+  selected token.
+- **the RNG is splitmix64 implemented in this module rather than a pinned dependency.**
+  What "version-pinned" protects is the algorithm's behaviour across builds, so the module
+  pins the published gamma and mix constants and `tests/SamplingSpec.hs` freezes the seed
+  to-word vectors (seed 0's first word is splitmix64's published `0xe220a8397b1dcdaf`),
+  which is strictly more stable than a version bound and keeps a new Hackage dependency out
+  of the build. The API is Word64-in/Word64-out and the mapping is the plan's
+  `u = (x >> 11) * 2^-53`.
+- **the greedy fixtures now select T=0 explicitly**, which the section above requires: the
+  fifteen pre-existing generation fixtures pass unchanged with an explicit greedy config,
+  and a request that omits `--temperature` samples at 1.0. The CLI reports
+  `sampling: temperature=..., seed=..., sampler=host-binary64-cdf-1` on stderr, keeping the
+  metadata out of the generated text, and an omitted seed is drawn once from `/dev/urandom`
+  (a missing source is an error, not a fixed seed).
+- **the review caught a third bug the fixture had been hiding**: `ell_model` was computed
+  from `a_i = (z_i - m)/tau`, which is only the raw-model offset when `tau = 1`, so every
+  selection made at a temperature other than 1 recorded a wrong raw-model log-probability.
+  The test that should have caught it had chosen a `u` that selected the row's *maximum*
+  token, where `z_i = m` makes both normalisations collapse to the same number; the
+  assertion is now on a non-maximum token and additionally requires the two recorded
+  log-probabilities to differ at `tau /= 1`.
+- **one rule could not be reached, and that is recorded.** The plan's endpoint correction -
+  "if floating multiplication rounds `r` up to `Z`, select the last positive-weight token" -
+  is defensive here: because `Z` is at most the vocabulary size and `u <= 1 - 2^-53`,
+  `u*Z < Z` always and the scan always finds a bin, so no admitted `u` exercises the branch.
+  The reachable half of the rule *is* asserted: the largest admitted `u` cannot select an
+  arbitrary final entry (a trailing zero-mass token is skipped for the last positive one).
+- **not done: the measurements T4 lists.** Host selection time, allocations/GC, TTFT and
+  tokens/s are **not** measured; the fixed-seed and greedy CLI smoke runs are, and they are
+  recorded in the worklog rather than in a gate that would need the checkpoint and a GPU.
 
-Proposed end state, after T0–T4 gates pass:
+
+Until this migration the implementation was **greedy decoding**: `generate` and
+`generateStreaming` selected argmax at prefill and every decode step, and neither
+`Config` nor `Main` had a temperature or a seed. `Infer.FFI.Engine` already returned host
+FP32 logits as `[Float]`, so the first sampler belonged in Haskell and needed no C ABI,
+CUDA kernel, weight format or architecture-descriptor change - which is where it now is
+(`src/Infer/Sampling.hs`, one `stepToken` at both entry points).
+
+The end state, which is what the implementation below does:
 
 | Input | Behavior |
 |---|---|
@@ -1311,14 +1358,14 @@ not the C stub; absent model/runtime prerequisites mean skipped/unverified, not
 a passing GPU gate. These new modules/options/tests are planned, not implemented
 by this document edit.
 
-- [ ] **T0 — Lock configuration and greedy baseline.** Write tests for default
+- [x] **T0 — Lock configuration and greedy baseline.** Write tests for default
   temperature, T=0/T>0, invalid numeric inputs, seed range and configuration
   parity; extend greedy tests for exact ties. Define a shared `SamplingConfig`
   with validated Double temperature and optional Word64 seed, used by Main and
   generation rather than duplicated defaults. Audit greedy examples/scripts
   before changing the default; use explicit greedy in regression fixtures.
   Invalid configuration must fail before any model allocation.
-- [ ] **T1 — Implement and test the pure selector.** Separate preparing weights
+- [x] **T1 — Implement and test the pure selector.** Separate preparing weights
   from choosing with a supplied u, so deterministic CDF/normalization tests do
   not depend on PRNG behavior. Add independent softmax/logprob reference values
   and boundary tests before implementation. Initially consume the existing
@@ -1327,14 +1374,14 @@ by this document edit.
   kernel is necessary. Register `Infer.Sampling` and `SamplingSpec` in affected
   Cabal components; do not inadvertently make unrelated config-only tests
   depend on random IO.
-- [ ] **T2 — Add request RNG and unify token selection.** Pin the RNG dependency
+- [x] **T2 — Add request RNG and unify token selection.** Pin the RNG dependency
   in the executable and generation-test component, add fixed word/uniform test
   vectors, then pass one state through all four current argmax call sites.
   Both generation entry points use the same selector and next-state contract.
   Resolve options once in Main and pass the validated configuration instead of
   reading globals/environment per token. Extend the C stub to supply arbitrary
   per-step vocabulary rows, not only one +1 winner with all other logits -1.
-- [ ] **T3 — Verify generation lifecycle and real CLI behavior.** Preserve
+- [x] **T3 — Verify generation lifecycle and real CLI behavior.** Preserve
   first-token budget counting, returned EOS, pending-token consumption, engine
   error propagation and stream flushing/cleanup. A sampled EOS is handled by
   the same stop path as a greedy EOS. Characterize the existing first-EOS versus
@@ -1344,7 +1391,7 @@ by this document edit.
   The current `infer-generation-tests` does not compile CLI Main: use the
   executable runner for option/default/help and stderr-seed checks, including
   invalid arguments with a nonexistent model path to prove early validation.
-- [ ] **T4 — Admit default change and document boundaries.** First run CPU
+- [x] **T4 — Admit default change and document boundaries.** First run CPU
   distribution/RNG/lifecycle tests, then real-model greedy regression and
   fixed-seed temperature smoke tests. Compare stream/non-stream returned IDs,
   rerun the same seed under the same manifest, and measure host selection time,
@@ -1911,10 +1958,12 @@ Before positive-lag async experiments, resolve:
   policy switching, arbitrary replay buffer or combined TP+EP in the first trainer.
 - GSPO is included with a precise synchronous objective. Async RL is a staged
   proposal, not a declaration that stale-policy GSPO is solved.
-- Ordinary temperature sampling is a separate T0–T4 migration: planned default
-  T=1 with explicit greedy T=0, without top-k/top-p, GPU sampling or stochastic
-  speculation. Seed replay, distributional correctness and model quality are
-  separate claims. This plan does not change today's greedy implementation.
+- Ordinary temperature sampling is a separate T0–T4 migration, and it has landed:
+  default T=1 with explicit greedy T=0, without top-k/top-p, GPU sampling or
+  stochastic speculation. Seed replay and the binary64 distribution are gated
+  (`tests/SamplingSpec.hs`); model *quality* under sampling is not measured, and the
+  migration's performance (host selection time, GC, TTFT, tokens/s) is not either,
+  which the section records.
 - Fusion, W4A16 and greedy speculative decoding are independent inference
   proposals, not implemented features or prerequisites for SFT. Their first
   admissions exclude quantized training/KV state and stochastic speculation;

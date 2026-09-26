@@ -92,12 +92,18 @@ def main():
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--intermediate", type=int, default=None,
+                        help="intermediate size override. A test uses 384 so that a tp=2 input "
+                             "split lands on 192, which is not a group boundary: the sharding "
+                             "gate needs a fixture where the plan's alignment rule can refuse.")
     args = parser.parse_args()
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(args.seed)
     config = tiny_config(args.layers)
+    if args.intermediate is not None:
+        config.intermediate_size = args.intermediate
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = Qwen3ForCausalLM(config).eval()
     # The engine loads BF16 weights only, and a training run has to start from the

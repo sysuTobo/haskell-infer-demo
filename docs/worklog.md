@@ -15,9 +15,12 @@ backward/loss/optimizer layer and the synchronous SFT/rollout baseline
 (`csrc/include/backward.h`, `csrc/include/train_loop.h`), the numerical-alignment
 decision (`csrc/include/alignment.h`), the GSPO/GRPO group objectives and the bounded
 rollout queue (`csrc/include/rollout_queue.h`), and the temperature-sampling migration
-(`src/Infer/Sampling.hs`, T0-T4). All are described below. What remains a proposal is the
-asynchronous GPU half of Stage 8 (snapshots, device leases, publication transfer, throughput
-measurement) and the inference-optimization track (F/Q/S).
+(`src/Infer/Sampling.hs`, T0-T4). All are described below. **The inference-optimization track
+(F/Q/S) is implemented and measured**: F1's packed dense gate/up GEMM and the weight-only INT4
+decode path (with per-rank tensor-parallel slicing) are *admitted*, while the fused residual+norm
+(F2), the four F3 candidates and speculative decoding (S3) are implemented, gated and *declined by
+their own measurements*. What remains a proposal is the asynchronous GPU half of Stage 8
+(snapshots, device leases, publication transfer, throughput measurement).
 
 Last updated: 2026-09-26.
 
@@ -34,7 +37,7 @@ and hardware" are the exceptions, and they say so.
 | Gate | Result |
 |---|---|
 | `cargo test --locked --offline` | 11/11 |
-| `ctest --test-dir csrc/build-libs` | 33/33 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_backward`, `test_train_loop`, `test_alignment`, `test_gspo`, `test_rollout_queue`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_backward_kernels`, `test_sft`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops`, `test_quantization_format`, `test_quantization_format_python`, `test_quant_manifest`, `test_quantization_converter`, `test_quantization_kernel` (on a **shared** GPU `test_engine_resources` reads the device's free memory before and after four failing `engine_create` rounds, so it needs a quiescent device: 2026-09-26 a co-tenant holding 28 GB on device 0 moved the reading by 736 MiB and failed a 16 MiB slack, the same test passed on the idle device 1, and the suite's second run of the day — with the device free — was 25/25) |
+| `ctest --test-dir csrc/build-libs` | 34/34 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_backward`, `test_train_loop`, `test_alignment`, `test_gspo`, `test_rollout_queue`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_backward_kernels`, `test_sft`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops`, `test_quantization_format`, `test_quantization_format_python`, `test_quant_manifest`, `test_quantization_converter`, `test_quantization_kernel`, `test_quantized_ffn` (on a **shared** GPU `test_engine_resources` reads the device's free memory before and after four failing `engine_create` rounds, so it needs a quiescent device: 2026-09-26 a co-tenant holding 28 GB on device 0 moved the reading by 736 MiB and failed a 16 MiB slack, the same test passed on the idle device 1, and the suite's second run of the day — with the device free — was 25/25) |
 | `ctest test_backward` (CPU, Stage 4) | the Stage-4 region table against the Stage-1 inventory in both directions; masked CE, reverse KL, the token/sequence clipped objective and the group advantage reduction against an independent FP64 implementation with its gradient checked by central difference; AdamW against FP64 in PyTorch's own order (including the bias-correction/eps ordering) plus the BF16 publication; the checkpoint round-trip with every failure mode refused; a deterministic fixture overfitting 32/32 through this stage's own loss and optimizer, and a 12+8 resumed run landing bitwise on the uninterrupted 20-step parameters, moments and cursor |
 | `ctest test_backward_kernels` (Stage 4, 2× A40) | every backward against a double-precision definition or a central difference of one: elementwise gates, residual branches, plain/Gemma RMSNorm, the GDN L2 norm, the gated norm, embedding (repeated ids summed), RoPE (the transposed rotation inverting the forward's), the Q/gate re-interleave, GEMM dX/dW, masked CE, AdamW, conv1d (d_x, d_weight, d_bias, d_state_in), GDN prepare (d_conv_out, d_a, d_b, d_A_log, d_dt_bias) — all 1e-8…1e-6 except the finite-difference rows at 1e-7…1e-3; attention forward+LSE vs the definition (2.1e-3 BF16 out, 1.5e-3 LSE) and its backward vs the FD of the definition (dQ 2.5e-4, dK 2.8e-4, dV 1.0e-3), with an analytic double reading of the device LSE reproducing the FD, so the base-2 convention is pinned; the GDN core backward with a nonzero initial state and a nonzero final-state gradient, one chunk and three chunks both matching the same reference (≤1.0e-7), d_state_start included; dQ and the whole GDN core backward bitwise reproducible, dK/dV reported (atomics) |
 | `ctest test_sft` (Stage 5, A40/L20) | SFT on the tiny dense checkpoint (0.72M params, tied embeddings, prompt-masked target) against a `transformers` training run: the first step's loss matches to 6.3e-05 relative; the tied parameter's gradient (after one large-lr AdamW step, where the move's sign *is* the gradient's) has cosine **0.9990** over all 131072 elements; the engine overfits 7.0322 → 0.6084 and the reference 7.0318 → 0.5652; the forward is bitwise reproducible run to run; the training state (FP32 masters and both optimizer moments) round-trips through export/import bitwise; and a pipeline/TP placement, an optimizer step during a live step and a NaN logit are each refused. The rollout section drives `engine_rollout_sample`: the record's fields, the seed reproducing a completion bitwise and a shorter rollout being its prefix, EOS vs the length limit, **20000 draws** whose mean `-log p` is 6.90837 ± 0.00162 against the distribution's entropy of 6.90495 (+2.11 sigma) with all 415 counted bins inside 4.5 sigma (worst 2.94), the record's version being the one the engine *read* (a +1 stamp refused) and an optimizer step refused while the borrow is live, and — for the same completion — the trainer's FP32 denominator differing from the sampler's FP64 one by 4.768e-07 (ratio 0.99999976), with the recorded denominator bitwise unchanged after a publish. Its **group** section generates four completions of one prompt (seeds as part of the fixture), gives each a reward from a deterministic check on the completion, records them into one `TrainGroup` whose version is pinned (a fifth completion generated *after* a publication is refused), reads the rewards back, reduces the advantages (+1.000/−1.000/+1.000/−1.000 at mean 0.5 and population std 0.5), refuses a zero-variance subset unless the caller waives it, runs the **sequence-level objective over the engine's own record** (ratio exactly 1 at unchanged parameters, the gradient's sign following the advantage, +0.25 nat/row giving 1.284025 against the records' 1.284025), and checks the offload declaration round-trips and is cleared at the boundary |
@@ -50,7 +53,7 @@ and hardware" are the exceptions, and they say so.
 | `tests/attention_backward_feasibility.py` (claim E backward) | the analytic backward from `(q,k,v,LSE)` reproduces torch.autograd in float64 to 1.7e-16; consuming the LSE without the log2 conversion moves `dv` by 3.04; a paired library (torch SDPA bf16) differs by 3.2e-3 forward / 2.8e-2 on gradients |
 | `ctest -R test_region_inventory` (CPU) | the inventory covers the plan's 21 in-scope regions and nothing else, agrees with the manifest registry in both directions, and every `exact` pair is backed by that registry's `deterministic` |
 | `ctest -R test_region_cases` (2× A40) | 18/18 registered `exact`/`unverified` pairs adjudicated; 8 `exact` pairs bitwise (output and persistent state); 7 unsupported shapes/cases rejected with a named reason; no trainer case offered by any of the 21 regions |
-| `cabal test all --enable-tests` | `infer-tests` 66/66, `infer-generation-tests` 54/54 (15 generation-loop plus 35 temperature-sampling plus 4 loop-level sampling), `infer-trainer-tests` 9/9 (the Haskell and C teacher-forcing plans must agree) |
+| `cabal test all --enable-tests` | `infer-tests` 66/66 (`Spec.hs` 46 descriptor/placement cases plus `ManifestSpec` 20), `infer-generation-tests` 74/74 (`GenerationSpec.hs` 39 - the generation loop, the speculative round arithmetic and the two-handle engine stub - plus `SamplingSpec` 35), `infer-trainer-tests` 9/9 (the Haskell and C teacher-forcing plans must agree) |
 | `manifest --model-dir <27B> --gpus 0,1 --check` | exit 0: a 12868-byte canonical document over 27 recorded regions carrying all three identities plus the parameter identity, build/runtime provenance fully established, two queries byte-identical, no unestablished provenance path, and every digest re-derived independently by `tests/manifest_check.py`. The byte count and the identities are the ones the *pre-Stage-4* registry produced; Stage 4 edits three registry rows (`attention_core`'s LSE, `masked_loss`'s stage, and `backward` from `not_implemented` to the backward inventory), which is a numerical-policy change: `ctest test_manifest`'s identity matrix is the gate that says only `numerical_policy_id` (and the `regions_sha256` inside it) moves, and the literals are re-derived by the same command |
 | Two independent 27B captures, strict comparison | bitwise identical (`max_abs == 0` on every array) and verdict `admitted` (exit 0) — the identities, parameter identity and provenance all agree, over the two captures' own `numerical_policy_id` (`012c264c…314f0e`, taken before Stage 4's registry edit) |
 | Pre-refactor golden vs a fresh 27B capture | bitwise identical (`max_abs == 0` on every array) with verdict `legacy/unverified` (exit 2) — the older capture's numeric arrays are compared, but nothing about its identity is invented. Re-run against the Stage-1 tree and again after Stage 3's engine changes, which is what shows the conv-activation export, the registry change and the training runtime are all numerically inert on the inference path |
@@ -106,6 +109,41 @@ greedy-token agreement — never a relaxation of the top-1 check.
   (`cuobjdump`) only — there is no H200 here.
 
 ## Recently completed
+
+**Q3: quantized tensor parallelism is admitted by slicing, expert parallelism stays refused** (plan
+Q3; verified 2026-09-26).
+
+- `engine_load_quantized_ffn` no longer refuses a replicated engine. Each rank loads the slice the
+  descriptor's `role_extent` selects, in the same places the BF16 loader slices the weight: an
+  output-row/head split (`OUT_DIM`/`OUT_HEADS`) slices the packed rows and the scale rows together,
+  and an input-column split (`IN_DIM`, the down projection's K) slices the packed columns and their
+  scales. The **scales stay the global ones the slice selects** - the loader copies the artifact's
+  own scale values and never rescales them per rank, which is the per-rank requantization the plan
+  forbids.
+- Two things are refused rather than approximated: a split whose column offset is not a multiple of
+  the group width (a slice inside a group would need a scale shared with columns this rank does not
+  hold - `"layer 0's rank 1 splits K at a non-group boundary, which cannot retain the global
+  scales"`), and a slice that is not this rank's dense MLP extent, so the kernel is never handed a
+  buffer whose declared extents are the checkpoint's rather than the rank's.
+- **The equivalence is measured against the same artifact.** `tests/test_tp.py --w4a16-dir` loads
+  the deployment artifact whole in its layer-split arm and sliced per rank in its tp = 2 arm, and
+  requires identical greedy tokens under a bounded rms. On Qwen3-4B (2x A40) it passes with step rms
+  **0.023-0.099** and every top-1 matched (`top1 279/279`, `73726/73726`), including on the
+  129-token boundary prompt (`[553, 3757, 43940, 11, 73526, 386]`, identical across arms).
+- `tests/test_quantized_sharding.py` is the refusal gate: the whole artifact loads at tp = 1 and
+  produces finite logits (the control); a sidecar naming another model's layers is refused by the
+  coverage check (`"layer 0's mlpGateUp pair is [19456, 2560], the checkpoint's gate+up is [512,
+  128]"`); and a tp = 2 split that cuts K inside a group on the 384-intermediate fixture is refused
+  by name.
+- The first cut of the down slice copied **full-width** rows instead of the rank's K - the kernel
+  was told the rank's extents while the buffer held the checkpoint's row width - which the tp = 2
+  arm caught as a wild divergence (rms 3-7) before the greedy-token comparison; the numbers above
+  are the fixed slice, and the full 34/34 suite re-ran green with the fix.
+- **Expert parallelism and additional roles stay refused**, by Q3's own interim rule: Q's initial
+  scope is the dense FFN, so no expert role is an admitted role and there is nothing to slice -
+  `ep_size > 1` is refused explicitly, with ordinary BF16 TP/EP support unchanged. The plan's
+  "future GDN row gathering must also gather scales" is a condition on quantizing a GDN role, which
+  no stage does.
 
 **F2: the fused residual+norm is implemented, gated, and measured - and not admitted** (plan F2;
 verified 2026-09-26).
@@ -235,8 +273,9 @@ S3; verified 2026-09-26).
   agreeing**, the rollback leaves the batch engine exactly where a clean prompt is, and a short
   buffer, a window past `max_chunk`, a truncation past the sequence and a GDN model are all
   refused. The scripted-engine half is in `cabal test infer-generation-tests` (**71 examples, 0
-  failures**), where two new counters pin that a rejecting round truncates the target and a fully
-  accepted one does not, and that the draft advances rather than replays.
+  failures** at this increment; 74 in the current tree), where two new counters pin that a
+  rejecting round truncates the target and a fully accepted one does not, and that the draft
+  advances rather than replays.
 - One bug of mine the wiring exposed: with truncation-based rollback the ordinary-step branch had
   left the draft one token behind, which the sequence-length assertion caught.
 - **Not done**: S2 (checkpoints, so a rejected round is O(1) instead of truncate-or-catch-up and
@@ -267,8 +306,9 @@ verified 2026-09-26).
   had happened rather than on what was consumed), and the consumed history is what the retention
   claim is asserted against. The pre-existing fixtures' call-indexed semantics is untouched - a
   `NULL` handle still means the default one - and all of them still pass.
-- Gates: `cabal test infer-generation-tests` is **71 examples, 0 failures** (63 pre-existing, 9 new
-  round-arithmetic cases, 8 two-handle engine cases), run locally and on the pod; and
+- Gates: `cabal test infer-generation-tests` is **74 examples, 0 failures** (35 temperature-sampling
+  in `SamplingSpec`, 39 in `GenerationSpec` including the new round-arithmetic and two-handle engine
+  cases), run on the pod; and
   `tests/test_speculative.py --exe "$(cabal list-bin ...)"` is **18 checks** over the CLI refusals
   on the pod. The plan's list is covered: k = 1, full acceptance, rejection at every position,
   repeated rejection, lowest-ID ties, first/accepted/correction/bonus EOS, budgets 0/1 and the
@@ -291,10 +331,11 @@ model-quality gate; verified 2026-09-26).
   format pays. Dequantizing for batched M is exactly what the Q2 kernel was written to avoid, and
   the tiled kernel that would avoid both is inadmissible at these shapes.
 - The load is **all-or-nothing across dense layers** (a layer with a pair but no `mlpDown` would
-  silently run mixed precision), refuses tensor parallelism (the converter quantizes whole
-  tensors; a rank's shard is not what the sidecar describes), and checks each entry against *this*
-  layer's own extents - `role_extent` for the gate/up/down roles - and each artifact's SHA-256
-  against the bytes on disk before anything is uploaded.
+  silently run mixed precision), **admits tensor parallelism by slicing** the whole-artifact
+  operands to each rank's `role_extent` (plan Q3, below; at the time of the Q2 increment it refused
+  a replicated engine), and checks each entry against *this* layer's own extents - `role_extent` for
+  the gate/up/down roles - and each artifact's SHA-256 against the bytes on disk before anything is
+  uploaded.
 - **A training store and the INT4 operands exclude each other**, in both directions and with the
   reason named: a publication rewrites the BF16 compute weights and would leave the packed
   operands describing the old ones, so a training step on such an engine would compute gradients
@@ -1194,12 +1235,13 @@ CPU case pinning the behaviour.
   out. Prefill therefore still runs cuBLAS BF16, which is also why both weight forms are
   resident when INT4 is loaded.
 - **Quantization stops at dense FFN decode.** Q0's format and reference, Q1's converter and
-  sidecar and its reader, Q2's kernels and the engine-side load and dispatch are implemented,
-  gated and measured. What is not done: any role other than the dense FFN's gate/up/down (MoE,
-  attention and GDN roles are outside Q's scope), activation quantization or QAT (the plan scopes
-  both out), and a region-inventory entry for the INT4 operand itself - the numerical-policy
-  field and the kernel gate carry that identity today, while a Stage-6 alignment verdict for the
-  packed path would be the inventory's job.
+  sidecar and its reader, Q2's kernels and the engine-side load and dispatch, and Q3's tensor-parallel
+  slicing are implemented, gated and measured. What is not done: any role other than the dense FFN's
+  gate/up/down (MoE, attention and GDN roles are outside Q's scope, so **expert parallelism has
+  nothing to slice and is refused** by Q3's interim rule while ordinary BF16 EP is unchanged),
+  activation quantization or QAT (the plan scopes both out), and a region-inventory entry for the
+  INT4 operand itself - the numerical-policy field and the kernel gate carry that identity today,
+  while a Stage-6 alignment verdict for the packed path would be the inventory's job.
 - **F0's memory-traffic and host-synchronization columns are not measured.** The plan's F0
   asks for four quantities per region; this repository now measures two of them (CUDA time
   and launch count). Per-region **memory traffic** and **host-synchronization counts** need a

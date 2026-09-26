@@ -40,10 +40,17 @@ RMS_GATE = 0.05
 STEPS = 10
 
 
-def run_case(lib, model_dir, descriptor, devices, prompt, steps):
-    """Greedy-decode `steps` tokens and return the logits seen at each step."""
+def run_case(lib, model_dir, descriptor, devices, prompt, steps, w4a16_dir=None):
+    """Greedy-decode `steps` tokens and return the logits seen at each step.
+
+    With `w4a16_dir` the dense FFN's packed operands are loaded too, so a placement comparison
+    also covers the quantized path: the descriptor's shard view slices the artifact the same way
+    it slices the BF16 weight, and both arms have to agree."""
     engine, vocab = create_engine(lib, model_dir, descriptor, devices)
     try:
+        if w4a16_dir:
+            loaded = lib.engine_load_quantized_ffn(engine, w4a16_dir.encode())
+            assert loaded == 0, lib.engine_last_error().decode()
         logits = np.empty(vocab, dtype=np.float32)
         ids = np.ascontiguousarray(prompt, dtype=np.int64)
         rc = lib.engine_prefill(engine, ptr(ids), len(ids), ptr(logits))
@@ -70,6 +77,10 @@ def main():
     parser.add_argument("--devices", default="0,1")
     parser.add_argument("--steps", type=int, default=STEPS)
     parser.add_argument("--rms-gate", type=float, default=RMS_GATE)
+    parser.add_argument("--w4a16-dir", default=None,
+                        help="load the packed INT4 dense-FFN operands in both arms, which turns "
+                             "this into the sharding gate: the second arm slices the same "
+                             "artifact instead of loading it whole")
     parser.add_argument("--ep", type=int, default=1,
                         help="expert-parallel ranks for the second arm "
                              "(> 1 compares the layer split against EP on MoE models)")
@@ -107,10 +118,12 @@ def main():
     cases = [("main", PROMPT_MAIN), ("boundary129", long_prompt)]
     for name, prompt in cases:
         start = time.monotonic()
-        tokens_a, logits_a = run_case(lib, args.model_dir, base, devices, prompt, args.steps)
+        tokens_a, logits_a = run_case(lib, args.model_dir, base, devices, prompt, args.steps,
+                                      args.w4a16_dir)
         print(f"[{name}] layer split: {tokens_a}  ({time.monotonic() - start:.0f}s)", flush=True)
         start = time.monotonic()
-        tokens_b, logits_b = run_case(lib, args.model_dir, other, devices, prompt, args.steps)
+        tokens_b, logits_b = run_case(lib, args.model_dir, other, devices, prompt, args.steps,
+                                      args.w4a16_dir)
         print(f"[{name}] replicated ({label}): {tokens_b}  ({time.monotonic() - start:.0f}s)",
               flush=True)
 
@@ -125,8 +138,10 @@ def main():
                 failures.append({"case": name, "step": step, "rms": rms})
 
     assert not failures, failures
+    kind = " (with the packed INT4 operands, so the artifact is sliced per rank too)" \
+        if args.w4a16_dir else ""
     print(f"placement equivalence passed ({label} vs layer split: rms <= {args.rms_gate}, "
-          "greedy tokens identical)")
+          f"greedy tokens identical){kind}")
     return 0
 
 

@@ -1,10 +1,12 @@
 # Plan: Numerical Execution Contract, Haskell Training, and Asynchronous RL
 
 Status: **Stages 0-5 are implemented**, and so are Stage 6's decision layer,
-Stage 7's GSPO/GRPO objectives, Stage 8's lag-zero admission protocol and the
-temperature-sampling migration (T0-T4). Still proposals: the asynchronous GPU half of
-Stage 8 (snapshots, device leases, publication transfer, throughput measurement) and
-the inference-optimization track (F/Q/S). What has landed: the versioned execution
+Stage 7's GSPO/GRPO objectives, Stage 8's lag-zero admission protocol, the
+temperature-sampling migration (T0-T4), and the inference-optimization track (F/Q/S) —
+of which F1 and the weight-only INT4 decode path are *admitted*, while F2, F3 and S3 are
+implemented, gated and *declined by their own measurements*. Still a proposal: the
+asynchronous GPU half of Stage 8 (snapshots, device leases, publication transfer,
+throughput measurement). What has landed: the versioned execution
 manifest with capture provenance, the region inventory with its cross-case harness, the
 feasibility/invariance experiments, the trainable runtime's parameter lifecycle, the
 backward/loss/optimizer layer, the synchronous SFT/rollout baseline, the
@@ -37,9 +39,9 @@ changes and supplies the sampling foundation the Stage-5 rollout's warm-up descr
 A separate [inference optimization track](#inference-optimization-track) covers
 operator fusion, weight-only quantization and speculative decoding. It shares
 the contract and measurement infrastructure, but neither blocks the initial
-trainer nor inherits trainability or exactness from it. All sampling/optimization
-APIs, formats and milestones below are proposals; this revision changes
-documentation only and authorizes no implementation or GPU experiment.
+trainer nor inherits trainability or exactness from it. The track's decision
+milestones below are what have since been implemented and measured: see the F, Q
+and S status blocks for what each experiment's own gate admitted or declined.
 
 Sharing implementations reduces duplication but does **not** establish either
 bitwise agreement or shared parameter storage by construction:
@@ -1488,11 +1490,13 @@ sampler alone does not satisfy that extension or Stage 5's trajectory ledger.
 
 ### Scope, dependencies and numerical identities
 
-**Status: proposed and unimplemented.** None of F, Q or S exists: no fusion was applied,
-no quantized artifact or `weights.manifest.json` sidecar was produced, and no draft/target
-speculative path was written. The region inventory notes where each change would land. This
-track was not touched by the Stage 6-8 work, which is per the recommendation below - it is
-"a prioritization, not a hard dependency".
+**Status: implemented and measured, 2026-09-26.** All three tracks were built: a fusion was
+applied (F1, admitted) and F2 was built and gated too (not admitted), a quantized artifact and
+its `weights.manifest.json` sidecar are produced and consumed (Q0-Q3, the decode path admitted),
+and a draft/target speculative path was written (S0-S3, not admitted by its own measurement).
+The region inventory noted where each change would land; the per-track status blocks below record
+what each gate decided. This track was taken up only after the Stage 6-8 work, which is per the
+recommendation below - it is "a prioritization, not a hard dependency".
 
 Recommended implementation order: **baseline/provenance → fusion → weight-only
 quantization → speculative decoding → measured combinations**. This is a
@@ -1809,6 +1813,38 @@ deployment target is max_abs 0.0835 / rms 1.37e-3 over 192 role instances in 170
 operand is a numerical-policy change and nothing else: `numerical_policy_id` moves, `semantic_id`
 and `deployment_id` do not, and `manifest_test.c` pins that.
 
+**Q3 status, 2026-09-26: tensor parallelism is admitted by slicing, and expert parallelism stays
+refused by this item's own rule.** `engine_load_quantized_ffn` no longer refuses a replicated
+engine: each rank loads the slice the descriptor's `role_extent` selects, in the same places the
+BF16 loader would slice the weight. An output-row/head split (`OUT_DIM`/`OUT_HEADS`) slices the
+packed rows and the scale rows together; an input-column split (`IN_DIM`, the down projection's K)
+slices the packed columns and their scales. Two things are refused rather than approximated: a
+split whose column offset is not a multiple of the group width - a slice inside a group would need
+a scale shared with columns this rank does not hold, and re-deriving one is exactly the per-rank
+requantization the plan forbids - and a slice that is not this rank's dense MLP extent, so the
+kernel is never handed a buffer whose declared extents are the checkpoint's rather than the
+rank's. **The scales stay the global ones the slice selects**: the loader copies the artifact's own
+scale values; it does not rescale them per rank.
+
+The equivalence is a measurement, not an assertion. `tests/test_tp.py --w4a16-dir` runs its two
+arms against the *same* artifact - the layer-split arm loads it whole and the tp = 2 arm loads it
+sliced per rank - and requires identical greedy tokens under a bounded rms. On Qwen3-4B (2x A40) it
+passes with step rms 0.023-0.099 and every top-1 matched (`top1 279/279`, `73726/73726`), on the
+129-token boundary prompt too (`[553, 3757, 43940, 11, 73526, 386]`, identical across arms).
+`tests/test_quantized_sharding.py` is the refusal gate: the whole artifact loads at tp = 1 and
+produces finite logits; a sidecar naming another model's layers is refused by the coverage check
+("layer 0's mlpGateUp pair is [19456, 2560], the checkpoint's gate+up is [512, 128]"); and a tp = 2
+split that cuts K inside a group on the 384-intermediate fixture is refused by name ("layer 0's
+rank 1 splits K at a non-group boundary, which cannot retain the global scales"). The first cut of
+the down slice copied full-width rows instead of the rank's K - the kernel was told the rank's
+extents while the buffer held the checkpoint's row width - which the tp = 2 arm caught as a wild
+divergence (rms 3-7) before the greedy-token comparison; the numbers above are the fixed slice.
+Expert parallelism and additional roles follow the interim rule: no expert role is an admitted role
+(Q's initial scope is the dense FFN), so there is nothing to slice and `ep_size > 1` is refused
+explicitly, with ordinary BF16 TP/EP support unchanged. The plan's "future GDN row gathering must
+also gather scales" is not reachable yet because no GDN role is quantized; it stays a condition on
+that work rather than an omission here.
+
 **Q0 and Q1 status.** — the format, its reference, the converter, the sidecar and its reader;
 the Q2 kernel consumes the format, and the engine does not yet consume the sidecar.**
 `scripts/quantize_weights.py` converts a
@@ -1971,7 +2007,7 @@ These are proposed new files, not current capabilities.
   separately before choosing specializations. If F1 is active, concatenate
   packed rows and scale rows consistently and preserve its activation layout.
   Unsupported kernels/shapes fail during creation, not midway through a request.
-- [ ] **Q3 — Add sharding and additional roles as separate admissions.** TP
+- [x] **Q3 — Add sharding and additional roles as separate admissions.** TP
   output-row/head splits slice corresponding scale rows; input-column splits
   must align with group and packing boundaries and retain global quantization
   scales. Do not requantize independently per rank. EP slices packed experts
@@ -2081,8 +2117,8 @@ to two handles with an observable consumed history - and to a *prefix-indexed* s
 which reset-and-replay would not be faithful - and covers the plan's list: k = 1, full acceptance,
 rejection at every position, repeated rejection, lowest-ID ties, first/accepted/correction/bonus
 EOS, budgets 0/1 and the window boundaries, context exhaustion, and the refusal of a differing
-vocabulary. 71 examples pass in `cabal test infer-generation-tests` (locally and on the pod), and
-`tests/test_speculative.py` adds the 18 CLI refusals. **What is not done**: S1's bounded
+vocabulary. 71 examples passed in `cabal test infer-generation-tests` at this increment (74 in the
+current tree), and `tests/test_speculative.py` adds the 18 CLI refusals. **What is not done**: S1's bounded
 all-position verification and append-cache rollback (the prototype verifies with sequential decode
 calls), S2's checkpoints (so recovery is a full replay), S3's cross-case admission gates, and any
 measurement of acceptance or speed - S0 is explicitly not a speedup.

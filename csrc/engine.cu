@@ -2174,32 +2174,34 @@ static std::string read_text_file(const char *path) {
     return out;
 }
 
-/* Read one artifact (verifying its recorded size, dtype and digest) and upload it to `device`,
- * registering the allocation with the layer so destroy frees it. The host buffer is transient:
- * what stays resident is the packed payload, not a widened copy. */
-static void *upload_artifact(const char *root, const struct QuantArtifact *artifact,
-                             const char *want_dtype, int device, std::vector<void *> &owned,
-                             const char *what) {
-    uint8_t *host = nullptr;
-    size_t length = 0;
-    if (quant_artifact_read(root, artifact, want_dtype, &host, &length, nullptr, 0) !=
-        QUANT_MANIFEST_OK) {
-        throw EngineError(ENGINE_ERR_WEIGHTS, std::string(quant_manifest_last_error()));
-    }
+/* Upload a host buffer and register it with the layer's ownership list. */
+static void *upload_host(const void *host, size_t bytes, int device, std::vector<void *> &owned,
+                         const char *what) {
     void *device_buffer = nullptr;
     check_cuda(cudaSetDevice(device), "Select INT4 device");
-    check_cuda(cudaMalloc(&device_buffer, length), what);
+    check_cuda(cudaMalloc(&device_buffer, bytes), what);
     try {
         owned.push_back(device_buffer);
     } catch (...) {
-        free(host);
         cudaSetDevice(device);
         cudaFree(device_buffer);
         throw;
     }
-    check_cuda(cudaMemcpy(device_buffer, host, length, cudaMemcpyHostToDevice), what);
-    free(host);
+    check_cuda(cudaMemcpy(device_buffer, host, bytes, cudaMemcpyHostToDevice), what);
     return device_buffer;
+}
+
+/* One rank's slice of a quantized artifact: `rows` rows starting at `first_row`, and inside each
+ * of them the `row_bytes` starting at byte `col_byte`. Payload and scales are both row-major, so
+ * the same walk serves both with their own row widths - and the scales copied this way are the
+ * *global* ones the slice selects, which is why a sharded load never requantizes. */
+static void slice_rows(uint8_t *dst, const uint8_t *source, long long source_row_bytes,
+                       long long first_row, long long rows, long long col_byte,
+                       long long row_bytes) {
+    for (long long i = 0; i < rows; ++i) {
+        std::memcpy(dst + i * row_bytes,
+                    source + (first_row + i) * source_row_bytes + col_byte, (size_t)row_bytes);
+    }
 }
 
 int engine_load_quantized_ffn(EngineHandle *eng, const char *manifest_dir) {
@@ -2217,10 +2219,17 @@ int engine_load_quantized_ffn(EngineHandle *eng, const char *manifest_dir) {
         if (quant_manifest_parse(json.c_str(), &manifest, nullptr, 0) != QUANT_MANIFEST_OK) {
             throw EngineError(ENGINE_ERR_WEIGHTS, std::string(quant_manifest_last_error()));
         }
-        if (eng->tp_size > 1 || eng->replicated) {
+        /* Tensor parallelism is admitted by slicing the artifact exactly as the descriptor
+         * slices the weight - the plan's Q3: an output split slices the scale rows, an input
+         * split slices the scale columns, the split has to land on a group boundary, and the
+         * scales stay the global ones the slice selects rather than being re-derived per rank.
+         * Expert parallelism stays refused: no expert role is an admitted role yet, so there is
+         * nothing to slice - which is this item's own interim rule. */
+        if (eng->ep_size > 1) {
             throw EngineError(ENGINE_ERR_CONFIG,
-                              "the converter quantizes whole tensors, so a tensor-parallel "
-                              "engine cannot read them yet");
+                              "the converter quantizes whole tensors and no expert role is "
+                              "admitted, so a quantized expert-parallel engine is refused (plan "
+                              "Q3's interim rule)");
         }
         /* The mirror of engine_train_attach's refusal: a store's publication writes the BF16
          * weights and would leave these operands describing the old ones. */
@@ -2267,50 +2276,149 @@ int engine_load_quantized_ffn(EngineHandle *eng, const char *manifest_dir) {
             const TensorInfo &up_ti = find_role(eng->tensor_index, eng->desc, ROLE_MLP_UP, layer);
             const TensorInfo &down_ti =
                 find_role(eng->tensor_index, eng->desc, ROLE_MLP_DOWN, layer);
-            role_extent(eng->desc, ROLE_MLP_GATE, gate_ti, 0, &gate_view, &gate_split);
-            role_extent(eng->desc, ROLE_MLP_UP, up_ti, 0, &up_view, &up_split);
-            role_extent(eng->desc, ROLE_MLP_DOWN, down_ti, 0, &down_view, &down_split);
-            if (gate_split || up_split || down_split) {
-                throw EngineError(ENGINE_ERR_CONFIG,
-                                  "layer " + std::to_string(layer) +
-                                      "'s FFN weights are sharded, which the sidecar cannot "
-                                      "describe");
-            }
-            const long long rows = gate_view.rows + up_view.rows;
-            if (pair.n != rows || pair.k != gate_view.cols || up_view.cols != gate_view.cols) {
+            /* The manifest describes the *whole* tensor, so it is checked against the
+             * descriptor's checkpoint shapes; what each rank loads is the slice the descriptor's
+             * shard view selects. */
+            const long long full_gate_rows = gate_ti.shape[0];
+            const long long full_gate_cols = gate_ti.ndim > 1 ? gate_ti.shape[1] : 0;
+            if (pair.n != 2 * full_gate_rows || pair.k != full_gate_cols) {
                 throw EngineError(ENGINE_ERR_WEIGHTS,
                                   "layer " + std::to_string(layer) + "'s mlpGateUp pair is [" +
                                       std::to_string(pair.n) + ", " + std::to_string(pair.k) +
-                                      "], its gate+up is [" + std::to_string(rows) + ", " +
-                                      std::to_string(gate_view.cols) + "]");
+                                      "], the checkpoint's gate+up is [" +
+                                      std::to_string(2 * full_gate_rows) + ", " +
+                                      std::to_string(full_gate_cols) + "]");
             }
-            if (down.n != down_view.rows || down.k != down_view.cols) {
+            if (down.n != down_ti.shape[0] || down.k != (down_ti.ndim > 1 ? down_ti.shape[1] : 0)) {
                 throw EngineError(ENGINE_ERR_WEIGHTS,
                                   "layer " + std::to_string(layer) + "'s mlpDown is [" +
                                       std::to_string(down.n) + ", " + std::to_string(down.k) +
-                                      "], its weight is [" + std::to_string(down_view.rows) +
-                                      ", " + std::to_string(down_view.cols) + "]");
+                                      "], the checkpoint's is [" +
+                                      std::to_string(down_ti.shape[0]) + ", " +
+                                      std::to_string(down_ti.ndim > 1 ? down_ti.shape[1] : 0) +
+                                      "]");
             }
             if (pair.group != down.group) {
                 throw EngineError(ENGINE_ERR_WEIGHTS,
                                   "layer " + std::to_string(layer) +
                                       "'s gate/up and down disagree on the group width");
             }
+            const ModelDims &local = eng->replicated ? eng->local_dims : eng->dims;
+            const int ranks = eng->replicated ? eng->num_devices : 1;
+            for (int r = 0; r < ranks; ++r) {
+                role_extent(eng->desc, ROLE_MLP_GATE, gate_ti, r, &gate_view, &gate_split);
+                role_extent(eng->desc, ROLE_MLP_UP, up_ti, r, &up_view, &up_split);
+                role_extent(eng->desc, ROLE_MLP_DOWN, down_ti, r, &down_view, &down_split);
+                /* A column split has to land on a group boundary: a slice inside a group would
+                 * need a scale shared with columns this rank does not hold, and re-deriving one
+                 * is the per-rank requantization the plan forbids. A split that does not align
+                 * is refused rather than quietly approximated. */
+                if (gate_view.col_off % pair.group != 0 || up_view.col_off % pair.group != 0 ||
+                    down_view.col_off % down.group != 0) {
+                    throw EngineError(ENGINE_ERR_WEIGHTS,
+                                      "layer " + std::to_string(layer) + "'s rank " +
+                                          std::to_string(r) + " splits K at a non-group "
+                                          "boundary, which cannot retain the global scales");
+                }
+                /* The slice has to be exactly what the forward will compute with, because the
+                 * kernel is told the rank's extents rather than the checkpoint's. */
+                if (gate_view.cols != local.hidden_size ||
+                    gate_view.rows + up_view.rows != 2 * local.intermediate_size ||
+                    up_view.cols != gate_view.cols || down_view.rows != local.hidden_size ||
+                    down_view.cols != local.intermediate_size) {
+                    throw EngineError(ENGINE_ERR_WEIGHTS,
+                                      "layer " + std::to_string(layer) + "'s rank " +
+                                          std::to_string(r) + " slice is [" +
+                                          std::to_string(gate_view.rows + up_view.rows) + ", " +
+                                          std::to_string(gate_view.cols) + "] gate/up and [" +
+                                          std::to_string(down_view.rows) + ", " +
+                                          std::to_string(down_view.cols) +
+                                          "] down, which is not this rank's dense MLP");
+                }
 
-            const int device_index = eng->layer_device[layer];
-            const int device = eng->devices[device_index];
-            LayerWeights &lw = layer_weights(eng, layer, device_index);
-            lw.gate_up_i4 = (uint8_t *)upload_artifact(root.c_str(), &pair.packed, "u8", device,
-                                                      lw.owned, "Upload INT4 gate/up weight");
-            lw.gate_up_i4_scales = (__nv_bfloat16 *)upload_artifact(
-                root.c_str(), &pair.scales, "bf16", device, lw.owned,
-                "Upload INT4 gate/up scales");
-            lw.down_i4 = (uint8_t *)upload_artifact(root.c_str(), &down.packed, "u8", device,
-                                                   lw.owned, "Upload INT4 down weight");
-            lw.down_i4_scales = (__nv_bfloat16 *)upload_artifact(
-                root.c_str(), &down.scales, "bf16", device, lw.owned, "Upload INT4 down scales");
-            lw.i4_group = (int)pair.group;
+                const int device_index = eng->replicated ? r : eng->layer_device[layer];
+                LayerWeights &lw = layer_weights(eng, layer, device_index);
+                const int device = eng->devices[device_index];
+                uint8_t *pair_packed_host = nullptr;
+                uint8_t *pair_scales_host = nullptr;
+                size_t pair_packed_bytes = 0, pair_scales_bytes = 0;
+                if (quant_artifact_read(root.c_str(), &pair.packed, "u8", &pair_packed_host,
+                                        &pair_packed_bytes, nullptr, 0) != QUANT_MANIFEST_OK ||
+                    quant_artifact_read(root.c_str(), &pair.scales, "bf16", &pair_scales_host,
+                                        &pair_scales_bytes, nullptr, 0) != QUANT_MANIFEST_OK) {
+                    throw EngineError(ENGINE_ERR_WEIGHTS, std::string(quant_manifest_last_error()));
+                }
+                uint8_t *down_packed_host = nullptr;
+                uint8_t *down_scales_host = nullptr;
+                size_t down_packed_bytes = 0, down_scales_bytes = 0;
+                if (quant_artifact_read(root.c_str(), &down.packed, "u8", &down_packed_host,
+                                        &down_packed_bytes, nullptr, 0) != QUANT_MANIFEST_OK ||
+                    quant_artifact_read(root.c_str(), &down.scales, "bf16", &down_scales_host,
+                                        &down_scales_bytes, nullptr, 0) != QUANT_MANIFEST_OK) {
+                    throw EngineError(ENGINE_ERR_WEIGHTS, std::string(quant_manifest_last_error()));
+                }
+                try {
+                    const long long half_rows = pair.n / 2;   /* the gate's full row count */
+                    const long long pair_row_bytes = pair.k / 2;
+                    const long long pair_scale_row_bytes = pair.k / pair.group * 2;
+                    const long long row_bytes = gate_view.cols / 2;
+                    const long long scale_row_bytes = gate_view.cols / pair.group * 2;
+                    std::vector<uint8_t> packed_host(
+                        (size_t)(gate_view.rows + up_view.rows) * (size_t)row_bytes);
+                    std::vector<uint8_t> scales_host(
+                        (size_t)(gate_view.rows + up_view.rows) * (size_t)scale_row_bytes);
+                    slice_rows(packed_host.data(), pair_packed_host, pair_row_bytes,
+                               gate_view.row_off, gate_view.rows, gate_view.col_off / 2,
+                               row_bytes);
+                    slice_rows(packed_host.data() + gate_view.rows * row_bytes, pair_packed_host,
+                               pair_row_bytes, half_rows + up_view.row_off, up_view.rows,
+                               up_view.col_off / 2, row_bytes);
+                    slice_rows(scales_host.data(), pair_scales_host, pair_scale_row_bytes,
+                               gate_view.row_off, gate_view.rows,
+                               gate_view.col_off / pair.group * 2, scale_row_bytes);
+                    slice_rows(scales_host.data() + gate_view.rows * scale_row_bytes,
+                               pair_scales_host, pair_scale_row_bytes,
+                               half_rows + up_view.row_off, up_view.rows,
+                               up_view.col_off / pair.group * 2, scale_row_bytes);
+                    lw.gate_up_i4 = (uint8_t *)upload_host(
+                        packed_host.data(), packed_host.size(), device, lw.owned,
+                        "Upload INT4 gate/up weight");
+                    lw.gate_up_i4_scales = (__nv_bfloat16 *)upload_host(
+                        scales_host.data(), scales_host.size(), device, lw.owned,
+                        "Upload INT4 gate/up scales");
+
+                    /* The source's row stride is the *whole* K, while the row this rank keeps
+                     * is its own K slice - mixing the two up would hand the kernel a buffer
+                     * whose row width is not the one it was told. */
+                    const long long down_row_bytes = down_view.cols / 2;
+                    const long long down_scale_row_bytes = down_view.cols / down.group * 2;
+                    std::vector<uint8_t> down_packed((size_t)down.n * (size_t)down_row_bytes);
+                    std::vector<uint8_t> down_scales((size_t)down.n * (size_t)down_scale_row_bytes);
+                    slice_rows(down_packed.data(), down_packed_host, down.k / 2, 0, down.n,
+                               down_view.col_off / 2, down_row_bytes);
+                    slice_rows(down_scales.data(), down_scales_host, down.k / down.group * 2, 0,
+                               down.n, down_view.col_off / down.group * 2,
+                               down_scale_row_bytes);
+                    lw.down_i4 = (uint8_t *)upload_host(down_packed.data(), down_packed.size(),
+                                                        device, lw.owned, "Upload INT4 down weight");
+                    lw.down_i4_scales = (__nv_bfloat16 *)upload_host(
+                        down_scales.data(), down_scales.size(), device, lw.owned,
+                        "Upload INT4 down scales");
+                    lw.i4_group = (int)pair.group;
+                } catch (...) {
+                    free(pair_packed_host);
+                    free(pair_scales_host);
+                    free(down_packed_host);
+                    free(down_scales_host);
+                    throw;
+                }
+                free(pair_packed_host);
+                free(pair_scales_host);
+                free(down_packed_host);
+                free(down_scales_host);
+            }
             ++eng->quantized_ffn_layers;
+
         }
     } catch (const std::exception &e) {
         set_error("engine_load_quantized_ffn: %s", e.what());

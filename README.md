@@ -25,6 +25,13 @@ targeting **Qwen3.8-27B** (hybrid Full-Attention + GatedDeltaNet architecture).
   `--temperature 0` is the explicit greedy mode), plus streaming output decoded
   incrementally, so a character whose bytes span several tokens is emitted once
   complete.
+- **Weight-only INT4 decode (opt-in)**: the dense FFN's decode path can read symmetric
+  INT4 group-128 packed weights *beside* the BF16 ones (prefill stays BF16), which is
+  **1.57× faster decode** on the deployment target within a per-model quality budget;
+  tensor parallelism is admitted by slicing the artifact per rank with the artifact's
+  global scales, while expert parallelism is refused. Fusion and speculative decoding
+  are the other two optimization tracks: implemented and gated, but **declined by their
+  own measurements** (see the phase table and `docs/plan-numeric-contract.md`).
 - **Three-language build**: Haskell (Cabal) + C/CUDA (CMake) + Rust (Cargo), with
   one command running every layer's test suite.
 
@@ -37,7 +44,7 @@ Haskell (GHC 9.6)
 ├── Placement.hs         Placement policies (layer-wise, replicated TP, EP)
 ├── Model.hs             Per-layer plan: (mixer, ffn, device)
 ├── Runtime.hs           Engine lifecycle, weight loading
-├── Generation.hs        Greedy decode loop, streaming output
+├── Generation.hs        Decode loop (sampling/greedy, speculative), streaming output
 ├── Tokenizer.hs         FFI → Rust tokenizer (capacity protocol + stream)
 └── FFI/Engine.hs        FFI → C engine API
          │
@@ -182,7 +189,7 @@ equal highest BF16 reference logits are treated as ties.
 
 ## Tests
 
-- `ctest --test-dir csrc/build-libs` runs eleven suites that need no GPU at all:
+- `ctest --test-dir csrc/build-libs` runs fourteen suites that need no GPU at all:
   `test_model_desc` (descriptor parsing, structural validation, the
   engine-capability gate for the AOT GDN layout, canonical echo and the tp-role
   coverage rule), `test_safetensors` (malformed headers, offsets, shapes and
@@ -203,7 +210,11 @@ equal highest BF16 reference logits are treated as ties.
   Stage-4 region table against that same inventory in both directions, the losses and
   AdamW against an independent FP64 implementation, the checkpoint's refusals, a
   deterministic fixture that overfits to 32/32 and a resume that has to land on the
-  uninterrupted run's bits; `test_alignment`, which checks Stage 6's numerical-alignment
+  uninterrupted run's bits; `test_quantization_format` (+ `test_quantization_format_python`)
+  and `test_quant_manifest`, which freeze the INT4 format and check its refusals
+  (partial groups/tiles, the reserved code, the all-zero-group scale, the signed
+  extrema, quantization as a fixed point of dequantization) and validate the
+  `weights.manifest.json` sidecar and its artifact digests; `test_alignment`, which checks Stage 6's numerical-alignment
   decision (one verdict per Stage-1 region derived from the inventory rather than restated
   beside it, a declared exception carrying a measured bound, a pending region naming its
   tracked work, and the refusals that keep a policy change or a sampler difference out of
@@ -254,9 +265,14 @@ equal highest BF16 reference logits are treated as ties.
   operator-level regressions `test_attention` (causal GQA, KV write, output
   gate), `test_gdn` (FLA recurrent decode, causal-conv1d, gated norm), `test_moe`
   (router, permute, expert GEMMs, combine, EP shards), `test_mla` (MLA chunking
-  self-consistency and the attention block-size boundary) and `test_library_ops`
+  self-consistency and the attention block-size boundary), `test_library_ops`
   (FLA chunk pipeline T=1..128 vs PyTorch recurrent on both GPUs, GemmaRMSNorm,
-  partial RoPE; skips itself when no device is visible).
+  partial RoPE; skips itself when no device is visible), and the quantization
+  device gates `test_quantization_kernel` (the INT4 GEMM against an independently
+  dequantized-weight reference, plus the M=1/batched timing that decides routing),
+  `test_quantization_converter` (the converter's sidecar re-read by the engine's
+  validator) and `test_quantized_ffn` (the routed decode path against the BF16
+  baseline, prefill required bitwise unchanged).
 - `tests/test_engine.py` — full 27B vs independently generated reference logits
   (20/20 argmax), state reset, invalid-input/capacity checks, chunk-split
   self-consistency.
@@ -275,7 +291,23 @@ equal highest BF16 reference logits are treated as ties.
 - `tests/test_tp.py` — placement equivalence on 2 GPUs: the layer-wise split
   against replicated tensor parallel (`--tp 2`) or expert parallel (`--ep 2`,
   with `--desc` and the MoE model), requiring identical greedy tokens and a
-  per-step logit RMS within `--rms-gate` (default 0.05).
+  per-step logit RMS within `--rms-gate` (default 0.05). With `--w4a16-dir` the
+  same comparison runs against one INT4 artifact loaded whole in the first arm and
+  sliced per rank in the second, which is plan Q3's equivalence gate.
+- `tests/test_verify_rows.py`, `tests/test_checkpoints.py` — the device halves of
+  speculative decoding: plan S1's bounded all-position verification against serial
+  execution (equal to 2.4e-7, every argmax equal) and the append-cache rollback, and
+  plan S2's round checkpoints (a GDN restore bitwise-equal to a straight-through
+  engine, and the lifetime/refusal contract).
+- `tests/test_speculative.py`, `tests/benchmark_speculative.py` — the two-runtime
+  prototype's CLI gate (k = 1, full acceptance, rejection at every position,
+  repeated rejection, lowest-ID ties, EOS in every position, budgets and window
+  boundaries, context exhaustion, target-only vs speculative) and the plan S3
+  acceptance/throughput measurement that declined to admit the acceleration.
+- `tests/test_residual_norm.py`, `tests/test_quantized_sharding.py` — the F2 and Q3
+  gates: the fused residual+norm against the rounded-residual reference (the rounding
+  rule as a discriminator) and the quantized-sharding refusals (a whole artifact at
+  tp = 1, a foreign sidecar, and a split that cuts K inside a group).
 - `tests/capture_logits.py` — records greedy logits for fixed prompts together
   with the execution manifest the capture was taken under, and compares two
   captures bitwise. The manifest decides the admission: identities and provenance
@@ -402,6 +434,9 @@ migrated from handwritten CUDA to FlashInfer + FLA + causal-conv1d.
 | 17 | Numerical-alignment decision (plan Stage 6): one verdict per Stage-1 region, derived from the committed inventory — a measured `exception` is a declared exception carrying its widest bound, an `unverified` pair is invariant-kernel-pending with the option that would remove it named, the rest are exact by construction — plus the reporting rule that keeps a numerical mismatch separate from a policy change and a sampler difference | ✅ CPU gate `test_alignment`: every region resolves, an exception without a measured bound and a pending region without named work are both refused, a policy change or sampler difference is refused as a numerical comparison, and an exact-by-construction region is not checked by a tolerance. **No alignment kernel was written**: the tracked work (a fixed reduction tree / constrained library configuration, CPR for GDN) is named rather than silently assumed |
 | 15 | Backward, losses and optimizer (plan Stage 4): a CUDA-free differentiation contract (cast-is-identity, the saved-statistic rule, the losses, AdamW, a CRC-checked checkpoint over parameters/moments/RNG/cursor) and one backward per Stage-4 table row — elementwise, the four norms, embedding scatter-add, RoPE, Q/gate split, GEMM dX/dW, GDN conv1d/prepare, the paired attention-from-LSE and GDN-core-from-chunk-states, plus the losses' gradient | ✅ CPU gate `test_backward` (losses/AdamW vs FP64, checkpoint refusals, an overfit that resumes bitwise) + device gate `test_backward_kernels` (every kernel vs a double-precision definition or its central difference) on sm_86 |
 | 13 | Feasibility and invariance experiments (plan Stage 2): PP inertness on a one-GPU model (logits + 324 tap dumps), GDN decomposition with prepare/core attribution, attention tiling across head dims/GQA/KV lengths, GEMM shape invariance at the real projection shapes, and the attention forward/backward pair (LSE availability, convention, gradient check, resource estimate) | ✅ six experiments on sm_86; six case pairs became measured `exception`s; no pair promoted to `exact` |
+| 20 | Fusion experiments (plan track F): an F0 costed baseline per region, and the F1 dense gate/up projection as one N = 2I GEMM over packed weights with a row-interleaved `[T, 2I]` activation | ✅ F1 admitted (prefill M=128 on Qwen3-4B **28.36 → 22.79 ms**); the four F3 candidates and the fused residual+norm (F2) were implemented, gated and **measured slower** (F2 decode **+1.2%**), so they are left opt-in/unbuilt by the F gates' own criterion |
+| 21 | Weight-only INT4 (plan track Q): a frozen symmetric group-128 format with a CUDA-free reference, an offline converter writing a strict `weights.manifest.json` sidecar with a validating reader, a warp-per-output GEMV routed into the dense FFN's **decode** path, and per-rank tensor-parallel slicing | ✅ on Qwen3.8-27B decode **1.57×** (10.0 → 15.7 tok/s), prefill **bitwise unchanged**, held-out NLL **−0.058 nats**; Qwen3-4B decode **1.61×** inside a per-model budget; gates `test_quantization_format`(+python), `test_quant_manifest`, `test_quantization_kernel`, `test_quantization_converter`, `test_quantized_ffn`, `test_tp.py --w4a16-dir`, `test_quantized_sharding.py` |
+| 22 | Speculative decoding (plan track S): a two-runtime prototype holding the plan's pending-token invariant, a bounded all-position target verification with append-cache rollback (S1), bitwise-exact GDN round checkpoints (S2), and the acceptance/throughput gate | ✅ S0–S2 pass (batched verification equal to serial to **2.4e-7** with every argmax equal; a GDN restore bitwise-equal to a straight-through run); **S3's measurement is 0.53× / 0.49× — slower — so the acceleration is not admitted**, and the speculative output is byte-identical to target-only |
 
 Known gaps, stated rather than implied:
 
@@ -412,6 +447,13 @@ Known gaps, stated rather than implied:
 - Long context is not supported: the MLA attention kernel's shared-memory budget
   caps the cached sequence length (a 16K context does not fit) and both
   `engine_create` and the kernel entry reject anything longer.
+- The optimization track admits only two of its experiments. F1's packed dense
+  gate/up projection and the INT4 decode path are admitted; the fused residual+norm
+  (F2), the four F3 candidates and speculative decoding (S3) are implemented, gated
+  and **not admitted**, because their own measurements declined them (slower, or not
+  the bottleneck). Quantized expert parallelism and every non-dense-FFN role are
+  refused rather than approximated, and the batched INT4 path exists but is
+  inadmissible at these shapes.
 
 ## Design Decisions
 
@@ -423,16 +465,22 @@ Key choices:
   the descriptor's per-role shard rules (no family knowledge in the engine)
 - **Library-backed operators** with a small native C ABI, not a wrapper around a serving engine
 - **Chunked prefill and recurrent decode** with reusable per-device scratch and state
-- **BF16** storage throughout (no quantization), with FP32 accumulation where it
-  matters: norms, the MoE expert sum, and now the cross-rank merge, which keeps a
-  partial in FP32 until one rounding turns it into the activation
+- **BF16** storage by default, with FP32 accumulation where it matters: norms, the
+  MoE expert sum, and the cross-rank merge, which keeps a partial in FP32 until one
+  rounding turns it into the activation. The one exception is opt-in **weight-only
+  INT4** on the dense FFN's decode path, which is a *numerical policy* change and
+  nothing else (`numerical_policy_id` moves; `semantic_id`/`deployment_id` do not)
 - **The element type belongs to the data**: the cross-device primitives take the
   buffers' type (F32, F16, BF16, either FP8 flavour) and size every copy from it
   rather than assuming one
 - **Ownership from the moment of allocation**: a layer buffer is registered with
   its layer before anything that can fail, so a failed initialization releases
   everything it had allocated
-- **Greedy decoding** only (no sampling)
+- **Sampling by default, greedy on request**: temperature draws from a request-owned
+  splitmix64 RNG (`--temperature 0` is explicit greedy), with the resolved temperature,
+  seed and sampler version reported on stderr so the text on stdout stays clean.
+  Speculative decoding is a T=0-only experiment and is not admitted by its own
+  measurement.
 
 ## License
 

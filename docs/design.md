@@ -12,9 +12,10 @@ These describe the current inference engine, not the proposed trainer in
 [plan-numeric-contract.md](plan-numeric-contract.md).
 
 - Single request at a time (chunked prefill, no multi-request batching)
-- Greedy decoding on the inference path. The trainer's synchronous rollout *does* sample
-  (`engine_rollout_sample`, host FP64 at temperature 1 with no truncation, plan Stage 5),
-  but the CLI's own sampler migration is planned, not implemented
+- Temperature sampling is the default inference policy (plan T0-T4, `src/Infer/Sampling.hs`);
+  `--temperature 0` selects the explicit greedy path. The trainer's synchronous rollout samples
+  too (`engine_rollout_sample`, host FP64 at temperature 1 with no truncation, plan Stage 5).
+  Speculative decoding is a T=0-only experiment and is not admitted by its own measurement
 - 1–8 GPUs; layer-wise placement and separate TP/EP policies (verified on 2× A40 46 GB, sm_86); combined TP+EP is rejected
 - Pure text (no vision/multimodal)
 - CLI interface with streaming output
@@ -1050,9 +1051,13 @@ weight-bandwidth-bound, so the format comes before more fusion.
   (the gate requires that) and decode is where the format pays. Both forms resident is the honest
   cost of the measurement's split - the alternative (dequantizing for batched M) is the thing the
   Q2 kernel was written to avoid, and the tiled kernel that would avoid both is inadmissible at
-  these shapes. The load is all-or-nothing across dense layers, refuses tensor parallelism (the
-  converter quantizes whole tensors, a rank's shard is not what the sidecar describes), and checks
-  each entry against *this* layer's extents. A packed operand is a **numerical policy** change and
+  these shapes. The load is all-or-nothing across dense layers, **admits tensor parallelism by
+  slicing** the whole-artifact operands to each rank exactly as the descriptor slices the BF16
+  weight (an output split slices the scale rows, an input split slices the scale columns, the split
+  must land on a group boundary, and the scales stay the artifact's global ones - nothing is
+  requantized per rank; expert parallelism stays refused because no expert role is admitted), and
+  checks each entry against *this* layer's extents. A packed operand is a **numerical policy**
+  change and
   nothing else, so it moves `numerical_policy_id` while `semantic_id` and `deployment_id` do not -
   in the manifest and in the identity matrix test.
 
@@ -1090,6 +1095,7 @@ stops at the first failure, so one command answers "is the tree green".
 | Quantized GEMM | `ctest -R test_quantization_kernel` (device) | the INT4 GEMM against an independently dequantized-weight reference over the FFN shapes and M = 1/2/8/64 (max_rel <= 3e-3, rms_rel <= 5e-4, i.e. within the BF16 output's rounding), the quantizer's error reported separately, the K % group refusal, and the M=1 vs batched timing that decides whether it may be routed |
 | Quantization converter | `ctest -R test_quantization_converter` (CPU) | the converter writes a verifiable sidecar over the synthetic dense checkpoint (6 role instances, error max_abs 0.0062 / rms 0.0024), leaves the checkpoint byte-identical, and the verification rejects a corrupted payload, a foreign format and a missing artifact |
 | Quantization format | `ctest -R test_quantization_format` (CPU) + `test_quantization_format_python` | the layout's refusals (partial groups, partial tiles, other group widths), BF16 round-to-nearest-even, the nibble packing checked against a hand-computed byte pattern as well as a round trip, the reserved code refused by the reader, the all-zero group's scale, the signed extrema and clipping, quantization as a fixed point of dequantization, and a numpy re-derivation of the whole fixture |
+| Quantized sharding | `tests/test_tp.py --w4a16-dir` + `tests/test_quantized_sharding.py` (device, run by hand — not a CTest gate) | the same artifact loaded whole (layer split) and sliced per rank (tp = 2) gives identical greedy tokens under a bounded rms; the whole artifact loads at tp = 1 and stays finite; a foreign sidecar and a split that cuts K inside a group are both refused by name |
 | Baseline | `tests/benchmark_inference.py` (device, run by hand — not a CTest gate) | full-request wall time with dispersion for prefill M=2/64/128 and decode M=1, plus per-region CUDA time and launch count from the opt-in scopes, with the measurement's own overhead reported beside them |
 | Resource safety | `ctest -R test_engine_resources` | repeated failing creations return no handle, explain the error and move no device memory; a valid checkpoint still builds afterwards |
 | Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set; configured `--rms-tolerance` (default 0.1, family-specific overrides) |
@@ -1130,7 +1136,8 @@ track, plus the alignment kernels the Stage-6 decision left as tracked work. See
    already exist and alter reduction order; initial training will instead use
    single-device or layer-wise placement with explicitly scoped invariance tests.
 4. CUDA graph capture for decode, vocab-parallel argmax.
-5. Sampling (temperature, top-p), HTTP API, streaming SSE.
+5. Truncated sampling (top-p/top-k) and the HTTP API; temperature sampling and
+   incremental streaming already exist.
 6. Haskell-orchestrated SFT, OPD, GRPO, DAPO, GSPO and PPO over a shared region
    library. This first requires trainable parameter ownership, saved-activation
    lifetimes, backward kernels and independently checked loss/optimizer regions.

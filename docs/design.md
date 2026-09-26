@@ -803,6 +803,46 @@ a token is picked:
   and reports `temperature`, `seed` and the sampler version on stderr so the generated text
   stays clean.
 
+### Speculative decoding: the S0 prototype
+
+The plan's S0 is a **correctness prototype, not a speedup**, and the implementation admits it
+twice: it owns two independent runtimes, and it recovers a rejected round by resetting and
+replaying rather than by restoring a checkpoint (which is S2's job). What it establishes is the
+round protocol the later stages reuse, so the protocol is the code:
+
+- **The invariant.** At every nonterminal round boundary both engines have consumed the same
+  prefix `P`, and the already emitted, target-confirmed token `x` has *not* been consumed.
+  `generateSpeculative` carries that as `(emitted, consumed, pending, remaining)` and never
+  consumes the pending token until a round confirms it - the plan's "do not pre-consume it and
+  then accidentally decode it twice".
+- **The round.** The draft consumes `x` and proposes `y1 .. yk`, consuming only through `y(k-1)`
+  so `yk` stays unconsumed. The target then consumes `[x, y1 .. yk]` with ordinary sequential
+  `engineDecode` calls - S1's bounded all-position API does not exist yet - and its row per token
+  decides: `decideRound` takes the longest prefix whose ids match, plus the target's own argmax
+  at the first mismatch as the correction, or the bonus row's argmax on full acceptance.
+  Checking stops there, because later rows condition on a token that was rejected.
+- **Recovery is sequential on purpose.** A rejected round leaves both engines holding tokens the
+  round did not confirm, so both are reset and the retained prefix `P + [x] + y[1:r]` is replayed
+  one token at a time. A chunked prefill would be faster and would produce a *different* state -
+  Stage 2 measured that chunked and recurrent execution differ - which is precisely the
+  difference that would make the prototype diverge from the serial baseline for reasons that have
+  nothing to do with the protocol.
+- **Emission and budgets.** Only target-confirmed tokens are emitted, in order, up to and
+  including the first confirmed EOS; nothing after an EOS is emitted and the round ends there
+  without a continuation. The window is the fixed `k` bounded by the remaining budget (a round
+  commits at most `k+1` tokens) and by the context both engines still have; a zero window becomes
+  one ordinary target step, and a single remaining output slot is never spent on a batch.
+- **Admission.** S0 admits a draft with a different architecture but not a different token space:
+  the runtime compares the two vocabularies *and* the prompt's encoding under both tokenizers, and
+  both contexts must hold the prompt. The CLI refuses a window without a draft, above temperature
+  0, with `--stream`, or outside 1..16 - all of it before any model is loaded.
+- **The test double.** `tests/generation_engine_stub.c` keeps per-handle state and records every
+  token a handle consumes. Its script has two modes: call-indexed (the pre-existing fixtures'
+  "script of the greedy output") and prefix-indexed, where the argmax after consuming a prefix is
+  `script[len(prefix)]`. Only the second is faithful under reset-and-replay - the answer must
+  depend on what was consumed, not on how many calls have happened - and the consumed histories
+  are what the retention claim is asserted against.
+
 ### Instrumentation for the optimization track
 
 The plan's fusion and quantization milestones both start by asking where the time actually
@@ -934,9 +974,18 @@ weight-bandwidth-bound, so the format comes before more fusion.
   with BF16 activations is a decode-time specialization**, and reaching the batched regime
   would take the int tensor cores, i.e. int8 activations, which the plan scopes out.
 
-The plan freezes the wire format "subject to a sm_86 kernel feasibility check": the format and
-its converter are gated, and Q2 now has a kernel admitted against the reference, but that
-kernel's *performance* is the open question and the model-quality gates wait on it.
+- **the operands are routed where the measurement put the win.** `engine_load_quantized_ffn`
+  reads a converted sidecar through the validator above and installs the packed operands **beside**
+  the BF16 weights rather than instead of them, because the two paths want different weights:
+  `forward_mlp` reads INT4 when `tokens == 1` and BF16 otherwise, so prefill is bitwise unchanged
+  (the gate requires that) and decode is where the format pays. Both forms resident is the honest
+  cost of the measurement's split - the alternative (dequantizing for batched M) is the thing the
+  Q2 kernel was written to avoid, and the tiled kernel that would avoid both is inadmissible at
+  these shapes. The load is all-or-nothing across dense layers, refuses tensor parallelism (the
+  converter quantizes whole tensors, a rank's shard is not what the sidecar describes), and checks
+  each entry against *this* layer's extents. A packed operand is a **numerical policy** change and
+  nothing else, so it moves `numerical_policy_id` while `semantic_id` and `deployment_id` do not -
+  in the manifest and in the identity matrix test.
 
 ### Memory budget (2× A40, 4096 context)
 

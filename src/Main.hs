@@ -67,6 +67,8 @@ data GenOptions = GenOptions
   , genCheckDesc :: Bool
   , genTemperature :: Maybe String
   , genSeed        :: Maybe String
+  , genDraftModelDir :: Maybe FilePath
+  , genSpecK         :: Maybe String
   }
 
 -- | The manifest has no request-level state, so there is no prompt or token
@@ -173,6 +175,19 @@ generateCmd = Generate <$> (GenOptions
      <> metavar "S"
      <> help ("Unsigned 64-bit seed for the request's random stream "
               ++ "(default: drawn once from the OS and reported on stderr)")
+      ))
+  <*> optional (strOption
+      ( long "draft-model-dir"
+     <> metavar "DIR"
+     <> help ("Speculative decoding (plan S0) needs a second, independent runtime: "
+              ++ "the draft model's directory. Requires --speculative-k, temperature 0 and "
+              ++ "no --stream")
+      ))
+  <*> optional (strOption
+      ( long "speculative-k"
+     <> metavar "K"
+     <> help ("Propose K tokens per speculative round (1..16). Explicitly a T=0 experiment: "
+              ++ "the draft and target must share a token space, and the run is greedy")
       )))
 
 helloGpuCmd :: Parser Command
@@ -498,6 +513,31 @@ runGenerate opts = do
   -- Request metadata goes to stderr, keeping the generated stdout text clean.
   hPutStrLn stderr (samplingSummary sampling ++ ", sampler=" ++ samplerVersion)
 
+  -- Speculative decoding (plan S0) is an explicitly greedy experiment that owns a second
+  -- runtime, so the combination it needs is refused here, before anything is loaded: the plan
+  -- asks for T=0 to be selected explicitly and for unsupported stochastic speculation to be
+  -- rejected rather than silently ignored.
+  specCfg <- case (genSpecK opts, genDraftModelDir opts) of
+    (Nothing, _) -> return Nothing
+    (Just _, Nothing) -> do
+      putStrLn "ERROR: --speculative-k needs --draft-model-dir (S0 owns two runtimes)"
+      exitFailure
+    (Just raw, Just _) -> do
+      k <- case parseProposals raw of
+        Left err -> putStrLn ("ERROR: " ++ err) >> exitFailure
+        Right n -> return n
+      if scTemperature sampling /= 0
+        then do
+          putStrLn "ERROR: speculative decoding is greedy-only in S0; pass --temperature 0"
+          exitFailure
+        else return ()
+      if genStreaming opts
+        then do
+          putStrLn "ERROR: speculative decoding does not stream yet: drop --stream"
+          exitFailure
+        else return ()
+      return (Just defaultSpecConfig { spProposals = k, spMaxSeqLen = genMaxSeqLen opts })
+
   let cfg = RuntimeConfig
         { rcModelDir  = genModelDir opts
         , rcDescriptor = genDesc opts
@@ -509,6 +549,12 @@ runGenerate opts = do
         , rcPrompt    = genPrompt opts
         , rcSampling  = sampling
         }
+  -- The draft is a second *independent* runtime: its own weights, its own descriptor (derived
+  -- from its own config.json unless one is given) and its own device placement. S0 admits a
+  -- draft with a different architecture, so nothing about the target's descriptor is reused.
+  let draftCfg = case genDraftModelDir opts of
+        Just dir -> cfg { rcModelDir = dir, rcDescriptor = Nothing }
+        Nothing -> cfg
 
   -- bracket: the tokenizer and the engine are released on every exit path,
   -- including a generation failure or an output error.
@@ -553,16 +599,25 @@ runGenerate opts = do
     putStrLn "---"
     -- An engine failure is reported as a failed run, never as a short output
     -- that exits 0.
-    outcome <- tryIOError $ if genStreaming opts
-      then bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
-        generateStreaming engine vocab (dEosTokens desc) stream promptTokens
-                          (genMaxTokens opts) (rcSampling cfg)
-      else do
-        toks <- generate engine vocab (dEosTokens desc) promptTokens
-                         (genMaxTokens opts) (rcSampling cfg)
+    outcome <- tryIOError $ case specCfg of
+      Just spec -> bracket (initRuntime draftCfg) shutdownRuntime $ \draftRt -> do
+        checkDraftCompatibility rt draftRt (genPrompt opts)
+        toks <- generateSpeculative spec (runtimeEngine draftRt) (rtVocabSize draftRt)
+                                   engine vocab (dEosTokens desc) promptTokens
+                                   (genMaxTokens opts)
         text <- decode tok toks
         putStrLn text
         return toks
+      Nothing -> if genStreaming opts
+        then bracket (newDecodeStream tok) freeDecodeStream $ \stream ->
+          generateStreaming engine vocab (dEosTokens desc) stream promptTokens
+                            (genMaxTokens opts) (rcSampling cfg)
+        else do
+          toks <- generate engine vocab (dEosTokens desc) promptTokens
+                           (genMaxTokens opts) (rcSampling cfg)
+          text <- decode tok toks
+          putStrLn text
+          return toks
 
     outputTokens <- case outcome of
       Left err -> do
@@ -572,6 +627,51 @@ runGenerate opts = do
 
     putStrLn "---"
     putStrLn $ "Generated " ++ show (length outputTokens) ++ " tokens"
+
+-- | S0's admission check for a draft/target pair. The plan asks for more than a vocabulary
+-- size: the two must share a *token space*, which is observable as the same text encoding to
+-- the same ids, because a draft whose tokenizer splits differently would propose tokens the
+-- target never sees. Both contexts must also hold the prompt, and S0 requires one token space
+-- outright (the generate loop refuses a differing vocabulary as well; this is the earlier,
+-- more specific refusal).
+checkDraftCompatibility :: Runtime -> Runtime -> String -> IO ()
+checkDraftCompatibility target draft promptText = do
+  let targetVocab = rtVocabSize target
+      draftVocab = rtVocabSize draft
+  if targetVocab /= draftVocab
+    then refuse ("the draft's vocabulary is " ++ show draftVocab ++ " and the target's is "
+                 ++ show targetVocab ++ "; S0 requires one token space")
+    else return ()
+  targetIds <- encode (rtTokenizer target) promptText
+  draftIds <- encode (rtTokenizer draft) promptText
+  if targetIds /= draftIds
+    then refuse ("the draft and target tokenizers disagree on the prompt encoding: "
+                 ++ show (take 8 targetIds) ++ " vs " ++ show (take 8 draftIds))
+    else return ()
+  let targetCapacity = dMaxSeqLen (runtimeDescriptor target)
+      draftCapacity = dMaxSeqLen (runtimeDescriptor draft)
+  if targetCapacity < length targetIds
+    then refuse ("the prompt does not fit the target's context (" ++ show targetCapacity ++ ")")
+    else return ()
+  if draftCapacity < length draftIds
+    then refuse ("the prompt does not fit the draft's context (" ++ show draftCapacity ++ ")")
+    else return ()
+  -- S1 admits pure full-attention runtimes. A GDN layer's recurrent state cannot be rewound and
+  -- MLA needs its own admission, so the rollback would be refused by the engine *mid-run*; the
+  -- refusal belongs here, before anything is generated.
+  let recurrent d = [ (i, k) | (i, k) <- zip [0 ..] (dLayerMixers d), k /= MFullAttention ]
+  case recurrent (runtimeDescriptor target) of
+    ((i, _) : _) -> refuse ("the target's layer " ++ show i ++ " is not full attention; S1 "
+                            ++ "verification and rollback admit attention-only runtimes")
+    [] -> return ()
+  case recurrent (runtimeDescriptor draft) of
+    ((i, _) : _) -> refuse ("the draft's layer " ++ show i ++ " is not full attention; S1 "
+                            ++ "verification and rollback admit attention-only runtimes")
+    [] -> return ()
+  where
+    refuse message = do
+      putStrLn ("ERROR: " ++ message)
+      exitFailure
 
 -- | Give a stochastic request a concrete seed: an explicit one is used as given and an
 -- omitted one is drawn once from the OS. A greedy request keeps whatever it was given (and

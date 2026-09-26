@@ -424,6 +424,11 @@ static void emit_numerical(struct MjBuf *b, const struct ManifestInputs *in,
      * concrete temperature and seed of one request are replay data and live in the
      * capture, so changing only them moves nothing here). */
     mj_kv_str(b, &first, "sampling_sha256", manifest_or_unknown(sampling_sha256));
+    /* Weight-only quantization is a numerical policy, not a deployment change: the decode path
+     * forms the dense FFN's products against packed INT4 operands, so its policy id has to move
+     * while semantic_id and deployment_id do not. */
+    mj_kv_str(b, &first, "weight_quantization",
+              in->weight_only_int4 ? "int4_symmetric_group_bf16_scale_decode_only" : "none");
     mj_put(b, "}");
 }
 

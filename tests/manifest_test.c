@@ -332,6 +332,25 @@ static void test_identity_matrix(void) {
         g_in.sampling = saved;
     }
 
+    /* Numerical change: weight-only INT4 FFN operands (plan Q2). A packed weight set is a
+     * different *realization* of the same function on the same placement, so only the
+     * numerical policy may move - if this moved semantic_id, a quantized model would look like a
+     * different architecture, and if it moved deployment_id, it would look like a different
+     * placement. */
+    {
+        const int saved = g_in.weight_only_int4;
+        g_in.weight_only_int4 = 1;
+        format_manifest(&g_in, variant_text, sizeof(variant_text));
+        read_identities(variant_text, &variant);
+        CHECK(strcmp(base.semantic, variant.semantic) == 0,
+              "weight-only INT4 moved semantic_id");
+        CHECK(strcmp(base.numerical, variant.numerical) != 0,
+              "weight-only INT4 did not move numerical_policy_id");
+        CHECK(strcmp(base.deployment, variant.deployment) == 0,
+              "weight-only INT4 moved deployment_id");
+        g_in.weight_only_int4 = saved;
+    }
+
     /* Numerical change: the region binding table. */
     {
         int count = 0;

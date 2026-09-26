@@ -13,6 +13,10 @@
 module Infer.Generation
   ( generate
   , generateStreaming
+  , generateSpeculative
+  , decideRound
+  , proposalWindow
+  , takeConfirmed
   , argmax
   ) where
 
@@ -108,6 +112,176 @@ generateStreaming engine vocab eosTokens stream prompt maxNew sampling
         else do
           emitToken stream nextTok
           go rng' (nextTok : acc) nextTok (remaining - 1)
+
+-- ---------------------------------------------------------------------------
+-- Speculative decoding (plan S0)
+-- ---------------------------------------------------------------------------
+
+-- | The longest prefix of @proposals@ the target confirmed, and the token the target's next
+-- row selects. @choices@ is the target's argmax for each of the @length proposals + 1@ rows:
+-- row @i@ predicts @proposals !! i@, and the last row is the bonus row. Checking stops at the
+-- first mismatch, because later rows condition on a token that was rejected and are therefore
+-- unusable as continued generation.
+--
+-- Pure on purpose: the whole decision is arithmetic over the two lists, so the CPU suite can
+-- exercise full acceptance, rejection at every position, ties and k = 1 without an engine.
+decideRound :: [Int64] -> [Int64] -> (Int, Int64)
+decideRound proposals choices =
+  (accepted, choices !! accepted)
+  where
+    accepted = length (takeWhile id (zipWith (==) proposals choices))
+
+-- | How many proposals a round may carry: the configured window, bounded by the remaining
+-- output budget (a round commits at most @k + 1@ tokens, so @k + 1@ must fit) and by the
+-- context both engines still have. Zero means "no legal window", and the caller then takes one
+-- ordinary target step rather than overproducing a batch the context cannot hold.
+proposalWindow :: Int -> Int -> Int -> Int -> Int
+proposalWindow k remaining consumedLen maxSeqLen =
+  max 0 (minimum [k, remaining - 1, maxSeqLen - consumedLen - 1])
+
+-- | Emit up to and including the first confirmed EOS: no later speculative token may enter the
+-- text decoder, and EOS terminates the round without a bonus or continuation.
+takeConfirmed :: (Int64 -> Bool) -> [Int64] -> ([Int64], Bool)
+takeConfirmed isEos = go []
+  where
+    go acc [] = (reverse acc, False)
+    go acc (t : ts)
+      | isEos t = (reverse (t : acc), True)
+      | otherwise = go (t : acc) ts
+
+-- | Speculative generation, the plan's S0: **two independent runtimes** that prefill the same
+-- prefix, greedy only, a fixed proposal count, and the target verifying candidates with
+-- ordinary sequential 'Infer.FFI.Engine.engineDecode' calls in the original order.
+--
+-- The invariant at every round boundary is the plan's: both engines have consumed @P@, and the
+-- already emitted, target-confirmed token @x@ is still pending consumption. A round has the
+-- draft consume @x@ and propose @y1 .. yk@ (consuming only through @y(k-1)@, so @yk@ stays
+-- unconsumed), the target then consume @[x, y1 .. yk]@ and return its own argmax per row, and
+-- the longest matching prefix @y[1:r]@ plus the target's correction (or bonus at @r = k@)
+-- becomes the round's output. Only target-confirmed tokens are returned, in order.
+--
+-- Recovery is deliberately the slow, obviously-correct one: S0 owns no checkpoints (that is
+-- S2), so both engines are reset and the retained prefix @P + [x] + y[1:r]@ is replayed
+-- **sequentially** - one prefill of the first token and one decode per remaining token - so the
+-- state matches the serial path rather than a chunked prefill, which Stage 2 measured to differ.
+-- This is why S0 is a correctness prototype and not a speedup.
+--
+-- The draft and target must share a vocabulary: S0 admits a draft with a different architecture
+-- but not a different token space. The runtime is what compares tokenizers and prompt templates.
+generateSpeculative
+  :: SpecConfig
+  -> Ptr EngineHandle   -- ^ draft
+  -> Int                -- ^ draft vocabulary size
+  -> Ptr EngineHandle   -- ^ target
+  -> Int                -- ^ target vocabulary size
+  -> [Int]              -- ^ EOS ids, as in 'generate'
+  -> [Int64]            -- ^ prompt
+  -> Int                -- ^ maximum new tokens
+  -> IO [Int64]
+generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt maxNew
+  | draftVocab /= targetVocab =
+      throwIO (userError ("speculative: the draft and target vocabularies differ ("
+                          ++ show draftVocab ++ " and " ++ show targetVocab
+                          ++ "); S0 requires one token space"))
+  | maxNew <= 0 = return []
+  | otherwise = do
+      -- Both runtimes consume the identical prefix, sequentially, so their states are the
+      -- serial path's states and a later replay can reproduce them exactly.
+      _ <- consumeSequentially draft vocab prompt
+      firstLogits <- consumeSequentially target vocab prompt
+      let first = argmax firstLogits
+      if isEos first
+        then return [first]
+        else go [first] prompt first (maxNew - 1)
+  where
+    isEos token = fromIntegral token `elem` eosTokens
+    vocab = targetVocab
+    k = spProposals spec
+
+    -- Consume a nonempty sequence on one engine and return the last logits. A single-token
+    -- prefill followed by decodes is the same path 'generate' takes after its own prefill.
+    consumeSequentially engine v (t : ts) = do
+      engineReset engine
+      logits <- prefillLogits engine [t] v
+      foldlMDecode engine v logits ts
+    consumeSequentially _ _ [] =
+      throwIO (userError "speculative: an empty sequence is not a consumption")
+
+    foldlMDecode _engine _v logits [] = return logits
+    foldlMDecode engine v _ (t : ts) = do
+      next <- decodeLogits engine t v
+      foldlMDecode engine v next ts
+
+    -- The draft consumes x and proposes k' tokens, consuming only through y(k'-1).
+    draftPropose k' x = do
+      logits <- decodeLogits draft x vocab
+      step k' [] logits
+      where
+        step 0 acc _ = return (reverse acc)
+        step n acc logits = do
+          let y = argmax logits
+          if n == 1
+            then return (reverse (y : acc))
+            else do
+              logits' <- decodeLogits draft y vocab
+              step (n - 1) (y : acc) logits'
+
+    -- emitted-so-far, the consumed prefix, the pending confirmed token, the budget left
+    go emitted consumed pending remaining
+      | remaining <= 0 = return (reverse emitted)
+      | window <= 0 = do
+          -- No legal window: one ordinary target step, so the run still finishes. The draft
+          -- consumes the same token - its logits are discarded - because the two runtimes have
+          -- to hold the same prefix for the next round to propose from the right position.
+          logits <- decodeLogits target pending vocab
+          _ <- decodeLogits draft pending vocab
+          let next = argmax logits
+          if isEos next
+            then return (reverse (next : emitted))
+            else go (next : emitted) (consumed ++ [pending]) next (remaining - 1)
+      | otherwise = do
+          proposals <- draftPropose window pending
+          -- S1's bounded all-position verification: one batch over [x, y1 .. yk] whose row i
+          -- conditions on inputs[0..i], so the target pays one forward instead of k+1 decodes.
+          rows <- verifyRows target (pending : proposals)
+          let (accepted, correction) = decideRound proposals (map argmax rows)
+              confirmed = take accepted proposals
+              (thisRound, stopped) = takeConfirmed isEos (confirmed ++ [correction])
+              emitted' = reverse thisRound ++ emitted
+          if stopped
+            then return (reverse emitted')
+            else do
+              -- Retain exactly P + [x] + y[1:r]. The target's batch consumed [x] ++ proposals,
+              -- so it is truncated back; the draft consumed only through y(k-1), so it is either
+              -- truncated too or - on full acceptance - made to consume its missing yk. The
+              -- correction becomes the new pending token and is not consumed here, precisely so
+              -- it is not decoded twice.
+              let retained = consumed ++ [pending] ++ confirmed
+              reconcile target retained
+              reconcile draft retained
+              go emitted' retained correction (remaining - length thisRound)
+      where
+        window = proposalWindow k remaining (length consumed) (spMaxSeqLen spec)
+
+    -- Bring an engine's consumed sequence to exactly the retained prefix: back to it when the
+    -- round went past (the target always does unless every proposal was accepted), and forward
+    -- to it otherwise (the draft's unconsumed yk on full acceptance).
+    reconcile engine retained = do
+      length_ <- engineSeqLen engine
+      if length_ > length retained
+        then do
+          result <- engineTruncate engine (length retained)
+          either (throwIO . userError . ("speculative: truncate failed: " ++)) return result
+        else catchUp engine (drop length_ retained)
+
+    catchUp _ [] = return ()
+    catchUp engine (t : ts) = do
+      _ <- decodeLogits engine t vocab
+      catchUp engine ts
+
+    verifyRows engine tokens = do
+      result <- engineVerifyRows engine tokens vocab
+      either (throwIO . userError . ("speculative: verification failed: " ++)) return result
 
 -- | Prefill, propagating the engine's error instead of returning no logits.
 prefillLogits :: Ptr EngineHandle -> [Int64] -> Int -> IO [Float]

@@ -56,6 +56,17 @@ typedef struct {
     const __nv_bfloat16 *up_proj_w;     // [intermediate, hidden]
     const __nv_bfloat16 *down_proj_w;   // [hidden, intermediate]
     const __nv_bfloat16 *post_norm_w;   // [hidden], raw Gemma weight
+    /* The weight-only INT4 operands (plan Q2), null unless the engine was asked to load a
+     * converted sidecar. `gate_up_i4` is the F1-compatible [2I, H] pair - gate rows then up
+     * rows, the same layout `gate_proj_w`/`up_proj_w` occupy - and `down_i4` is [H, I], with
+     * `i4_group`-wide K groups. Decode (M = 1) uses them; batched M does not, because the
+     * measurement put the tiled kernel 8-30x behind BF16 at these shapes (plan Q2). Both weight
+     * forms are therefore resident when this is set, and the BF16 one is what prefill reads. */
+    const uint8_t *gate_up_i4;
+    const __nv_bfloat16 *gate_up_i4_scales;
+    const uint8_t *down_i4;
+    const __nv_bfloat16 *down_i4_scales;
+    int i4_group;
 } MlpWeights;
 
 /* Attention layer weights */
@@ -145,6 +156,13 @@ struct LayerWeights {
     __nv_bfloat16 *mla_cache;   /* latent KV: [max_seq, kv_lora_rank + rope] */
     __nv_bfloat16 *conv_state;
     float *ssm_state;
+    /* The dense FFN's weight-only INT4 operands (plan Q2), loaded by
+     * engine_load_quantized_ffn and owned here. Null means the layer is all-BF16. */
+    uint8_t *gate_up_i4;
+    __nv_bfloat16 *gate_up_i4_scales;
+    uint8_t *down_i4;
+    __nv_bfloat16 *down_i4_scales;
+    int i4_group;
 
     /* Weight/inner-state buffers owned by this layer (freed on destroy). */
     std::vector<void *> owned;

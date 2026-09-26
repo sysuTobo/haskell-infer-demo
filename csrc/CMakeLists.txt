@@ -70,7 +70,8 @@ add_custom_command(
 
 add_library(engine SHARED
     engine.cu memory.cu safetensors_loader.cu safetensors.cpp model_desc.c manifest.c sha256.c
-    regions.c train.c backward.c train_loop.c alignment.c rollout_queue.c
+    regions.c train.c backward.c train_loop.c alignment.c rollout_queue.c quant_manifest.c
+    linear_weight.cpp
     layer_dispatch.cu collective.cu moe.cu tap.cu profile.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
@@ -341,4 +342,16 @@ if(BUILD_TESTS)
              "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_quantization_kernel.py"
              --library $<TARGET_FILE:kernel_test_bridge>
              --quantize-reference $<TARGET_FILE:test_quantization_format>)
+
+    # Q2's model-quality gate: the engine loads a sidecar, decode (M = 1) reads the packed
+    # operands, and the comparison is against the same engine's BF16 run - prefill logits
+    # bitwise equal, decode logits within the format's error, top-1 and the held-out NLL
+    # agreeing, and the execution manifest moving only numerical_policy_id. It needs the
+    # synthetic dense checkpoint, so it skips itself when that is absent.
+    add_test(NAME test_quantized_ffn COMMAND ${Python3_EXECUTABLE}
+             "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_quantized_ffn.py"
+             --library $<TARGET_FILE:engine>
+             --model-dir "${ENGINE_SFT_MODEL_DIR}"
+             --desc "${CMAKE_CURRENT_SOURCE_DIR}/../descriptors/qwen3-dense-synth.json"
+             --reference $<TARGET_FILE:test_quantization_format>)
 endif()

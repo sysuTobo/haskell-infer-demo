@@ -116,7 +116,9 @@ static int run_ffn(const LayerContext *ctx, const struct LayerWeights *w,
                    const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out) {
     switch (w->plan.ffn) {
     case ENGINE_FFN_DENSE: {
-        MlpWeights mw{w->gate_proj_w, w->up_proj_w, w->down_proj_w, w->post_norm_w};
+        MlpWeights mw{w->gate_proj_w, w->up_proj_w, w->down_proj_w, w->post_norm_w,
+                      w->gate_up_i4, w->gate_up_i4_scales, w->down_i4, w->down_i4_scales,
+                      w->i4_group};
         { PROFILE_SCOPE("ffn.dense", ctx->stream);
         return forward_mlp(ctx->cublas, ctx->stream, residual, ctx->workspace, layer_out,
                            &mw, ctx->tokens, ctx->dims);

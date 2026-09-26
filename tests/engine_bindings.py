@@ -30,6 +30,10 @@ def bind(lib):
     lib.engine_prefill.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
     lib.engine_decode.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p]
     lib.engine_last_error.restype = ctypes.c_char_p
+    # Q2: the weight-only INT4 FFN operands, loaded from a converted sidecar.
+    if hasattr(lib, "engine_load_quantized_ffn"):
+        lib.engine_load_quantized_ffn.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.engine_load_quantized_ffn.restype = ctypes.c_int
     if hasattr(lib, "engine_manifest"):
         lib.engine_manifest.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
         lib.engine_manifest.restype = ctypes.c_int

@@ -8,6 +8,7 @@
 #include "manifest.h"
 #include "model_desc.h"
 #include "moe.h"
+#include "quant_manifest.h"
 #include "sha256.h"
 #include "flashinfer_ops.h"
 #include "fla_ops.h"
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -232,6 +234,10 @@ struct DeviceCtx {
     __nv_bfloat16 *lm_head_w = nullptr;     // logits device only
     __nv_bfloat16 *final_norm_w = nullptr;  // logits device only
     float *d_logits = nullptr;              // logits device only
+    /* All-rows logits for engine_verify_rows (plan S1), allocated lazily: the ordinary path
+     * never needs [max_chunk, vocab], so an engine that never verifies never pays for it. */
+    float *d_logits_rows = nullptr;
+    long long d_logits_rows_cap = 0;
     int64_t *token_ids = nullptr;
     __nv_bfloat16 *conv_bias_zero = nullptr;
     int64_t *positions = nullptr;
@@ -256,6 +262,9 @@ struct EngineHandle {
     struct ModelDesc desc{};
     int num_layers = 0;      // layers actually allocated (0 before parsing succeeds)
     int num_devices = 0;
+    /* Dense FFN layers whose INT4 operands engine_load_quantized_ffn installed. Nonzero makes
+     * the execution manifest report the weight-quantization numerical policy. */
+    int quantized_ffn_layers = 0;
     bool replicated = false; // tp_size > 1 || ep_size > 1: every rank holds every layer
     int tp_size = 1;
     int ep_size = 1;         // > 1: experts are split across the ranks
@@ -1309,6 +1318,7 @@ int engine_manifest(const EngineHandle *eng, char *buf, int buf_len) {
     in.devices = devices;
     in.device_count = eng->num_devices;
     in.weights = &eng->weights;
+    in.weight_only_int4 = eng->quantized_ffn_layers > 0 ? 1 : 0;
     in.replicated = eng->replicated ? 1 : 0;
     in.ep_size = eng->ep_size;
     in.declared_tp_rank = eng->desc.tp_rank;
@@ -1450,6 +1460,44 @@ static void compute_logits(EngineHandle *eng, DeviceCtx &last, const __nv_bfloat
     { PROFILE_SCOPE("lm_head.d2h", last.stream);
     check_cuda(cudaMemcpyAsync(h_logits, last.d_logits, eng->dims.vocab_size * sizeof(float),
                                cudaMemcpyDeviceToHost, last.stream), "Download logits");
+    }
+}
+
+/* Every position's logits (plan S1). The ordinary path computes one row on purpose, to avoid a
+ * [max_chunk, vocab] buffer; verification needs all of them, so the buffer is allocated lazily
+ * and the whole activation is normalized in one call. The rows are row-major [tokens, vocab]. */
+static void compute_logits_all(EngineHandle *eng, DeviceCtx &last, const __nv_bfloat16 *act,
+                               int tokens, float *h_logits) {
+    const long long needed = (long long)tokens * eng->dims.vocab_size;
+    if (last.d_logits_rows_cap < needed) {
+        check_cuda(cudaSetDevice(last.device_id), "Select verification device");
+        if (last.d_logits_rows != nullptr) cudaFree(last.d_logits_rows);
+        check_cuda(cudaMalloc(&last.d_logits_rows, (size_t)needed * sizeof(float)),
+                   "Allocate all-row logits");
+        last.d_logits_rows_cap = needed;
+    }
+    if (eng->dims.norm_style == 1) {
+        { PROFILE_SCOPE("verify.final_norm", last.stream);
+        kernel_rms_norm_plain(last.workspace, act, last.final_norm_w, eng->dims.hidden_size,
+                              tokens, eng->dims.rms_eps, last.stream);
+        }
+    } else {
+        { PROFILE_SCOPE("verify.final_norm", last.stream);
+        kernel_gemma_rms_norm(last.workspace, act, last.final_norm_w, eng->dims.hidden_size,
+                              tokens, eng->dims.rms_eps, last.stream);
+        }
+    }
+    check_cuda(cudaGetLastError(), "Verification final norm");
+    { PROFILE_SCOPE("verify.lm_head", last.stream);
+    check_forward(gemm_bf16_f32out(last.cublas, last.d_logits_rows, last.workspace,
+                                   last.lm_head_w, tokens, eng->dims.vocab_size,
+                                   eng->dims.hidden_size), "Verification LM head");
+    }
+    { PROFILE_SCOPE("verify.d2h", last.stream);
+    check_cuda(cudaMemcpyAsync(h_logits, last.d_logits_rows, (size_t)needed * sizeof(float),
+                               cudaMemcpyDeviceToHost, last.stream),
+               "Download verification logits");
+    check_cuda(cudaStreamSynchronize(last.stream), "Finish verification download");
     }
 }
 
@@ -1763,8 +1811,8 @@ void engine_destroy(EngineHandle *eng) {
             void *buffers[] = {ctx.residual, ctx.layer_out, ctx.workspace, ctx.conv_bias_zero,
                                ctx.positions, ctx.fla_scratch, ctx.moe_scratch, ctx.mla_scratch,
                                ctx.token_ids, ctx.embed_w, ctx.lm_head_w, ctx.final_norm_w,
-                               ctx.d_logits, ctx.reduce_staging, ctx.moe_partial_f32,
-                               ctx.moe_staging_f32};
+                               ctx.d_logits, ctx.d_logits_rows, ctx.reduce_staging,
+                               ctx.moe_partial_f32, ctx.moe_staging_f32};
             for (void *ptr : buffers) if (ptr) cleanup_cuda(cudaFree(ptr));
             if (ctx.cublas) {
                 cublasStatus_t status = cublasDestroy(ctx.cublas);
@@ -1779,6 +1827,69 @@ void engine_destroy(EngineHandle *eng) {
     delete[] eng->ctx;
     delete[] eng->layers;
     delete eng;
+}
+
+int engine_verify_rows(EngineHandle *eng, const int64_t *token_ids, int num_tokens,
+                       float *out_logits, long long capacity) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr) {
+        set_error("engine_verify_rows: null engine");
+        return ENGINE_ERR_CONFIG;
+    }
+    const long long needed = (long long)num_tokens * eng->dims.vocab_size;
+    if (capacity < needed) {
+        set_error("engine_verify_rows: capacity %lld holds fewer than %d rows x %d logits",
+                  capacity, num_tokens, eng->dims.vocab_size);
+        return ENGINE_ERR_CONFIG;
+    }
+    /* One bounded batch: the plan's "respecting max_chunk", refused rather than chunked, because
+     * a silently chunked verification would answer rows from a different execution case. */
+    if (num_tokens > eng->dims.max_chunk) {
+        set_error("engine_verify_rows: %d tokens exceed max_chunk %d", num_tokens,
+                  eng->dims.max_chunk);
+        return ENGINE_ERR_CONFIG;
+    }
+    const int status = validate_inputs(eng, token_ids, num_tokens, out_logits);
+    if (status != ENGINE_OK) return status;
+    try {
+        __nv_bfloat16 *act = nullptr;
+        DeviceCtx *ctx = nullptr;
+        /* The tokens append to the current sequence exactly as engine_decode appends them; the
+         * caller truncates with engine_truncate when a proposal is rejected. */
+        forward_tokens(eng, token_ids, num_tokens, nullptr, nullptr, &act, &ctx);
+        compute_logits_all(eng, *ctx, act, num_tokens, out_logits);
+        return ENGINE_OK;
+    } catch (const std::exception &e) {
+        return forward_error(eng, e);
+    } catch (...) {
+        if (eng) eng->state_valid = false;
+        set_error("Verification failed: unknown failure");
+        return ENGINE_ERR_CUDA;
+    }
+}
+
+int engine_truncate(EngineHandle *eng, int retain_len) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr || !eng->state_valid) {
+        set_error("engine_truncate: engine is null or requires engine_reset");
+        return ENGINE_ERR_STATE;
+    }
+    if (retain_len < 0 || retain_len > eng->seq_len) {
+        set_error("engine_truncate: retain %d is outside [0, %d]", retain_len, eng->seq_len);
+        return ENGINE_ERR_CONFIG;
+    }
+    /* A recurrent layer's state cannot be rewound, and MLA needs its own admission, so only a
+     * pure full-attention model is admitted here. S2's hybrid checkpoints are what would let a
+     * GDN model restore an earlier state instead. */
+    for (int i = 0; i < eng->num_layers; ++i) {
+        if (eng->desc.layer_mixers[i] != ENGINE_MIXER_FULL_ATTN) {
+            set_error("engine_truncate: layer %d is not full attention, so its cache cannot be "
+                      "truncated (plan S2 owns state restore)", i);
+            return ENGINE_ERR_CONFIG;
+        }
+    }
+    eng->seq_len = retain_len;
+    return ENGINE_OK;
 }
 
 int engine_vocab_size(const EngineHandle *eng) { return eng ? eng->dims.vocab_size : 0; }
@@ -1841,12 +1952,187 @@ float *layer_role_derived(EngineHandle *eng, int layer, int role, int rank) {
 
 }  // namespace
 
+/* ------------------------------------------------------------------ */
+/*  Weight-only INT4 FFN operands (plan Q2)                           */
+/* ------------------------------------------------------------------ */
+
+static std::string read_text_file(const char *path) {
+    FILE *handle = fopen(path, "rb");
+    if (handle == nullptr) {
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("cannot open ") + path);
+    }
+    std::string out;
+    char buffer[8192];
+    for (;;) {
+        const size_t got = fread(buffer, 1, sizeof(buffer), handle);
+        if (got > 0) out.append(buffer, got);
+        if (got < sizeof(buffer)) break;
+    }
+    fclose(handle);
+    return out;
+}
+
+/* Read one artifact (verifying its recorded size, dtype and digest) and upload it to `device`,
+ * registering the allocation with the layer so destroy frees it. The host buffer is transient:
+ * what stays resident is the packed payload, not a widened copy. */
+static void *upload_artifact(const char *root, const struct QuantArtifact *artifact,
+                             const char *want_dtype, int device, std::vector<void *> &owned,
+                             const char *what) {
+    uint8_t *host = nullptr;
+    size_t length = 0;
+    if (quant_artifact_read(root, artifact, want_dtype, &host, &length, nullptr, 0) !=
+        QUANT_MANIFEST_OK) {
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string(quant_manifest_last_error()));
+    }
+    void *device_buffer = nullptr;
+    check_cuda(cudaSetDevice(device), "Select INT4 device");
+    check_cuda(cudaMalloc(&device_buffer, length), what);
+    try {
+        owned.push_back(device_buffer);
+    } catch (...) {
+        free(host);
+        cudaSetDevice(device);
+        cudaFree(device_buffer);
+        throw;
+    }
+    check_cuda(cudaMemcpy(device_buffer, host, length, cudaMemcpyHostToDevice), what);
+    free(host);
+    return device_buffer;
+}
+
+int engine_load_quantized_ffn(EngineHandle *eng, const char *manifest_dir) {
+    if (eng == nullptr || manifest_dir == nullptr) {
+        set_error("engine_load_quantized_ffn: null argument");
+        return ENGINE_ERR_CONFIG;
+    }
+    try {
+        const std::string root(manifest_dir);
+        const std::string json = read_text_file((root + "/weights.manifest.json").c_str());
+        /* On the heap: a parsed manifest of the deployment model's 192 entries is about a
+         * megabyte, which does not belong on a stack an FFI caller supplied. */
+        const auto manifest_holder = std::make_unique<struct QuantManifest>();
+        struct QuantManifest &manifest = *manifest_holder;
+        if (quant_manifest_parse(json.c_str(), &manifest, nullptr, 0) != QUANT_MANIFEST_OK) {
+            throw EngineError(ENGINE_ERR_WEIGHTS, std::string(quant_manifest_last_error()));
+        }
+        if (eng->tp_size > 1 || eng->replicated) {
+            throw EngineError(ENGINE_ERR_CONFIG,
+                              "the converter quantizes whole tensors, so a tensor-parallel "
+                              "engine cannot read them yet");
+        }
+        /* The mirror of engine_train_attach's refusal: a store's publication writes the BF16
+         * weights and would leave these operands describing the old ones. */
+        if (eng->train_store != nullptr) {
+            throw EngineError(ENGINE_ERR_STATE,
+                              "this engine has a training store attached, whose publications "
+                              "would not refresh the packed operands; load INT4 into an engine "
+                              "created without engine_train_attach");
+        }
+        /* Every dense layer or none. A layer with a pair but no down projection - or the other
+         * way round - would run mixed precision silently, so it is refused rather than patched
+         * up. */
+        int dense = 0, prepared = 0;
+        for (int layer = 0; layer < eng->num_layers; ++layer) {
+            if (eng->desc.layer_ffns[layer] != ENGINE_FFN_DENSE) continue;
+            ++dense;
+            if (quant_manifest_find_pair(&manifest, "mlpGateUp", layer) >= 0 &&
+                quant_manifest_find_entry(&manifest, layer, "mlpDown") >= 0) {
+                ++prepared;
+            }
+        }
+        if (dense == 0) {
+            throw EngineError(ENGINE_ERR_CONFIG,
+                              "this descriptor has no dense FFN layer to quantize");
+        }
+        if (prepared != dense) {
+            throw EngineError(ENGINE_ERR_WEIGHTS,
+                              "the sidecar covers " + std::to_string(prepared) + " of " +
+                                  std::to_string(dense) + " dense layers");
+        }
+        for (int layer = 0; layer < eng->num_layers; ++layer) {
+            if (eng->desc.layer_ffns[layer] != ENGINE_FFN_DENSE) continue;
+            const int pair_index = quant_manifest_find_pair(&manifest, "mlpGateUp", layer);
+            const int down_index = quant_manifest_find_entry(&manifest, layer, "mlpDown");
+            const struct QuantPair &pair = manifest.pairs[pair_index];
+            const struct QuantEntry &down = manifest.entries[down_index];
+
+            /* The manifest has to describe *this* layer's weights, and the pair has to be the
+             * [2I, H] the forward's row-interleaved layout assumes (gate rows then up rows). */
+            struct ShardView gate_view, up_view, down_view;
+            bool gate_split = false, up_split = false, down_split = false;
+            const TensorInfo &gate_ti =
+                find_role(eng->tensor_index, eng->desc, ROLE_MLP_GATE, layer);
+            const TensorInfo &up_ti = find_role(eng->tensor_index, eng->desc, ROLE_MLP_UP, layer);
+            const TensorInfo &down_ti =
+                find_role(eng->tensor_index, eng->desc, ROLE_MLP_DOWN, layer);
+            role_extent(eng->desc, ROLE_MLP_GATE, gate_ti, 0, &gate_view, &gate_split);
+            role_extent(eng->desc, ROLE_MLP_UP, up_ti, 0, &up_view, &up_split);
+            role_extent(eng->desc, ROLE_MLP_DOWN, down_ti, 0, &down_view, &down_split);
+            if (gate_split || up_split || down_split) {
+                throw EngineError(ENGINE_ERR_CONFIG,
+                                  "layer " + std::to_string(layer) +
+                                      "'s FFN weights are sharded, which the sidecar cannot "
+                                      "describe");
+            }
+            const long long rows = gate_view.rows + up_view.rows;
+            if (pair.n != rows || pair.k != gate_view.cols || up_view.cols != gate_view.cols) {
+                throw EngineError(ENGINE_ERR_WEIGHTS,
+                                  "layer " + std::to_string(layer) + "'s mlpGateUp pair is [" +
+                                      std::to_string(pair.n) + ", " + std::to_string(pair.k) +
+                                      "], its gate+up is [" + std::to_string(rows) + ", " +
+                                      std::to_string(gate_view.cols) + "]");
+            }
+            if (down.n != down_view.rows || down.k != down_view.cols) {
+                throw EngineError(ENGINE_ERR_WEIGHTS,
+                                  "layer " + std::to_string(layer) + "'s mlpDown is [" +
+                                      std::to_string(down.n) + ", " + std::to_string(down.k) +
+                                      "], its weight is [" + std::to_string(down_view.rows) +
+                                      ", " + std::to_string(down_view.cols) + "]");
+            }
+            if (pair.group != down.group) {
+                throw EngineError(ENGINE_ERR_WEIGHTS,
+                                  "layer " + std::to_string(layer) +
+                                      "'s gate/up and down disagree on the group width");
+            }
+
+            const int device_index = eng->layer_device[layer];
+            const int device = eng->devices[device_index];
+            LayerWeights &lw = layer_weights(eng, layer, device_index);
+            lw.gate_up_i4 = (uint8_t *)upload_artifact(root.c_str(), &pair.packed, "u8", device,
+                                                      lw.owned, "Upload INT4 gate/up weight");
+            lw.gate_up_i4_scales = (__nv_bfloat16 *)upload_artifact(
+                root.c_str(), &pair.scales, "bf16", device, lw.owned,
+                "Upload INT4 gate/up scales");
+            lw.down_i4 = (uint8_t *)upload_artifact(root.c_str(), &down.packed, "u8", device,
+                                                   lw.owned, "Upload INT4 down weight");
+            lw.down_i4_scales = (__nv_bfloat16 *)upload_artifact(
+                root.c_str(), &down.scales, "bf16", device, lw.owned, "Upload INT4 down scales");
+            lw.i4_group = (int)pair.group;
+            ++eng->quantized_ffn_layers;
+        }
+    } catch (const std::exception &e) {
+        set_error("engine_load_quantized_ffn: %s", e.what());
+        return ENGINE_ERR_WEIGHTS;
+    }
+    return ENGINE_OK;
+}
+
 TrainStore *engine_train_attach(EngineHandle *eng, const struct TrainAttachOptions *options) {
     if (eng == nullptr) {
         set_error("engine_train_attach: null engine");
         return nullptr;
     }
     if (eng->train_store != nullptr) return eng->train_store;
+    /* A publication rewrites the BF16 compute weights, which is *not* what the packed operands
+     * hold: a training step on such an engine would compute gradients against weights the
+     * optimizer never updates. The two postures are therefore mutually exclusive, and the
+     * refusal names the engine call that put it in the other one. */
+    if (eng->quantized_ffn_layers > 0) {
+        set_error("engine_train_attach: this engine's dense FFN decode path reads INT4 operands, "
+                  "which a publication would not refresh; attach a store to an engine created "
+                  "without engine_load_quantized_ffn");
+        return nullptr;
+    }
     const struct TrainAttachOptions defaults = {0, nullptr, 0};
     if (options == nullptr) options = &defaults;
 

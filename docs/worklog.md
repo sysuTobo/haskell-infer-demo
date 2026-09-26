@@ -107,6 +107,129 @@ greedy-token agreement — never a relaxation of the top-1 check.
 
 ## Recently completed
 
+**S1: bounded all-position verification and append-cache rollback** (plan S1; verified
+2026-09-26).
+
+- `engine_verify_rows` consumes n ids as **one bounded batch** and returns every row's FP32
+  logits. The ordinary path computes only the final row on purpose (to avoid a
+  `[max_chunk, vocab]` buffer), so this allocates one lazily and normalizes the whole activation
+  in a single call. It refuses n > `max_chunk` rather than silently chunking - a chunked
+  verification would answer rows from a different execution case - and refuses a host buffer
+  shorter than `n x vocab` rather than overrunning it.
+- `engine_truncate` takes the sequence back to a retained length, so the next append overwrites
+  what was dropped. It is admitted only for a model whose every layer is full attention: a GDN
+  state cannot be rewound and MLA needs its own admission, so the call *refuses* rather than
+  leaving the cache and the recurrent state disagreeing. That admission is S2's checkpoints.
+- `generateSpeculative` now uses both: the round's verification is one batch, and the rollback is
+  "truncate the target back to the retained prefix, and either truncate the draft or make it
+  consume its missing last proposal" instead of S0's full replay. That is the plan's "on full
+  acceptance draft must additionally consume its missing yk", and it is what stops a rejected
+  round from costing a replay of the whole prefix. The ordinary-step branch (no legal window)
+  also steps the draft, so the two runtimes still hold the same prefix.
+- Admission is checked before anything is generated: the CLI refuses a target or draft with a
+  recurrent layer, so the rollback's refusal cannot arrive mid-run.
+- Gates: `tests/test_verify_rows.py` on the real engine - n = 1 is **bitwise** a decode, and for
+  n = 4 the batch rows match serial execution to **2.4e-7 max_abs with all four argmaxes
+  agreeing**, the rollback leaves the batch engine exactly where a clean prompt is, and a short
+  buffer, a window past `max_chunk`, a truncation past the sequence and a GDN model are all
+  refused. The scripted-engine half is in `cabal test infer-generation-tests` (**71 examples, 0
+  failures**), where two new counters pin that a rejecting round truncates the target and a fully
+  accepted one does not, and that the draft advances rather than replays.
+- One bug of mine the wiring exposed: with truncation-based rollback the ordinary-step branch had
+  left the draft one token behind, which the sequence-length assertion caught.
+- **Not done**: S2 (checkpoints, so a rejected round is O(1) instead of truncate-or-catch-up and
+  a GDN model can be admitted) and S3 (the cross-case and continuation gates, and any acceptance
+  or throughput measurement).
+
+**S0: the speculative-decoding prototype, two runtimes and the round protocol** (plan S0;
+verified 2026-09-26).
+
+- `Infer.Generation.generateSpeculative` is the plan's S0: two independent runtimes over the same
+  prompt, greedy only, a fixed window, and the target verifying candidates with **sequential**
+  decode calls. It keeps the plan's invariant - both engines have consumed `P` and the last
+  confirmed token is still pending - takes the longest matching prefix with the target's own
+  argmax as the correction (or the bonus row on full acceptance), emits only target-confirmed
+  tokens up to and including the first EOS, and bounds the window by the remaining budget (a round
+  commits at most `k+1`) and by the context both engines still have.
+- **Recovery is reset plus sequential replay, on purpose.** Checkpoints are S2, and a chunked
+  replay would produce a state Stage 2 measured to differ from the serial path - so S0 is
+  explicitly not a speedup, and the recovery is the slow one that cannot be wrong for a reason
+  unrelated to the protocol.
+- Admission is **one token space**, which the runtime checks as more than a vocabulary size: the
+  same text must encode to the same ids under both tokenizers, and both contexts must hold the
+  prompt. The CLI refuses a window without `--draft-model-dir`, above temperature 0, with
+  `--stream`, or outside 1..16, all before any model is loaded.
+- **The scripted engine now owns two handles with observable consumed histories**, and its script
+  gained a prefix-indexed mode: the argmax after consuming a prefix is `script[len(prefix)]`.
+  Without that mode reset-and-replay is not faithful (the answer would depend on how many calls
+  had happened rather than on what was consumed), and the consumed history is what the retention
+  claim is asserted against. The pre-existing fixtures' call-indexed semantics is untouched - a
+  `NULL` handle still means the default one - and all of them still pass.
+- Gates: `cabal test infer-generation-tests` is **71 examples, 0 failures** (63 pre-existing, 9 new
+  round-arithmetic cases, 8 two-handle engine cases), run locally and on the pod; and
+  `tests/test_speculative.py --exe "$(cabal list-bin ...)"` is **18 checks** over the CLI refusals
+  on the pod. The plan's list is covered: k = 1, full acceptance, rejection at every position,
+  repeated rejection, lowest-ID ties, first/accepted/correction/bonus EOS, budgets 0/1 and the
+  window boundaries, context exhaustion, a differing vocabulary, and target-only versus
+  speculative output.
+- **Not done (S1-S3)**: bounded all-position verification with append-cache rollback (the
+  prototype verifies sequentially, so the target consumes rejected candidates and the round pays a
+  full replay), hybrid state checkpoints and restore, the cross-case and continuation admission
+  gates, and every acceptance/throughput measurement. The device half of
+  `tests/test_speculative.py` (`--target-dir`, comparing a real run's speculative output against
+  the target-only output) is written and needs a free GPU.
+
+**The dense FFN's decode path now reads the packed INT4 operands** (plan Q2's routing and its
+model-quality gate; verified 2026-09-26).
+
+- `engine_load_quantized_ffn(engine, manifest_dir)` reads a converted sidecar through the
+  validator above and installs the operands **beside** the BF16 weights (both forms resident),
+  because the measurement put the two paths in different regimes: `forward_mlp` reads INT4 when
+  `tokens == 1` and BF16 otherwise, so **prefill is bitwise unchanged** and decode is where the
+  format pays. Dequantizing for batched M is exactly what the Q2 kernel was written to avoid, and
+  the tiled kernel that would avoid both is inadmissible at these shapes.
+- The load is **all-or-nothing across dense layers** (a layer with a pair but no `mlpDown` would
+  silently run mixed precision), refuses tensor parallelism (the converter quantizes whole
+  tensors; a rank's shard is not what the sidecar describes), and checks each entry against *this*
+  layer's own extents - `role_extent` for the gate/up/down roles - and each artifact's SHA-256
+  against the bytes on disk before anything is uploaded.
+- **A training store and the INT4 operands exclude each other**, in both directions and with the
+  reason named: a publication rewrites the BF16 compute weights and would leave the packed
+  operands describing the old ones, so a training step on such an engine would compute gradients
+  against weights the optimizer never updates. Both refusals are gated.
+- **The identity discipline holds end to end**: a packed operand is a numerical-policy change and
+  nothing else, so `numerical_policy_id` moves while `semantic_id` and `deployment_id` do not.
+  The manifest gained a `weight_quantization` field (`none` |
+  `int4_symmetric_group_bf16_scale_decode_only`), and `manifest_test.c` now pins that only the
+  numerical identity moves.
+- `ctest test_quantized_ffn` is the gate. On the synthetic dense fixture: prefill logits
+  **bitwise equal**, worst decode rms **9.08e-3** over 8 steps, top-1 7/8 with the single flip
+  explained (bf16 top-1 margin 3.2e-3 < the step's 2.7e-2 max_abs difference - a tie-break, not a
+  regression), held-out NLL delta **-0.0008 nats**. The gate prints the margin and the
+  perturbation side by side, so a flip that the perturbation cannot explain fails.
+- Refusals through the same entry point: a corrupted **pair payload** (the artifact the engine
+  actually reads - the first version of the test corrupted a *member's* file, which nothing
+  loads, and the gate caught that by failing) and a tampered format block are both refused with
+  the reason.
+- **Measured on real models.** The converter ran on the deployment target (Qwen3.8-27B, 64 dense
+  layers, hidden 5120, intermediate 17408, all four of those multiples of the group): 192 role
+  instances and 64 F1 pairs in **1705 s**, with a per-element block error of max_abs 0.0835 /
+  rms 1.37e-3. The engine-side comparison below ran on **Qwen3-4B** (36 dense full-attention
+  layers, hidden 2560, intermediate 9728 — the pod for it had a single A40, and the 27B's BF16
+  weights are ~50 GiB): prefill logits **bitwise unchanged**, and over 8 decode steps the worst
+  rms is **1.00379** with top-1 **6/8 where both flips are tie-breaks** (the BF16 margins were
+  2.5e-2 and 5.8e-2, both far below their steps' 4.0 and 1.5 max_abs differences, and the gate
+  reports any flip it cannot explain) and the held-out NLL moved by **+0.28559 nats** - inside the
+  documented budget of 1.25 / 0.40, which is a *per-model* budget set from this measurement
+  because the plan explicitly does not require token identity with BF16.
+- **The cost side, from the same run** (the plan's Q gates ask for it): the sidecar is 2204.5 MiB
+  on disk and **1322.6 MiB loaded** into the engine (the F1 pair duplicates its members on disk,
+  and only the pair plus every `mlpDown` is resident), the load takes **6.04 s**, TTFT is
+  **unchanged** (17.265 ms BF16 vs 17.239 ms INT4) because prefill still reads BF16, and decode
+  goes **17.092 ms -> 10.597 ms, 1.61x faster** (58.3 -> 94.1 tok/s). That is the format's
+  advantage showing up on a real model rather than on a synthetic one, and it is exactly the
+  decode-only specialization the kernel measurement predicted.
+
 **The `weights.manifest.json` reader, as a validator** (plan Q1's sidecar, consumed by Q2;
 verified 2026-09-26).
 
@@ -958,22 +1081,22 @@ CPU case pinning the behaviour.
   and both gates then run. A stronger fix would store the fixture on the PVC next to the other
   models, or make a skip a distinct CTest status (`set_tests_properties(... SKIP_RETURN_CODE)`)
   so the count cannot hide it.
-- **The quantized GEMM's batched path is not admissible, and nothing is routed.** The
+- **The quantized GEMM's batched path is not admissible, and only decode is routed.** The
   warp-per-row GEMV is verified *and* measured 2.25x faster than BF16 at M = 1 (52.1 vs
-  117.2 us), so the decode case is ready for routing; the batched path was built as a
-  shared-memory-tiled GEMM and is verified correct, but measured 8-30x *slower* than BF16
-  (M=2 924 us, M=128 3316 us against BF16's flat ~115 us) because at these shapes BF16 is
-  weight-bandwidth-bound while a SIMT int4 kernel is instruction-bound on the nibble unpack.
+  117.2 us), so that is what the engine now uses for a single-token forward; the batched path
+  was built as a shared-memory-tiled GEMM and is verified correct, but measured 8-30x *slower*
+  than BF16 (M=2 924 us, M=128 3316 us against BF16's flat ~115 us) because at these shapes BF16
+  is weight-bandwidth-bound while a SIMT int4 kernel is instruction-bound on the nibble unpack.
   Reaching that regime needs the int tensor cores, i.e. int8 activations, which the plan scopes
-  out. Until the decode path is routed, `gemm_int4_bf16` is not used by the model, so the dense
-  FFN still runs cuBLAS BF16.
-- **Quantization stops short of the engine.** Q0's format and reference, Q1's converter and
-  sidecar and its reader (`csrc/quant_manifest.c`), and Q2's kernels are implemented, gated and
-  measured; what remains is the piece between them: loading the artifacts into owned device
-  buffers, routing the decode (M = 1) path to the warp-per-row GEMV, and the model-quality gates
-  (logits RMS, top-1 agreement, held-out NLL against the BF16 baseline) that only make sense once
-  something is routed. The plan's sm_86 kernel feasibility question was answered by measurement
-  rather than by a check - see the Q2 rows below.
+  out. Prefill therefore still runs cuBLAS BF16, which is also why both weight forms are
+  resident when INT4 is loaded.
+- **Quantization stops at dense FFN decode.** Q0's format and reference, Q1's converter and
+  sidecar and its reader, Q2's kernels and the engine-side load and dispatch are implemented,
+  gated and measured. What is not done: any role other than the dense FFN's gate/up/down (MoE,
+  attention and GDN roles are outside Q's scope), activation quantization or QAT (the plan scopes
+  both out), and a region-inventory entry for the INT4 operand itself - the numerical-policy
+  field and the kernel gate carry that identity today, while a Stage-6 alignment verdict for the
+  packed path would be the inventory's job.
 - **F0's memory-traffic and host-synchronization columns are not measured.** The plan's F0
   asks for four quantities per region; this repository now measures two of them (CUDA time
   and launch count). Per-region **memory traffic** and **host-synchronization counts** need a

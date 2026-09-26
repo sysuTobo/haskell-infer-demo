@@ -161,6 +161,12 @@ struct ManifestInputs {
     /* Weights. */
     const struct ManifestWeights *weights;
 
+    /* Weight-only quantization (plan Q2). Nonzero when the dense FFN's operands were replaced
+     * by packed INT4 weights, which is a *numerical policy* change - the products are formed by
+     * a different kernel against a different operand - so it has to move
+     * numerical_policy_id even though the architecture and the deployment are unchanged. */
+    int weight_only_int4;
+
     /* Deployment: placement plus allocation/transfer choices. layer_device holds
      * internal device indices (the engine's own numbering); device_ordinals maps
      * them to CUDA ordinals. */

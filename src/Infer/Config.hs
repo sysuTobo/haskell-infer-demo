@@ -11,6 +11,10 @@ module Infer.Config
   , seedIsUnused
   , samplingSummary
   , streamSeed
+  , SpecConfig(..)
+  , defaultSpecConfig
+  , maxProposals
+  , parseProposals
   ) where
 
 import Data.Char (isDigit)
@@ -58,6 +62,36 @@ data SamplingConfig = SamplingConfig
 -- and a seed resolved and reported per request.
 defaultSamplingConfig :: SamplingConfig
 defaultSamplingConfig = SamplingConfig { scTemperature = 1.0, scSeed = Nothing }
+
+-- | The speculative window (plan S). S0 is greedy-only and takes a *fixed* proposal count -
+-- the plan says to start at 2-4 and to select a fixed k from measurements before considering
+-- anything adaptive - and the context capacity both engines share, which bounds how many
+-- tokens a round may consume.
+data SpecConfig = SpecConfig
+  { spProposals :: Int
+  , spMaxSeqLen :: Int
+  } deriving (Eq, Show)
+
+-- | The plan's starting window.
+defaultSpecConfig :: SpecConfig
+defaultSpecConfig = SpecConfig { spProposals = 3, spMaxSeqLen = 4096 }
+
+-- | The largest window this prototype admits. A window is a bounded batch of proposals; a
+-- large one is a different protocol (adaptive windows are explicitly later work), so the
+-- ceiling is a refusal rather than a silently accepted number.
+maxProposals :: Int
+maxProposals = 16
+
+-- | Parse @--speculative-k@. Zero is refused rather than turned into an ordinary step: a
+-- window of no proposals is not speculative decoding, and pretending otherwise would hide a
+-- typo behind a slower-but-correct path.
+parseProposals :: String -> Either String Int
+parseProposals raw = case reads raw of
+  [(n, "")] | n >= 1 && n <= maxProposals -> Right n
+            | otherwise ->
+                Left ("--speculative-k must be between 1 and " ++ show maxProposals
+                      ++ ", got " ++ raw)
+  _ -> Left ("--speculative-k must be an integer, got " ++ raw)
 
 -- | A seed supplied with temperature 0 is accepted and reported as unused rather than
 -- silently dropped (the plan is explicit about both halves of that).

@@ -76,6 +76,27 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
  */
 void engine_destroy(EngineHandle *engine);
 
+/**
+ * Load weight-only INT4 operands for the dense FFN roles from a converted sidecar (plan Q2).
+ *
+ * `manifest_dir` holds a `weights.manifest.json` written by scripts/quantize_weights.py and the
+ * `artifacts/` it names. The engine **keeps** the BF16 weights it loaded and adds the packed
+ * operands beside them: decode (M = 1) reads the INT4 weights, batched M keeps reading BF16,
+ * which is the split the Q2 measurement supports (the warp-per-row GEMV is 2.25x faster than
+ * BF16 at M = 1, the tiled kernel 8-30x slower at M > 1). Call it after engine_create and
+ * before any forward.
+ *
+ * Every dense layer of the descriptor must have both an `mlpGateUp` pair and an `mlpDown`, or
+ * the call fails: a layer with one and not the other would silently run mixed precision. A
+ * tensor-parallel or expert-parallel engine is refused, because the converter quantizes whole
+ * tensors and a rank's shard is not what the sidecar describes. The manifest's extents are
+ * checked against this layer's own weights and its SHA-256 against the bytes on disk before
+ * anything is uploaded.
+ *
+ * @return ENGINE_OK, or a negative error code with the reason in engine_last_error().
+ */
+int engine_load_quantized_ffn(EngineHandle *engine, const char *manifest_dir);
+
 /* ------------------------------------------------------------------ */
 /*  Inference                                                         */
 /* ------------------------------------------------------------------ */
@@ -120,6 +141,37 @@ int engine_decode(EngineHandle *engine,
  * counter). Call before each new request.
  */
 void engine_reset(EngineHandle *engine);
+
+/**
+ * Verify: consume @num_tokens@ ids as one bounded batch and return **every** row's logits
+ * (plan S1). Row @i@ is the distribution that conditions on @token_ids[0..i]@, so a caller
+ * proposing a window can score each candidate against the target's own state instead of paying
+ * one decode per proposal.
+ *
+ * The ordinary entry points deliberately compute only the final row to avoid a
+ * @[max_chunk, vocab]@ buffer; this one allocates that buffer lazily on first use. The tokens
+ * are appended to the current sequence exactly as @engine_decode@ would append them, and the
+ * caller is responsible for truncating with engine_truncate when a proposal is rejected.
+ *
+ * @param out_logits  Host buffer of at least @num_tokens * vocab_size@ floats, row-major.
+ * @param capacity    Its length in floats; a short buffer is refused rather than overrun.
+ * @return            ENGINE_OK, or a negative error code with the reason in engine_last_error().
+ */
+int engine_verify_rows(EngineHandle *engine, const int64_t *token_ids, int num_tokens,
+                       float *out_logits, long long capacity);
+
+/**
+ * Truncate the sequence back to @retain_len@ tokens, so the next append overwrites what was
+ * dropped (plan S1's "append-only cache truncation restricted to the current sequence and an
+ * available prefix").
+ *
+ * Admitted only for a model whose every layer is full attention. A GDN layer's recurrent state
+ * cannot be inverted, and MLA needs its own admission, so both are refused rather than left to
+ * disagree with the cache: that admission is S2's hybrid checkpoints, not this call.
+ *
+ * @return ENGINE_OK, or a negative error code with the reason in engine_last_error().
+ */
+int engine_truncate(EngineHandle *engine, int retain_len);
 
 /* ------------------------------------------------------------------ */
 /*  Queries                                                           */

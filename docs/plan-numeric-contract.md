@@ -1674,8 +1674,8 @@ requires saved-rounded-value and backward/gradient revalidation from Stage 4.
 
 ### Q — Weight-only quantization
 
-**Status: Q2 is implemented up to its fixtures and its first kernel, 2026-09-26; nothing is
-routed into the engine, and the measurement says why.** `csrc/kernels/gemm_quant.cu` is the
+**Status: Q2 is implemented and routed, 2026-09-26: the dense FFN's decode path reads the packed
+operands, and the measurement is what decided which path.** `csrc/kernels/gemm_quant.cu` is the
 weight-only INT4 GEMM - `C = A * B^T` with a BF16 activation, the Q0-packed weight and a BF16
 output accumulated in FP32 - and it does what the plan's Q2 demands of it: the weights are
 **unpacked and scaled inside the thread** (one 32-bit load carries eight codes, the group's
@@ -1738,6 +1738,27 @@ weight-only INT4 with BF16 activations is a **decode-time specialization**, and 
 means the warp-per-row GEMV for M = 1 plus the F1-compatible packed-row layout, with the
 batched path left in the tree, verified, and recorded as inadmissible at these shapes rather
 than routed.
+
+**The routing is done, and the quality gate is what says it is admissible.** `forward_mlp` reads
+the packed operands when `tokens == 1` and BF16 otherwise, so prefill is untouched and decode is
+the specialization; `engine_load_quantized_ffn` installs the operands beside the BF16 weights
+after validating the sidecar, refuses a tensor-parallel engine (the converter quantizes whole
+tensors), requires every dense layer to be covered (a half-quantized layer would be silent mixed
+precision), and refuses to coexist with a training store in either direction - a publication
+writes the BF16 weights and would leave the packed operands describing the old ones.
+`ctest test_quantized_ffn` is the gate. On the synthetic dense fixture the prefill logits are
+**bitwise equal**, the worst decode rms is **9.08e-3** over 8 steps, top-1 is 7/8 with the flip
+explained by its margin (3.2e-3, below the step's 2.7e-2 perturbation - a tie-break, and the gate
+requires exactly that), and the held-out NLL moves by **-0.0008 nats**. On a real model
+(Qwen3-4B, 36 dense full-attention layers) the same gate reports prefill **bitwise unchanged**,
+worst decode rms **1.00379**, top-1 **6/8 with both flips tie-breaks and none unexplained**, the
+held-out NLL **+0.28559 nats** inside a per-model budget, and the **cost side the plan's Q gates
+ask for**: 1322.6 MiB resident (from a 2204.5 MiB sidecar, whose pairs duplicate their members),
+a 6.04 s load, TTFT **unchanged** at 17.27 ms and decode **17.09 -> 10.60 ms, 1.61x** (58.3 ->
+94.1 tok/s). The converter's own error on the deployment target is max_abs 0.0835 / rms 1.37e-3
+over 192 role instances in 1705 s. A packed operand is a numerical-policy change and nothing else:
+`numerical_policy_id` moves, `semantic_id` and `deployment_id` do not, and `manifest_test.c` pins
+that.
 
 **Q0 and Q1 status.** — the format, its reference, the converter, the sidecar and its reader;
 the Q2 kernel consumes the format, and the engine does not yet consume the sidecar.**
@@ -1955,7 +1976,7 @@ Extend `tests/GenerationSpec.hs`, `tests/generation_engine_stub.c`,
 Any additional test target/module must be registered in the existing Cabal or
 CMake configuration. No CUDA pointers cross the Haskell boundary.
 
-- [ ] **S0 — Build a sequential correctness prototype first.** Own two
+- [x] **S0 — Build a sequential correctness prototype first.** Own two
   independent runtimes, prefilling the identical token prefix. Validate complete
   tokenizer/token-ID and special-token compatibility, not just vocabulary size;
   use the same prompt/template encoding and check both context capacities.
@@ -1965,7 +1986,7 @@ CMake configuration. No CUDA pointers cross the Haskell boundary.
   candidate to this target baseline. Recover draft by reset plus sequential
   prefix replay. This validates acceptance, pending-token and lifetime logic,
   but is explicitly not a speedup. Keep the normal target-only path available.
-- [ ] **S1 — Add bounded all-position verification and append-cache rollback.**
+- [x] **S1 — Add bounded all-position verification and append-cache rollback.**
   Introduce a proposed `engine_verify_rows` API that consumes n token IDs and
   returns n FP32 vocabulary rows, with explicit output capacity and checked
   sizes. Apply final norm and LM head to every input row, respecting `max_chunk`;
@@ -1996,6 +2017,45 @@ CMake configuration. No CUDA pointers cross the Haskell boundary.
   S0 or narrow support/fix numerical alignment under Stage 6; do not hide changed
   tokens behind a logit RMS tolerance or certify only near-tie positions without
   a justified error bound. Quantized targets get their own target-only baseline.
+
+**S0 status (2026-09-26): implemented and gated; S1–S3 are open.** `Infer.Generation.generateSpeculative`
+owns two runtimes over the same prompt, keeps the plan's invariant (`P` consumed in both, the last
+confirmed token still pending), takes the longest matching prefix with the target's own argmax as
+the correction or bonus, emits only target-confirmed tokens up to the first EOS, bounds the window
+by the budget and both contexts, and recovers a rejected round by resetting and **sequentially**
+replaying `P + [x] + y[1:r]` - deliberately the slow, obviously-correct recovery, since checkpoints
+are S2 and a chunked replay would produce a state Stage 2 measured to differ from the serial path.
+Admission is one token space (vocabulary *and* the prompt's encoding under both tokenizers) with
+both contexts holding the prompt, and the CLI refuses a window without a draft, above temperature 0,
+with `--stream` or outside 1..16 before loading anything. The CPU gate extends the scripted engine
+to two handles with an observable consumed history - and to a *prefix-indexed* script mode, without
+which reset-and-replay would not be faithful - and covers the plan's list: k = 1, full acceptance,
+rejection at every position, repeated rejection, lowest-ID ties, first/accepted/correction/bonus
+EOS, budgets 0/1 and the window boundaries, context exhaustion, and the refusal of a differing
+vocabulary. 71 examples pass in `cabal test infer-generation-tests` (locally and on the pod), and
+`tests/test_speculative.py` adds the 18 CLI refusals. **What is not done**: S1's bounded
+all-position verification and append-cache rollback (the prototype verifies with sequential decode
+calls), S2's checkpoints (so recovery is a full replay), S3's cross-case admission gates, and any
+measurement of acceptance or speed - S0 is explicitly not a speedup.
+
+**S1 status (2026-09-26): implemented; its device gate is the open confirmation.** `engine_verify_rows`
+consumes n ids as one bounded batch (refusing n > max_chunk rather than silently chunking, and
+refusing a host buffer shorter than n x vocab instead of overrunning it) and returns every row's
+FP32 logits: the ordinary path deliberately computes only the final row to avoid a
+[max_chunk, vocab] buffer, so this allocates one lazily and normalizes the whole activation in a
+single call. The tokens append to the current sequence exactly as `engine_decode` appends them,
+and `engine_truncate` takes the sequence back to a retained length - admitted only for a model
+whose every layer is full attention, because a GDN state cannot be rewound and MLA needs its own
+admission (that is S2's checkpoint work; the call refuses rather than leaving the cache and the
+state disagreeing). `generateSpeculative` now uses both: the round's verification is one batch, and
+the rollback is "truncate the target back to the retained prefix, and either truncate the draft or
+make it consume its missing last proposal" instead of S0's full replay - the plan's "on full
+acceptance draft must additionally consume its missing yk". The CLI refuses a target or draft with a
+recurrent layer up front, so the admission failure cannot arrive mid-run. `tests/test_verify_rows.py`
+is the device gate: n = 1 must be **bitwise** a decode (one execution case), n > 1 is reported
+row-by-row with every argmax required to match serial execution, the rollback must leave the batch
+engine where the serial one is, and a short buffer, a window past max_chunk, a truncation past the
+sequence and a recurrent model must all be refused.
 
 #### Round protocol and failure semantics
 

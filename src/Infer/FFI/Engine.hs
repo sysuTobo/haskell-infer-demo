@@ -20,6 +20,8 @@ module Infer.FFI.Engine
     -- * Inference
   , enginePrefill
   , engineDecode
+  , engineVerifyRows
+  , engineTruncate
   , engineReset
     -- * Queries
   , engineVocabSize
@@ -61,6 +63,12 @@ foreign import ccall unsafe "engine.h engine_prefill"
 
 foreign import ccall unsafe "engine.h engine_decode"
   c_engine_decode :: Ptr EngineHandle -> Int64 -> Ptr CFloat -> IO CInt
+
+foreign import ccall unsafe "engine.h engine_truncate"
+  c_engine_truncate :: Ptr EngineHandle -> CInt -> IO CInt
+
+foreign import ccall unsafe "engine.h engine_verify_rows"
+  c_engine_verify_rows :: Ptr EngineHandle -> Ptr Int64 -> CInt -> Ptr CFloat -> CLLong -> IO CInt
 
 foreign import ccall unsafe "engine.h engine_reset"
   c_engine_reset :: Ptr EngineHandle -> IO ()
@@ -135,6 +143,39 @@ engineDecode h token vocabSize =
       else do
         logits <- peekArray vocabSize pLogits
         return (Right (map realToFrac logits))
+
+-- | Verify (plan S1): consume @tokens@ as one bounded batch and return **every** row's logits,
+-- in order. Row @i@ conditions on @tokens[0..i]@, so a round can score a whole window against
+-- the target's own state instead of paying one decode per proposal. The tokens are appended to
+-- the current sequence; the caller truncates with 'engineTruncate' when a proposal is rejected.
+engineVerifyRows :: Ptr EngineHandle -> [Int64] -> Int -> IO (Either String [[Float]])
+engineVerifyRows h tokens vocabSize =
+  withArray tokens $ \pTokens ->
+    allocaArray capacity $ \pRows -> do
+      rc <- c_engine_verify_rows h pTokens (fromIntegral (length tokens)) pRows
+              (fromIntegral capacity)
+      if rc /= 0
+        then do
+          err <- engineLastError
+          return (Left err)
+        else do
+          flat <- peekArray capacity pRows
+          return (Right [ map realToFrac (take vocabSize (drop (row * vocabSize) flat))
+                        | row <- [0 .. length tokens - 1] ])
+  where
+    capacity = length tokens * vocabSize
+
+-- | Truncate the sequence back to @retainLen@ tokens (plan S1's append-only rollback), so the
+-- next append overwrites what was dropped. A model with a recurrent layer is refused by the
+-- engine, which is what reserves this for pure full-attention models until S2.
+engineTruncate :: Ptr EngineHandle -> Int -> IO (Either String ())
+engineTruncate h retainLen = do
+  rc <- c_engine_truncate h (fromIntegral retainLen)
+  if rc /= 0
+    then do
+      err <- engineLastError
+      return (Left err)
+    else return (Right ())
 
 engineReset :: Ptr EngineHandle -> IO ()
 engineReset = c_engine_reset

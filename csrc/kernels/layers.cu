@@ -118,14 +118,31 @@ int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
     { PROFILE_SCOPE("mlp.post_norm", stream);
     layer_norm(normed, residual, w->post_norm_w, H, tokens, dims, stream);
     }
+    /* Decode reads the weight-only INT4 operands when the engine loaded them (plan Q2): the
+     * weights are unpacked and scaled inside the thread, so a quarter of a BF16 weight's bytes
+     * are read, and at M = 1 that is where the format's advantage is (measured 2.25x). Batched
+     * M deliberately stays on cuBLAS BF16 - the same kernel is 8-30x *slower* there because a
+     * SIMT int4 kernel is instruction-bound on the unpack once there is more than one
+     * multiply-accumulate per byte. */
+    const bool int4 = tokens == 1 && w->gate_up_i4 != nullptr && w->down_i4 != nullptr;
     { PROFILE_SCOPE("mlp.gate_up_gemm", stream);
-    checked_gemm(cublas, packed, normed, w->gate_proj_w, tokens, 2 * I, H);
+    if (int4) {
+        gemm_int4_bf16(normed, w->gate_up_i4, w->gate_up_i4_scales, packed, tokens, 2 * I, H,
+                       w->i4_group, stream);
+    } else {
+        checked_gemm(cublas, packed, normed, w->gate_proj_w, tokens, 2 * I, H);
+    }
     }
     { PROFILE_SCOPE("mlp.silu_mul", stream);
     kernel_silu_mul_packed(mlp_act, packed, tokens, I, stream);
     }
     { PROFILE_SCOPE("mlp.down_gemm", stream);
-    checked_gemm(cublas, layer_out, mlp_act, w->down_proj_w, tokens, H, I);
+    if (int4) {
+        gemm_int4_bf16(mlp_act, w->down_i4, w->down_i4_scales, layer_out, tokens, H, I,
+                       w->i4_group, stream);
+    } else {
+        checked_gemm(cublas, layer_out, mlp_act, w->down_proj_w, tokens, H, I);
+    }
     }
     return 0;
 }

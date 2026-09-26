@@ -14,6 +14,7 @@ import qualified Data.ByteString as BS
 import Control.Exception (onException)
 import Foreign.Ptr
 import System.Exit (exitFailure)
+import System.IO (hPutStrLn, stderr)
 
 import Infer.Config
 import Infer.Descriptor
@@ -54,7 +55,7 @@ loadDescriptor cfg = case rcDescriptor cfg of
   where
     validated desc = validateDescriptor desc >> pure desc
     finish (Left err) = do
-      putStrLn $ "ERROR: cannot load model descriptor: " ++ err
+      hPutStrLn stderr $ "ERROR: cannot load model descriptor: " ++ err
       exitFailure
     finish (Right desc) = pure (withMaxSeqLen (rcMaxSeqLen cfg) desc)
 
@@ -64,36 +65,36 @@ initRuntime cfg = do
   base <- loadDescriptor cfg
   (policy, desc) <- case resolveTopology (rcTp cfg) (rcEp cfg) base of
     Left err -> do
-      putStrLn $ "ERROR: " ++ err
+      hPutStrLn stderr $ "ERROR: " ++ err
       exitFailure
     Right resolved -> return resolved
-  putStrLn $ "Descriptor: " ++ dFamily desc ++ " (" ++ dModelType desc ++ "), "
+  hPutStrLn stderr $ "Descriptor: " ++ dFamily desc ++ " (" ++ dModelType desc ++ "), "
     ++ show (dNumLayers desc) ++ " layers, hidden " ++ show (dHiddenSize desc)
     ++ ", vocab " ++ show (dVocabSize desc)
 
   model <- case modelDef desc policy (rcDevices cfg) of
     Left err -> do
-      putStrLn $ "ERROR: " ++ err
+      hPutStrLn stderr $ "ERROR: " ++ err
       exitFailure
     Right md -> return md
-  putStrLn $ "  Placement (" ++ show (plPolicy (mdPlacement model)) ++ "): "
+  hPutStrLn stderr $ "  Placement (" ++ show (plPolicy (mdPlacement model)) ++ "): "
     ++ show (plLayersPerDevice (mdPlacement model))
 
-  putStrLn $ "Loading tokenizer from " ++ rcModelDir cfg ++ "/tokenizer.json"
+  hPutStrLn stderr $ "Loading tokenizer from " ++ rcModelDir cfg ++ "/tokenizer.json"
   mTok <- loadTokenizer (rcModelDir cfg ++ "/tokenizer.json")
   tok <- case mTok of
     Nothing -> do
-      putStrLn "ERROR: Failed to load tokenizer.json"
+      hPutStrLn stderr "ERROR: Failed to load tokenizer.json"
       exitFailure
     Just t -> return t
 
-  putStrLn $ "Initializing engine on " ++ show (length (rcDevices cfg)) ++ " GPU(s)..."
+  hPutStrLn stderr $ "Initializing engine on " ++ show (length (rcDevices cfg)) ++ " GPU(s)..."
   mEngine <- engineCreate (rcModelDir cfg) (encodeDescriptor desc)
     (plDevices (mdPlacement model)) (plLayerDevices (mdPlacement model))
   engine <- case mEngine of
     Nothing -> do
       err <- engineLastError
-      putStrLn $ "ERROR: engine_create failed: " ++ err
+      hPutStrLn stderr $ "ERROR: engine_create failed: " ++ err
       -- The tokenizer is already live; release it before bailing out so a
       -- failed engine brings the whole runtime down without a leak.
       freeTokenizer tok
@@ -104,7 +105,7 @@ initRuntime cfg = do
   -- bracket never sees an acquisition, so release them here rather than leaking.
   withRuntimeResources engine tok $ do
     vocab <- engineVocabSize engine
-    putStrLn "Engine initialized successfully."
+    hPutStrLn stderr "Engine initialized successfully."
     return Runtime
       { rtEngine = engine
       , rtTokenizer = tok

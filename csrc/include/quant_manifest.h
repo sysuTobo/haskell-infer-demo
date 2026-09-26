@@ -40,10 +40,12 @@ extern "C" {
 #define QUANT_MANIFEST_VERSION 1
 
 /* A manifest that names more entries, pairs or bytes than these is refused rather than
- * silently truncated. The counts are small because the plan's scope is the dense FFN roles
- * of one model; raising them is a deliberate edit, not an accident. */
-#define QUANT_MANIFEST_MAX_ENTRIES 128
-#define QUANT_MANIFEST_MAX_PAIRS 64
+ * silently truncated. The bounds are deliberate: the deployment model's dense FFN is 64 layers
+ * x 3 roles = 192 entries and 64 pairs, so the ceilings leave room without letting a malformed
+ * document size a caller's stack. Because the parsed manifest is ~1 MiB at these limits, a
+ * caller must not keep it on the stack - the engine's loader allocates it on the heap. */
+#define QUANT_MANIFEST_MAX_ENTRIES 256
+#define QUANT_MANIFEST_MAX_PAIRS 128
 #define QUANT_MANIFEST_NAME_MAX 64
 #define QUANT_MANIFEST_PATH_MAX 512
 #define QUANT_MANIFEST_SHA256_HEX 65

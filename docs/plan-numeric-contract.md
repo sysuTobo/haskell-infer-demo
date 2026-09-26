@@ -1712,14 +1712,32 @@ which is the format's advantage showing up as a measurement rather than a claim 
 theoretical 4x: the kernel reaches 208 GB/s of the device's ~700, so latency hiding is still
 the limit).
 
-**Only the decode path is admissible, and only that one may be routed.** The batched path is
-44x *slower* than BF16 at M = 64, so routing it would regress prefill; it needs a
-shared-memory-tiled GEMM (the weight tile loaded once and reused across the M rows) before it
-is used anywhere. The plan's "Measure M = 1 and batched M separately before choosing
-specializations" is what produced that split, and the routing now means: the warp-per-row GEMV
-for M = 1, the F1-compatible packed-row layout (the plan's "concatenate packed rows and scale
-rows consistently and preserve its activation layout"), and the tiled kernel for M > 1 - in
-that order.
+**Only the decode path is admissible, and the batched path was built and measured before that
+was concluded.** The batched path is now a shared-memory-tiled GEMM (block tile 64x64, the K
+slice exactly one scale group so the slice's sums are scaled once, a 4x4 micro-tile per thread,
+the activation tile padded off one bank) and it is **verified correct** - all the same checks
+pass - but it is far too slow to route:
+
+| M | int4 tiled | BF16 | effective rate |
+|---|---|---|---|
+| 1 (GEMV, not tiled) | **54.3 us** | 115.3 us | **2.12x faster** |
+| 2 | 924.1 us | 116.0 us | 0.13x |
+| 16 | 996.7 us | 116.4 us | 0.12x |
+| 64 | 2247.7 us | 116.0 us | 0.05x |
+| 128 | 3316.1 us | 114.5 us | 0.03x |
+
+The reason is not the tiling but the arithmetic: at N=4096, K=5120 the BF16 path is
+*weight-bandwidth-bound* at ~115 us for every M (365 GB/s of a 42 MB read), so the format's
+four-fold byte saving *should* win - and the decode path does win, because at M = 1 there is one
+multiply-accumulate per byte read and the bytes are what cost. As M grows there are more
+multiply-accumulates per byte, and a SIMT kernel pays an unpack instruction for each one:
+measured **1.2-2.7 TFLOP/s** against the tensor cores' 23-47. Putting the same products on the
+*int* tensor cores is what would change this, and that needs int8 activations - which the plan
+scopes out ("activation quantization, QAT and quantized optimizers are separate work"). So
+weight-only INT4 with BF16 activations is a **decode-time specialization**, and the routing
+means the warp-per-row GEMV for M = 1 plus the F1-compatible packed-row layout, with the
+batched path left in the tree, verified, and recorded as inadmissible at these shapes rather
+than routed.
 
 **Q0 and Q1 status.** — the format, its reference, the converter and
 the sidecar; not yet a kernel consuming any of it.** `scripts/quantize_weights.py` converts a

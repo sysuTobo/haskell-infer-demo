@@ -174,10 +174,20 @@ instrument and the numbers rather than a guess:
   and **2.25x faster than BF16 on the same values**, which turns the format's advantage into a
   measurement instead of a claim. It is not the theoretical 4x: the kernel reaches 208 GB/s of
   the device's ~700, so latency hiding is still the limit.
-- **only the decode path is admissible.** The batched path is 44x *slower* than BF16 at M=64, so
-  routing it would regress prefill: it needs a shared-memory-tiled GEMM first. The routing
-  order is therefore the GEMV for M=1, the F1-compatible packed-row layout, then the tiled
-  kernel for M>1.
+- **the batched path was then built and measured, and the verdict is decode-only.** The batched
+  kernel is now a shared-memory-tiled GEMM (64x64 block tile, the K slice exactly one scale
+  group so each slice's sums are scaled once, a 4x4 micro-tile per thread, the activation tile
+  padded off one bank). Two bugs the gate caught on the way: applying only the *last* slice's
+  scale (every group has its own), and an early `return` for threads with no output rows, which
+  left the block's `__syncthreads()` with a different set of arrivals and silently corrupted the
+  M=2 and M=8 cases. Both fixed (the second became a work guard that still reaches the
+  barriers); all 13 checks pass on both paths. But it is 8-30x slower than BF16 (M=2 924 us, M=16
+  997 us, M=128 3316 us against BF16's flat ~115 us), because at N=4096, K=5120 BF16 is
+  *weight-bandwidth-bound* at every M while the SIMT int4 kernel is *instruction-bound* on the
+  nibble unpack (measured 1.2-2.7 TFLOP/s against the tensor cores' 23-47). Only M=1 wins
+  (**54.3 vs 115.3 us, 2.12x**). Putting those products on the int tensor cores needs int8
+  activations, which the plan scopes out, so **weight-only INT4 with BF16 activations is a
+  decode-time specialization**.
 - two fixture bugs the gate caught before the kernel was trusted: the test passed a float32
   activation where the kernel reads BF16, and wrote the BF16 output into a float32 buffer
   (which produced denormals whose signs tracked the reference - the giveaway). Both were in the

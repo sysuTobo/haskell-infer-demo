@@ -897,9 +897,12 @@ weight-bandwidth-bound, so the format comes before more fusion.
   32-bit word at index t so a warp's loads are consecutive, with the activation staged in shared
   memory once per block - and it is **2.25x faster than the same values in BF16** (52.1 vs
   117.2 us at N=4096, K=5120), which is the format's advantage as a measurement. Its **batched
-  path** is still the first one-thread-per-output kernel and is 44x *slower* than BF16 at M=64,
-  so only the decode case is admissible; a shared-memory-tiled GEMM comes before prefill may use
-  it.
+  path** is a shared-memory-tiled GEMM, verified correct and measured 8-30x *slower* than BF16
+  (M=2 924 us, M=128 3316 us against BF16's flat ~115 us), because at these shapes BF16 is
+  weight-bandwidth-bound while a SIMT int4 kernel is instruction-bound on the nibble unpack
+  (1.2-2.7 TFLOP/s against 23-47). So only the decode case is admissible: **weight-only INT4
+  with BF16 activations is a decode-time specialization**, and reaching the batched regime
+  would take the int tensor cores, i.e. int8 activations, which the plan scopes out.
 
 The plan freezes the wire format "subject to a sm_86 kernel feasibility check": the format and
 its converter are gated, and Q2 now has a kernel admitted against the reference, but that

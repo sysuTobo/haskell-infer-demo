@@ -47,39 +47,113 @@ __device__ __forceinline__ int int4_code(uint32_t word, int j) {
     return nibble >= 8 ? nibble - 16 : nibble;
 }
 
-/* One thread per output element. The K loop walks the packed row eight codes (one 32-bit load)
- * at a time with the group's scale hoisted, so nothing is dequantized into memory. */
-__global__ void gemm_int4_kernel(const __nv_bfloat16 *__restrict__ a,
-                                 const uint8_t *__restrict__ packed,
-                                 const __nv_bfloat16 *__restrict__ scales,
-                                 __nv_bfloat16 *__restrict__ out, int m, int n, int k,
-                                 int group) {
-    const int row = blockIdx.y * blockDim.y + threadIdx.y;  /* output column, over N */
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;  /* output row, over M */
-    if (row >= n || col >= m) return;
+/* Batched M: a shared-memory tiled GEMM. Block tile 64x64, and the K slice is exactly one
+ * scale group (128) - that is what lets the group scale be applied once per slice instead of
+ * once per product, which is the difference between an unpack-per-FMA kernel and one that can
+ * approach the FP32 FMA rate. Each thread owns a 4x4 micro-tile.
+ *
+ * The activation tile is padded to keep the 4-row reads off one bank (a 128-wide bf16 row is
+ * 64 words, i.e. 0 mod 32, so the unpadded tile would put every row on the same bank). */
+constexpr int kBM = 64;
+constexpr int kBN = 64;
+constexpr int kBK = 128; /* == the format's group, one group per slice */
+constexpr int kThreadCols = 16;
+constexpr int kTM = kBM / kThreadCols; /* 4 */
+constexpr int kTN = kBN / kThreadCols; /* 4 */
+constexpr int kAPad = 8;
 
-    const __nv_bfloat16 *a_row = a + (size_t)col * (size_t)k;
-    const uint8_t *w_row = packed + (size_t)row * (size_t)(k / 2);
-    const __nv_bfloat16 *s_row = scales + (size_t)row * (size_t)(k / group);
-    const int groups = k / group;
+__global__ void gemm_int4_tiled_kernel(const __nv_bfloat16 *__restrict__ a,
+                                      const uint8_t *__restrict__ packed,
+                                      const __nv_bfloat16 *__restrict__ scales,
+                                      __nv_bfloat16 *__restrict__ out, int m, int n, int k,
+                                      int group) {
+    __shared__ __nv_bfloat16 a_s[kBM][kBK + kAPad];
+    __shared__ uint8_t w_s[kBN][kBK / 2];
+    __shared__ float scale_s[kBN];
 
-    float acc = 0.0f;
-    for (int g = 0; g < groups; ++g) {
-        const float scale = __bfloat162float(s_row[g]);
-        const uint8_t *w_group = w_row + (size_t)g * (size_t)(group / 2);
-        const __nv_bfloat16 *a_group = a_row + (size_t)g * group;
-        for (int i = 0; i < group; i += 8) {
-            /* One aligned 32-bit load carries eight codes: the group is a multiple of 8 so
-             * `i/2` is a multiple of 4 and the payload's start is 4-byte aligned. */
-            const uint32_t word = *(const uint32_t *)(w_group + i / 2);
+    const int tx = threadIdx.x % kThreadCols;
+    const int ty = threadIdx.x / kThreadCols;
+    const int row_base = blockIdx.x * kBM; /* over M */
+    const int col_base = blockIdx.y * kBN; /* over N */
+    /* A thread whose four output rows are all outside M has no arithmetic to do - without
+     * this the block computes a full 64-row tile for an M of 2 and the measurement reads as a
+     * tiling flaw rather than as the instruction-bound ceiling it is. It must still take part
+     * in the staging and the barriers: returning here would leave the block's __syncthreads()
+     * with a different set of arrivals, which is undefined. */
+    const bool active = (row_base + ty * kTM) < m;
+
+    float acc[kTN][kTM];
+    float slice[kTN][kTM];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const float weight = (float)int4_code(word, j) * scale;
-                acc = fmaf(weight, __bfloat162float(a_group[i + j]), acc);
+    for (int j = 0; j < kTN; ++j) {
+#pragma unroll
+        for (int i = 0; i < kTM; ++i) acc[j][i] = 0.0f;
+    }
+
+    for (int k0 = 0; k0 < k; k0 += kBK) {
+        for (int i = threadIdx.x; i < kBM * kBK; i += blockDim.x) {
+            const int r = i / kBK, c = i % kBK;
+            const int gr = row_base + r;
+            a_s[r][c] = (gr < m) ? a[(size_t)gr * k + k0 + c] : __float2bfloat16(0.0f);
+        }
+        for (int i = threadIdx.x; i < kBN * (kBK / 2); i += blockDim.x) {
+            const int r = i / (kBK / 2), c = i % (kBK / 2);
+            const int gc = col_base + r;
+            w_s[r][c] = (gc < n) ? packed[(size_t)gc * (k / 2) + k0 / 2 + c] : (uint8_t)0;
+        }
+        for (int i = threadIdx.x; i < kBN; i += blockDim.x) {
+            const int gc = col_base + i;
+            scale_s[i] = (gc < n)
+                             ? __bfloat162float(scales[(size_t)gc * (k / group) + k0 / group])
+                             : 0.0f;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int j = 0; j < kTN; ++j) {
+#pragma unroll
+            for (int i = 0; i < kTM; ++i) slice[j][i] = 0.0f;
+        }
+        for (int kk = 0; active && kk < kBK; ++kk) {
+            float av[kTM];
+#pragma unroll
+            for (int i = 0; i < kTM; ++i) av[i] = __bfloat162float(a_s[ty * kTM + i][kk]);
+#pragma unroll
+            for (int j = 0; j < kTN; ++j) {
+                const uint8_t byte = w_s[tx * kTN + j][kk / 2];
+                const int nibble = (kk % 2 == 0) ? (int)(byte & 0x0F) : (int)(byte >> 4);
+                const float w = (float)(nibble >= 8 ? nibble - 16 : nibble);
+#pragma unroll
+                for (int i = 0; i < kTM; ++i) slice[j][i] = fmaf(w, av[i], slice[j][i]);
             }
         }
+        /* Each K slice is exactly one scale group, so the slice's sums are scaled by that
+         * slice's scale and folded into the total: sum_k(code_k * scale * x_k) ==
+         * scale * sum_k(code_k * x_k), and the FP32 difference between the two associations is
+         * far inside the gate's BF16-sized tolerance. Applying only the *last* slice's scale
+         * would be the obvious bug here. */
+        if (active) {
+#pragma unroll
+            for (int j = 0; j < kTN; ++j) {
+                const float s_col = scale_s[tx * kTN + j];
+#pragma unroll
+                for (int i = 0; i < kTM; ++i) acc[j][i] = fmaf(slice[j][i], s_col, acc[j][i]);
+            }
+        }
+        __syncthreads();
     }
-    out[(size_t)col * (size_t)n + row] = __float2bfloat16(acc);
+
+#pragma unroll
+    for (int i = 0; i < kTM; ++i) {
+        const int gr = row_base + ty * kTM + i;
+        if (gr >= m) continue;
+#pragma unroll
+        for (int j = 0; j < kTN; ++j) {
+            const int gc = col_base + tx * kTN + j;
+            if (gc >= n) continue;
+            out[(size_t)gr * (size_t)n + gc] = __float2bfloat16(acc[j][i]);
+        }
+    }
 }
 
 /* M = 1: one warp per weight row. Lane t loads the 32-bit word at index t, i.e. the eight
@@ -165,12 +239,12 @@ int gemm_int4_bf16(const __nv_bfloat16 *a, const uint8_t *packed, const __nv_bfl
         gemv_int4_kernel<<<grid, block, shared_bytes, stream>>>(a, packed, scales, out, N, K,
                                                                 group);
     } else {
-        /* Batched M still uses the first implementation: it is *not* fast (measured at
-         * 2.1 GB/s of packed weight at M = 64 against the same 10.8 MB read), and a
-         * shared-memory-tiled GEMM is what this path needs before it is routed anywhere. */
-        const dim3 block(16, 16);
-        const dim3 grid((unsigned)((M + 15) / 16), (unsigned)((N + 15) / 16));
-        gemm_int4_kernel<<<grid, block, 0, stream>>>(a, packed, scales, out, M, N, K, group);
+        /* Batched M: the tiled kernel above, which reuses the staged weight and activation
+         * tiles across the block instead of walking a whole weight row per thread. */
+        const dim3 block(kThreadCols * kThreadCols);
+        const dim3 grid((unsigned)((M + kBM - 1) / kBM), (unsigned)((N + kBN - 1) / kBN));
+        gemm_int4_tiled_kernel<<<grid, block, 0, stream>>>(a, packed, scales, out, M, N, K,
+                                                           group);
     }
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {

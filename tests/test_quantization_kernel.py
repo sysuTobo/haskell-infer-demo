@@ -163,7 +163,7 @@ def main():
             n, k = 4096, 5120
             weights = (rng.randn(n, k) * 0.05).astype(np.float32)
             packed, scales = quantize_reference(args.quantize_reference, weights, workdir, "tw")
-            for m in (1, 64):
+            for m in (1, 2, 4, 8, 16, 32, 64, 128):
                 x_bits = np.ascontiguousarray(bf16_round((rng.randn(m, k) * 0.5).astype(np.float32)))
                 out = np.empty((m, n), dtype=np.uint16)
                 for _ in range(3):
@@ -181,9 +181,10 @@ def main():
                     runs.append((time.perf_counter() - start) * 1e6)
                 weight_bytes = n * k / 2 + n * (k // GROUP) * 2
                 median = sorted(runs)[len(runs) // 2]
-                line = (f"timing M={m:<3} N={n} K={k}: median {median:.1f} us, "
-                        f"{weight_bytes / (median * 1e-6) / 1e9:.1f} GB/s of packed weight "
-                        f"({weight_bytes / 1e6:.1f} MB read)")
+                flops = 2.0 * m * n * k
+                line = (f"timing M={m:<4} N={n} K={k}: int4 {median:8.1f} us "
+                        f"({weight_bytes / (median * 1e-6) / 1e9:6.1f} GB/s packed, "
+                        f"{flops / (median * 1e-6) / 1e12:5.1f} TFLOP/s)")
                 # The comparison that matters is against the *same values* in BF16, so the
                 # time gap is the format's and not the fixture's. torch is only needed here.
                 try:
@@ -206,8 +207,10 @@ def main():
                             torch.cuda.synchronize()
                             samples.append((time.perf_counter() - start) * 1e6)
                         bf16_median = sorted(samples)[len(samples) // 2]
-                        line += (f"; the same values as BF16: {bf16_median:.1f} us "
-                                 f"(2x the bytes read, and {bf16_median / median:.2f}x the time)")
+                        line += (f" | BF16 {bf16_median:8.1f} us "
+                                 f"({flops / (bf16_median * 1e-6) / 1e12:5.1f} TFLOP/s, "
+                                 f"2x the bytes) -> int4 is "
+                                 f"{bf16_median / median:.2f}x the BF16 time")
                 except ImportError:
                     line += "; BF16 comparison skipped (no torch)"
                 print(line)

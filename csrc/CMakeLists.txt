@@ -75,7 +75,7 @@ add_library(engine SHARED
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu kernels/mla.cu
-    kernels/logprob.cu kernels/backward.cu kernels/backward_paired.cu
+    kernels/logprob.cu kernels/backward.cu kernels/backward_paired.cu kernels/gemm_quant.cu
     backward_layers.cu
     "${GENERATED}/aot_kernels.cpp" "${GENERATED}/aot_kernels.h"
     "${GENERATED}/causal_conv1d.h" "${GENERATED}/causal_conv1d_update.cuh"
@@ -315,4 +315,12 @@ if(BUILD_TESTS)
     add_test(NAME test_library_ops COMMAND ${Python3_EXECUTABLE}
              "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_library_ops.py"
              --library $<TARGET_FILE:kernel_test_bridge>)
+
+    # Q2's gate (plan Q2): the weight-only INT4 GEMM against an independently dequantized-weight
+    # reference, over the FFN shapes and M = 1/2/8/64, plus the shape refusals. The reference is
+    # a numpy dequantization of the payload the Q0 binary produced, not the kernel's own output.
+    add_test(NAME test_quantization_kernel COMMAND ${Python3_EXECUTABLE}
+             "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_quantization_kernel.py"
+             --library $<TARGET_FILE:kernel_test_bridge>
+             --quantize-reference $<TARGET_FILE:test_quantization_format>)
 endif()

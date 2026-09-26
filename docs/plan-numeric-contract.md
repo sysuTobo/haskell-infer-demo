@@ -1674,7 +1674,39 @@ requires saved-rounded-value and backward/gradient revalidation from Stage 4.
 
 ### Q — Weight-only quantization
 
-**Status: Q0 and Q1 are implemented, 2026-09-26 — the format, its reference, the converter and
+**Status: Q2 is implemented up to its fixtures and its first kernel, 2026-09-26; nothing is
+routed into the engine, and the measurement says why.** `csrc/kernels/gemm_quant.cu` is the
+weight-only INT4 GEMM - `C = A * B^T` with a BF16 activation, the Q0-packed weight and a BF16
+output accumulated in FP32 - and it does what the plan's Q2 demands of it: the weights are
+**unpacked and scaled inside the thread** (one 32-bit load carries eight codes, the group's
+scale hoisted out of the inner loop), so a quarter of a BF16 weight's bytes are read and
+nothing is dequantized into memory. Unsupported shapes are refused by the host wrapper at
+creation time rather than midway through a request.
+
+`ctest test_quantization_kernel` is the gate, and it makes the plan's **two separate
+comparisons**: the kernel against an *independently dequantized-weight* reference (the payload
+dequantized in numpy from the format's definition and multiplied in float64) and the quantizer
+against the original weight. Only the first is asserted, and tightly: across the FFN shapes
+and M = 1/2/8/64 the kernel's error is `max_rel <= 3e-3`, `rms_rel <= 5e-4` - inside the BF16
+output's own rounding, which a wrong nibble, a wrong scale or a wrong group index cannot pass.
+The second is reported (max_abs 0.021-0.027, rms 0.0074 of a |w| max of ~0.38) because the
+quantizer's quality is a model-level question the plan assesses with logits RMS, top-1
+agreement and held-out NLL once a kernel is actually routed.
+
+**The measurement is why it is not routed.** The plan asks for M = 1 and batched M to be
+measured separately before choosing specializations, and on one A40 at N = 4096, K = 5120 this
+first implementation reads its 10.8 MB of packed weight at **29.5 GB/s** for M = 1 (366.7 us)
+and 2.1 GB/s for M = 64 (5161 us). The device has roughly 700 GB/s, and a BF16 GEMV of the same
+shape would read 42 MB in about 60 us, so this kernel would be several times *slower* than what
+it replaces. The cause is the mapping, not the format: one thread per output element gives each
+thread a whole weight row, so a warp's loads walk different rows and are uncoalesced. Routing
+it now would regress the model, which is exactly what "only admit when the intended workload
+improves" forbids, so the next step is a coalesced/tiled kernel (a warp cooperating on a row
+for the M = 1 case, shared-memory tiling of the activation for batched M) and *then* the
+routing, the F1-compatible packed-row layout (the plan's "concatenate packed rows and scale
+rows consistently and preserve its activation layout") and the model-quality gates.
+
+**Q0 and Q1 status.** — the format, its reference, the converter and
 the sidecar; not yet a kernel consuming any of it.** `scripts/quantize_weights.py` converts a
 checkpoint's admitted roles (the dense FFN gate/up/down, per Q's initial scope) into a
 separate output directory without touching the BF16 checkpoint, and writes a versioned
@@ -1788,7 +1820,7 @@ These are proposed new files, not current capabilities.
   support in safetensors does not authorize arbitrary integer model weights.
   Represent each linear weight with format, logical/local dimensions, packed
   pointer and scales; register every allocation for partial-load cleanup.
-- [ ] **Q2 — Add real weight-only execution, then model gates.** Start from
+- [x] **Q2 — Add real weight-only execution, then model gates.** (the kernel and its fixtures; the routing waits on the measurement above) Start from
   pack/unpack and synthetic GEMM fixtures, then route only admitted FFN roles to
   a kernel that unpacks/scales inside its register/shared-memory tiles. Reject
   full-weight dequantization into a BF16 temporary on every forward: it restores

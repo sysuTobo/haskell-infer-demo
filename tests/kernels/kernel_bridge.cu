@@ -77,3 +77,19 @@ extern "C" int test_silu_mul_packed(void *out, const void *packed, int tokens,
         return -1;
     }
 }
+
+/* The weight-only INT4 GEMM (plan Q2): the activation in BF16, the weight packed in the Q0
+ * format, the output in BF16. */
+extern "C" int test_gemm_int4(void *out, const void *a, const void *packed, const void *scales,
+                              int M, int N, int K, int group) {
+    try {
+        gemm_int4_bf16(static_cast<const __nv_bfloat16 *>(a),
+                       static_cast<const uint8_t *>(packed),
+                       static_cast<const __nv_bfloat16 *>(scales),
+                       static_cast<__nv_bfloat16 *>(out), M, N, K, group, nullptr);
+        return int(cudaDeviceSynchronize());
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "test_gemm_int4: %s\n", error.what());
+        return -1;
+    }
+}

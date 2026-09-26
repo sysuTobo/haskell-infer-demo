@@ -143,6 +143,32 @@ instrument and the numbers rather than a guess:
   a NULL handle look valid on device 0, which poisoned the stream and aborted the 2-device
   forward at the third scope.
 
+**Q2: the weight-only INT4 GEMM, verified numerically and measured (plan Q2, first half,
+2026-09-26).**
+
+- `csrc/kernels/gemm_quant.cu`: `C = A * B^T` with a BF16 activation, the Q0-packed weight and
+  a BF16 output accumulated in FP32. The weights are **unpacked and scaled inside the thread**
+  (one 32-bit load carries eight codes, the group's scale hoisted out of the inner loop), which
+  is the plan's alternative to "full-weight dequantization into a BF16 temporary on every
+  forward". Shapes the format cannot hold are refused by the host wrapper at creation time.
+- `ctest test_quantization_kernel` makes the plan's **two separate comparisons**: the kernel
+  against an independently dequantized-weight reference (the payload dequantized in numpy from
+  the format's definition, multiplied in float64) and the quantizer against the original
+  weight. Only the first is asserted, tightly: across the FFN shapes and M = 1/2/8/64,
+  `max_rel <= 3e-3` and `rms_rel <= 5e-4` - inside the BF16 output's own rounding. The second is
+  reported (max_abs 0.021-0.027, rms 0.0074 of |w| max ~0.38).
+- **the measurement blocks the routing, on purpose.** On one A40 at N=4096, K=5120 the kernel
+  reads its 10.8 MB of packed weight at **29.5 GB/s for M=1** (366.7 us) and 2.1 GB/s for
+  M=64 (5161 us), against ~700 GB/s available: one thread per output element gives each thread
+  a whole weight row, so a warp's loads walk different rows and are uncoalesced, and the kernel
+  would be several times *slower* than the BF16 GEMV it would replace. Routing it now would
+  regress the model, so the next step is a coalesced/tiled kernel, then the routing, the
+  F1-compatible packed-row layout and the model-quality gates.
+- two fixture bugs the gate caught before the kernel was trusted: the test passed a float32
+  activation where the kernel reads BF16, and wrote the BF16 output into a float32 buffer
+  (which produced denormals whose signs tracked the reference - the giveaway). Both were in the
+  test, not the kernel, and both are why the "independent reference" check exists.
+
 **Q1: the converter and the weights.manifest.json sidecar** (plan Q1, verified 2026-09-26).
 
 - `scripts/quantize_weights.py` converts the admitted roles - the dense FFN gate/up/down, Q's
@@ -827,6 +853,12 @@ CPU case pinning the behaviour.
   and both gates then run. A stronger fix would store the fixture on the PVC next to the other
   models, or make a skip a distinct CTest status (`set_tests_properties(... SKIP_RETURN_CODE)`)
   so the count cannot hide it.
+- **The quantized GEMM is verified but not yet an optimization.** `gemm_int4_bf16` matches an
+  independently dequantized-weight reference within BF16 rounding (max_rel <= 3e-3), but its
+  row-per-thread mapping leaves it at 29.5 GB/s of packed weight at M = 1 against the device's
+  ~700 GB/s, i.e. several times slower than the BF16 GEMV it would replace. It is therefore not
+  routed into the dense FFN: a coalesced (warp-per-row) GEMV for M = 1 and a shared-memory-tiled
+  GEMM for batched M come first, then the routing and the model-quality gates.
 - **Quantization stops at the format.** Q0's INT4 layout and its reference are implemented,
   gated and re-derived by a second implementation, but nothing consumes them yet: there is no
   converter (`scripts/quantize_weights.py`), no `weights.manifest.json` reader, no quantized

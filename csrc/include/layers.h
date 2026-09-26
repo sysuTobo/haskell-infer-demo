@@ -335,6 +335,19 @@ int gemm_bf16_f32out(cublasHandle_t handle, float *out,
                      const __nv_bfloat16 *x, const __nv_bfloat16 *W,
                      int M, int N, int K);
 
+/* Weight-only INT4 GEMM (plan "Q - Weight-only quantization", Q2): `out[M, N] = a[M, K] *
+ * packed[N, K]^T` with the activation in BF16, the weight in the Q0 format
+ * (csrc/include/linear_weight.h) and the output in BF16, accumulated in FP32. `scales` is
+ * [N, K/group] BF16 in row-major (row, group) order, exactly what linear_quantize_int4 writes.
+ *
+ * There is no cuBLAS handle because there is no BF16 GEMM for a 4-bit weight: the kernel
+ * unpacks and scales inside its own threads, which is the whole point (reading a quarter of a
+ * BF16 weight's bytes). A shape this format cannot represent - K not a whole number of groups,
+ * a group that is not a multiple of 8 - is refused here, at creation time, not midway through
+ * a request. */
+int gemm_int4_bf16(const __nv_bfloat16 *a, const uint8_t *packed, const __nv_bfloat16 *scales,
+                   __nv_bfloat16 *out, int M, int N, int K, int group, cudaStream_t stream);
+
 /* Safetensors loader: TensorInfo and the parsing/validation entry points live
  * in safetensors.h (CUDA-free, shared with the CPU test). */
 #include "safetensors.h"

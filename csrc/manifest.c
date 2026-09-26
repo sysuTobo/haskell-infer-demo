@@ -402,7 +402,8 @@ static void emit_numerical(struct MjBuf *b, const struct ManifestInputs *in,
     mj_kv_numstr(b, &first, "effective_rope_theta", effective_float(d->rotary_theta));
     mj_kv_int(b, &first, "fla_chunk_size", has_gdn ? d->fla_chunk_size : 0);
     mj_kv_str(b, &first, "fusion",
-              "flashinfer_attention;silu_mul;gdn_gated_norm;dense_gate_up_separate");
+              "flashinfer_attention;silu_mul;gdn_gated_norm;dense_gate_up_fused;"
+              "mlp_act_row_interleaved");
     mj_kv_str(b, &first, "gdn_recurrent_impl",
               has_gdn ? "fla_aot_chunkwise_cubin_plus_recurrent_tokens1" : "not_used");
     mj_kv_str(b, &first, "gemm_algorithm_policy", "cublas_default_heuristic_unpinned");

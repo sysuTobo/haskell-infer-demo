@@ -80,7 +80,7 @@ debuggability and attributable experiments, not promised reward or speed gains.
 | Descriptor | Strict flat schema and canonical C formatting | Semantic/numerical digests and resolved execution manifest |
 | Artifacts | nvcc SASS `86;89;90a` plus `90-virtual`; Triton cubins `86;89;90` | Capture provenance identifying the actual selected kernels; Triton has no PTX fallback |
 | Weights | Engine-owned BF16; derived GDN norm FP32 copy; shared trainable ownership with tied-gradient merging and derived-copy refresh (Stage 3) | Refresh of derived copies under a concurrent writer, and any multi-device gradient merge |
-| Fusion | FlashInfer attention, SiLU-multiply and GDN gated norm; dense gate/up still separate GEMMs | Combined projection layouts, residual-add/norm fusion and measured end-to-end benefit |
+| Fusion | FlashInfer attention, SiLU-multiply and GDN gated norm; **the dense gate/up projections are one N = 2I GEMM over packed weights with a row-interleaved `[T, 2I]` activation** (F1), which took prefill M=128 on Qwen3-4B from 28.36 ms to 22.79 ms | The remaining combined projection layouts (Q/K/V, GDN QKVZ/BA), residual-add/norm fusion (F2), and the measurement of each on the deployment target |
 | Quantization | Weight-role loading requires BF16; GEMM uses BF16 inputs with FP32 compute | Packed low-bit weights, scales, format validation, quantized GEMM and quality gates |
 | Speculative decoding | Batched prefill internally, but only final-row logits; reset clears all sequence state | Draft/target orchestration, per-position verification, prefix rollback and GDN state snapshots |
 | Sampling | One `stepToken` at both generation entry points; temperature categorical sampling in binary64 with a request-owned splitmix64 RNG; `--temperature`/`--seed` with early validation; greedy is the explicit temperature-0 mode; sampler and raw-model logprobs recorded per selection (T0-T4) | A GPU or batched sampler, top-k/top-p truncation, and the migration's performance (host selection time, GC, TTFT, tokens/s) |
@@ -1586,25 +1586,43 @@ recorded in the JSON the runner writes.
   taps disabled, after warm-up, and synchronize only at measurement boundaries;
   keep diagnostic captures separate. Weight traffic, MoE host-offset sync and
   device transfers may dominate launch savings.
-**Status: F1 is half done, 2026-09-26 — the fixtures and the activation contract, not yet the
-packing.** The plan's F1 opens with "First add fixtures for existing separate GEMMs and SiLU
-output", and that half is in: `tests/test_library_ops.py` now pins **both** activation
-contracts — `kernel_silu_mul`'s contiguous `[gate[n], up[n]]` pair and the new
-`kernel_silu_mul_packed`'s row-interleaved `[tokens, 2*intermediate]` buffer — against an
-independent float32 reference, for T = 1/2/3/4 and I = 8/12/16 on two devices. Both reproduce
-the reference **bitwise** (max_abs = 0), so the new kernel's `__expf` arithmetic and the
-FlashInfer path agree exactly at these shapes. The fixture's third check is the one that
-matters: feeding the *packed* buffer to the *halves* kernel misses the reference by
-0.43/0.64/1.55 against reference magnitudes of 0.36/0.68/1.33 — so a fusion that reformatted
-the GEMM output without changing the activation's row/stride contract would pass at T = 1 and
-fail here, which is exactly the "include T>1 tests because T=1 hides this layout defect"
-the plan asks for. What is **not** done: the weight packing and the single N = 2*intermediate
-GEMM. The recon for it is recorded (the scratch size is unchanged at T*(H+3I), the down GEMM
-is unaffected, and the packing can be done at load time with no duplicate weights by
-allocating gate+up as one owned buffer and loading each role into its half), so the remaining
-work is the loader change plus `forward_mlp`, not a design question.
+**Status: F1 is implemented, 2026-09-26.** The loader allocates one packed `[2I, H]` buffer per
+dense MLP and loads the gate and up roles into its two halves, so there is never a second copy
+of those weights and the shard rule is still applied per role (the two halves' extents are
+compared and the load is refused if they disagree); `forward_mlp` then issues **one GEMM with
+N = 2I** into a row-interleaved `[T, 2I]` output and `kernel_silu_mul_packed` consumes that
+layout. The workspace is unchanged (T*(H + 2I + I) is the T*(H + 3I) the pool is sized for).
 
-- [ ] **F1 — Merge dense gate/up projections.** First add fixtures for existing
+The fusion is admitted on this evidence:
+
+- **where the reduction does not change, the numbers do not either.** Against the *unfused*
+  build on the same fixture, the short-prompt logits are **bitwise identical** (rms = 0,
+  max_abs = 0), and the per-step rms against the independent torch reference is identical to
+  16 digits for both regular cases (0.1305636763572693 … 0.06327719986438751), inside the
+  0.1–0.4 band this family is recorded with, with every token matching.
+- **where cuBLAS does pick differently, the difference is quantified rather than denied.**
+  The long/chunked fixture is where M is large enough for N = 2I to select another reduction:
+  its logits differ from the unfused build by rel_rms **0.8–2.7%** (max_abs 0.33) with
+  **16/16** top-1 agreement, and the engine's own chunk-boundary self-consistency gate moves
+  from rms 0.108/0.102 to **0.069/0.065** with top-1 374/374 unchanged. That is the plan's
+  "GEMM N changes from I to 2I and may select a different reduction"; it is a declared
+  numerical-policy change, not a bitwise-equivalent refactor.
+- **the policy records it.** `numerical_policy_id` moves (`05fa3b15…` → `61bbd7f3…`) while
+  `semantic_id` and `deployment_id` do **not** — which is the plan's fusion row exactly:
+  logical operation and parameter identities preserved, fused implementation and layout
+  recorded in the numerical policy.
+- **it is worth admitting.** Qwen3-4B on one A40: prefill M=64 23.53 → **20.32 ms** and M=128
+  28.36 → **22.79 ms** (−13.6% / −19.6%), decode M=1 17.30 → **16.89 ms** (57.8 → 59.2 tok/s),
+  with no prefill regression. The per-region table says *where* the win comes from, and it is
+  not the GEMM: at M=128 the fused gate/up GEMM is 8.29 ms against the two separate GEMMs'
+  3.99 + 3.95 = 7.94, i.e. slightly *slower*, while `mlp.silu_mul` falls from **6.55 ms to
+  0.45 ms** because the old FlashInfer `act_and_mul` launch was a single block. At M=1 the
+  GEMM is the faster part (6.63 vs 3.54 + 3.53) and the step gains 2.4%.
+
+Not yet done, and the next F candidate: the GDN in-projections (QKV + Z were 15.1 ms of a
+decode step in F0's table), and the plan's F2/F3 rows.
+
+- [x] **F1 — Merge dense gate/up projections.** First add fixtures for existing
   separate GEMMs and SiLU output; then concatenate weight rows once during
   loading and compute `[T,2I]` in one GEMM. Existing scratch is
   `[gate[T,I]; up[T,I]]`, while row-major `[T,2I]` interleaves gate/up per token:

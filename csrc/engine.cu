@@ -382,6 +382,52 @@ static void load_role(const std::map<std::string, TensorInfo> &index,
     check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
 }
 
+/* The rows and columns this rank keeps of a role: the whole tensor when the descriptor's
+ * rule does not shard it, otherwise the descriptor's shard view. `split` says whether a rule
+ * actually applied, which is what the caller reports as "this sublayer all-reduces". */
+static void role_extent(const struct ModelDesc &desc, int role, const TensorInfo &ti, int rank,
+                        struct ShardView *out, bool *split) {
+    *split = false;
+    const int slot = model_desc_role_index(&desc, role);
+    const int rule = slot >= 0 && slot < desc.role_shard_count ? desc.role_shards[slot]
+                                                              : ENGINE_SHARD_NONE;
+    if (desc.tp_size <= 1 || rule == ENGINE_SHARD_NONE) {
+        if (ti.ndim != 2)
+            throw EngineError(ENGINE_ERR_WEIGHTS,
+                              std::string("Cannot pack a non-2-D tensor: ") + ti.name);
+        out->row_off = 0;
+        out->rows = ti.shape[0];
+        out->col_off = 0;
+        out->cols = ti.shape[1];
+        return;
+    }
+    char err[256] = {0};
+    if (model_desc_shard_view(&desc, role, ti.shape[0], ti.shape[1], rank, out, err,
+                              sizeof(err)) != 0)
+        throw EngineError(ENGINE_ERR_WEIGHTS, std::string("Shard view: ") + err);
+    *split = true;
+}
+
+/* Upload a role's (possibly sharded) slice into a buffer the caller owns, which must hold
+ * view.rows * view.cols elements. The packing below needs this: the destination is one half
+ * of a shared allocation rather than a buffer this function chose. */
+static void load_role_into(const std::map<std::string, TensorInfo> &index,
+                           const struct ModelDesc &desc, int role, int layer, int device,
+                           const struct ShardView &view, bool split, __nv_bfloat16 *dst) {
+    const TensorInfo &ti = find_role(index, desc, role, layer);
+    const int64_t bytes = (int64_t)view.rows * view.cols * (int64_t)sizeof(__nv_bfloat16);
+    const int status = split
+        ? safetensors_load_tensor_slice(ti, dst, bytes, device, view.row_off, view.rows,
+                                        view.col_off, view.cols)
+        : safetensors_load_tensor(ti, dst, bytes, device);
+    check_cuda(cudaGetLastError(), "Upload weight");
+    if (status != 0)
+        throw EngineError(ENGINE_ERR_WEIGHTS,
+                          std::string("Cannot load tensor: ") + ti.name + ": " +
+                              safetensors_last_error());
+    check_cuda(cudaStreamSynchronize(nullptr), "Finish weight upload");
+}
+
 /* Load a role honouring the descriptor's shard rule: this rank keeps only its
  * slice of the checkpoint tensor. `sharded` reports whether the rule actually
  * split the tensor -- the sublayer then all-reduces its output across ranks. */
@@ -1078,9 +1124,42 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
                 lw.plan.mixer = eng->desc.layer_mixers[i];
                 lw.plan.ffn = eng->desc.layer_ffns[i];
                 bool mixer_sharded = false, ffn_sharded = false;
+                bool mlp_packed = false;
                 for (int role = 0; role < ROLE_COUNT; ++role) {
                     if (!role_used_by_layer(role, lw.plan.mixer, lw.plan.ffn)) continue;
                     if (model_desc_role_index(&eng->desc, role) < 0) continue;
+                    /* A dense MLP's gate and up weights share one [2I, H] allocation, so the
+                     * forward can issue a single N = 2I GEMM over a row-interleaved [T, 2I]
+                     * output (plan F1). Loading each role into its own half means there is
+                     * never a second copy of these weights; both roles must shard on the same
+                     * axis, which is checked rather than assumed. */
+                    if (role == ROLE_MLP_UP && mlp_packed) continue;
+                    if (role == ROLE_MLP_GATE &&
+                        role_used_by_layer(ROLE_MLP_UP, lw.plan.mixer, lw.plan.ffn)) {
+                        const TensorInfo &gate_ti = find_role(index, eng->desc, ROLE_MLP_GATE, i);
+                        const TensorInfo &up_ti = find_role(index, eng->desc, ROLE_MLP_UP, i);
+                        struct ShardView gate_view, up_view;
+                        bool gate_split = false, up_split = false;
+                        role_extent(eng->desc, ROLE_MLP_GATE, gate_ti, r, &gate_view, &gate_split);
+                        role_extent(eng->desc, ROLE_MLP_UP, up_ti, r, &up_view, &up_split);
+                        if (gate_view.rows != up_view.rows || gate_view.cols != up_view.cols ||
+                            gate_split != up_split)
+                            throw EngineError(ENGINE_ERR_WEIGHTS,
+                                              "Cannot pack gate/up: their shard extents differ");
+                        const size_t half = (size_t)gate_view.rows * (size_t)gate_view.cols;
+                        __nv_bfloat16 *packed = (__nv_bfloat16 *)alloc_owned(
+                            lw.owned, (size_t)2 * half * sizeof(__nv_bfloat16), ctx.device_id,
+                            "Allocate packed gate/up weight");
+                        lw.gate_proj_w = packed;
+                        lw.up_proj_w = packed + half;
+                        load_role_into(index, eng->desc, ROLE_MLP_GATE, i, ctx.device_id,
+                                       gate_view, gate_split, lw.gate_proj_w);
+                        load_role_into(index, eng->desc, ROLE_MLP_UP, i, ctx.device_id, up_view,
+                                       up_split, lw.up_proj_w);
+                        if (gate_split) ffn_sharded = true;
+                        mlp_packed = true;
+                        continue;
+                    }
                     __nv_bfloat16 **target = role_target(lw, role);
                     if (target == nullptr) continue;
                     bool sharded = false;

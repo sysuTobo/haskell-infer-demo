@@ -108,22 +108,21 @@ int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
     const int I = dims->intermediate_size;
     const size_t TI = (size_t)tokens * I;
     __nv_bfloat16 *normed = ws;
-    __nv_bfloat16 *gate = normed + (size_t)tokens * H;
-    // Entire [T,I] gate matrix precedes the entire [T,I] up matrix.
-    __nv_bfloat16 *up = gate + TI;
-    __nv_bfloat16 *mlp_act = up + TI;
+    /* gate_proj_w and up_proj_w are one packed [2I, H] buffer (plan F1: the loader loads
+     * each role into its half of a single allocation), so one GEMM with N = 2I produces
+     * [T, 2I] with gate then up per row and the activation consumes that layout. The
+     * workspace is unchanged: T*(H + 2I + I) is the T*(H + 3I) the pool is sized for. */
+    __nv_bfloat16 *packed = normed + (size_t)tokens * H;   // [T, 2I], row-interleaved
+    __nv_bfloat16 *mlp_act = packed + 2 * TI;              // [T, I]
 
     { PROFILE_SCOPE("mlp.post_norm", stream);
     layer_norm(normed, residual, w->post_norm_w, H, tokens, dims, stream);
     }
-    { PROFILE_SCOPE("mlp.gate_gemm", stream);
-    checked_gemm(cublas, gate, normed, w->gate_proj_w, tokens, I, H);
-    }
-    { PROFILE_SCOPE("mlp.up_gemm", stream);
-    checked_gemm(cublas, up, normed, w->up_proj_w, tokens, I, H);
+    { PROFILE_SCOPE("mlp.gate_up_gemm", stream);
+    checked_gemm(cublas, packed, normed, w->gate_proj_w, tokens, 2 * I, H);
     }
     { PROFILE_SCOPE("mlp.silu_mul", stream);
-    kernel_silu_mul(mlp_act, gate, up, tokens * I, stream);
+    kernel_silu_mul_packed(mlp_act, packed, tokens, I, stream);
     }
     { PROFILE_SCOPE("mlp.down_gemm", stream);
     checked_gemm(cublas, layer_out, mlp_act, w->down_proj_w, tokens, H, I);

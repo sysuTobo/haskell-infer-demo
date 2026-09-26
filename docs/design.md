@@ -818,6 +818,35 @@ goes, so the repository now has the instrument that question needs, and it is bu
   point and not a CTest gate on purpose: a timing threshold in the suite would be a flaky
   gate, and the plan asks for recorded measurements, not a pass/fail.
 
+### The dense MLP: one gate/up GEMM and a row-interleaved activation
+
+The plan's F1 ("merge dense gate/up projections") is in, and the shape of it is worth
+recording because the *reason* it is faster is not the reason it looks like:
+
+- **one packed weight, loaded once.** The loader allocates a single `[2I, H]` buffer per dense
+  MLP and loads the gate and up roles into its two halves, so the two projections share one
+  allocation with no second copy of the weights. The shard rule is still applied per role and
+  the two halves' extents are compared, with the load refused if they disagree - a tensor
+  parallel rank that sharded them differently would produce a buffer whose halves are not the
+  gate and up it thinks they are.
+- **one GEMM, then a layout-specific activation.** `forward_mlp` issues `N = 2I` into a
+  row-interleaved `[T, 2I]` output, so gate and up for a token are adjacent and
+  `kernel_silu_mul_packed` carries that row/stride contract rather than pointer offsets. Its
+  contract and `kernel_silu_mul`'s contiguous-halves contract *coincide at T = 1*, which is
+  why the fixture drives T > 1; the workspace is unchanged because T*(H + 2I + I) is the
+  T*(H + 3I) the pool was sized for before.
+- **the win came from the activation, not the GEMM.** On Qwen3-4B the fused gate/up GEMM is
+  slightly *slower* at prefill M=128 (8.29 ms against 3.99 + 3.95 separate) while
+  `mlp.silu_mul` falls from 6.55 ms to 0.45 ms, because the previous FlashInfer
+  `act_and_mul` dispatch launched a single block. Net: prefill 28.36 → 22.79 ms. At M=1 the
+  GEMM is the faster half and the decode step gains 2.4%.
+- **the numbers say where it is exact and where it is not.** Against the unfused build the
+  short-prompt logits are bitwise identical and the long/chunked fixture differs by
+  rel_rms ≤ 2.7% with top-1 unchanged, which is a cuBLAS reduction change at N = 2I. That is
+  a declared numerical-policy change: `numerical_policy_id` moves while `semantic_id` and
+  `deployment_id` do not, so the fusion is recorded as a numerical-policy fact rather than
+  disguised as an unchanged-arithmetic refactor.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:

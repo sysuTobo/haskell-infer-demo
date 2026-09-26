@@ -143,25 +143,36 @@ instrument and the numbers rather than a guess:
   a NULL handle look valid on device 0, which poisoned the stream and aborted the 2-device
   forward at the third scope.
 
-**F1's fixtures and the row-interleaved activation contract** (plan F1, first half, verified
-2026-09-26).
-F0's numbers pointed at the gate/up pair (40.9 ms of a 95.5 ms decode step), and F1 opens by
-pinning the arithmetic before changing it:
+**F1: the dense gate/up projections are one GEMM** (plan F1, verified 2026-09-26).
+F0's table put the gate/up pair at 40.9 ms of the 27B's 95.5 ms decode step; F1 fuses it:
 
-- `kernel_silu_mul_packed` (`csrc/kernels/silu.cu`, declared in `csrc/include/kernels.h`) is
-  the activation for the layout one N = 2*intermediate gate/up GEMM produces: `packed` is
-  `[tokens, 2*intermediate]` row-major with gate then up per row, and the kernel's index
-  arithmetic carries the row/stride contract rather than a caller-supplied offset. It is a
-  separate entry point rather than a flag, because at `tokens == 1` the two contracts
-  coincide and only a multi-token case tells them apart.
-- `tests/test_library_ops.py` checks both contracts against an independent float32 reference
-  at T = 1/2/3/4 and I = 8/12/16, on both devices, through two new
-  `tests/kernels/kernel_bridge.cu` entries. Both are **bitwise** equal to the reference
-  (max_abs = 0), and the fixture also asserts the trap: the halves kernel applied to the
-  packed buffer misses by 0.43-1.55 (reference magnitudes 0.36-1.33), so the layout cannot be
-  silently mishandled at T > 1.
-- **not done**: the weight packing and the single GEMM. Recon recorded in the plan's F1 status
-  block.
+- the loader allocates **one packed [2I, H] buffer** per dense MLP and loads the gate and up
+  roles into its two halves (`role_extent` + `load_role_into` in `csrc/engine.cu`), so there
+  is never a second copy of these weights. Both roles must shard on the same axis and that is
+  compared, with the load refused if the extents disagree.
+- `forward_mlp` issues **one GEMM with N = 2I** into a row-interleaved `[T, 2I]` output and
+  `kernel_silu_mul_packed` consumes that layout; the workspace is unchanged because
+  T*(H + 2I + I) is the T*(H + 3I) the pool is sized for.
+- **the fusion is admitted on measured evidence, and one number runs against the
+  expectation.** Against the unfused build *on the same fixture*, the short-prompt logits are
+  **bitwise identical** and the per-step rms against the independent torch reference is
+  identical to 16 digits (0.1305636763572693 … 0.06327719986438751), with every token
+  matching - i.e. where cuBLAS keeps the same reduction, the fusion changes nothing. Where
+  N = 2I makes it choose differently (the long/chunked fixture) the logits differ by
+  rel_rms 0.8-2.7% (max_abs 0.33) with 16/16 top-1, and the engine's chunk-boundary
+  self-consistency gate moves 0.108/0.102 → 0.069/0.065 with top-1 374/374. That is recorded
+  as a **declared numerical-policy change**, not as a bitwise refactor.
+- **the policy records it**: `numerical_policy_id` moves (05fa3b15… → 61bbd7f3…) while
+  `semantic_id` and `deployment_id` do not, which is the plan's fusion row exactly.
+- **the win is not where F0's table suggested.** Qwen3-4B on one A40: prefill M=64
+  23.53 → 20.32 ms, M=128 28.36 → **22.79 ms** (−19.6%), decode M=1 17.30 → 16.89 ms
+  (59.2 tok/s), no prefill regression. Per region at M=128 the fused gate/up GEMM is 8.29 ms
+  against the separate GEMMs' 3.99 + 3.95 = 7.94 — slightly *slower* — while
+  `mlp.silu_mul` falls from **6.55 ms to 0.45 ms** because the old FlashInfer
+  `act_and_mul` dispatch was a single block. At M=1 the GEMM is the faster half (6.63 vs
+  7.07) and the step gains 2.4%.
+- ctest is 28/28 with the fused path, and the fixtures from the previous commit pin both
+  activation contracts (bitwise against an independent reference at T = 1/2/3/4).
 
 **The temperature-sampling migration** (plan T0-T4, verified 2026-09-26).
 The plan's generation track is independent of the trainer and was the last unimplemented

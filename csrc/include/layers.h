@@ -232,6 +232,10 @@ typedef struct {
     LayerReduceFn reduce;
     void *reduce_opaque;
     int split_phase;
+    /* Plan F2: fuse the mixer's residual update with the FFN's post-norm into one pass, so the
+     * FFN consumes the activation that pass produced instead of normalizing a second time.
+     * Opt-in per engine, because the F gates admit a fusion only against the unfused path. */
+    int fused_residual_norm;
 } LayerContext;
 
 /* norm -> mixer -> residual -> norm -> ffn -> residual, dispatched on the plan.
@@ -321,6 +325,12 @@ int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
     const GdnWeights *w, __nv_bfloat16 *conv_state,
     float *ssm_state, void *fla_scratch, int tokens, const ModelDims *dims,
     const GdnTapSites *taps = nullptr);
+
+/* The dense MLP from an already-normalized activation (plan F2's fused path). */
+int forward_mlp_prepared(cublasHandle_t cublas, cudaStream_t stream,
+                         const __nv_bfloat16 *normed, __nv_bfloat16 *ws,
+                         __nv_bfloat16 *layer_out, const MlpWeights *w,
+                         int tokens, const ModelDims *dims);
 
 int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
     const __nv_bfloat16 *residual, __nv_bfloat16 *ws, __nv_bfloat16 *layer_out,

@@ -153,6 +153,13 @@ void kernel_cast_f32_bf16(__nv_bfloat16 *out, const float *in, int n,
                           cudaStream_t stream);
 
 /** Residual add: dst[i] += src[i] (BF16, element-wise). */
+/* Plan F2: one pass for the residual update and the following norm. `r = BF16(residual +
+ * sublayer)` is written back into the residual stream and the norm reads that rounded r;
+ * `gemma` selects `weight + 1` (Gemma) versus the weight as stored (plain RMSNorm). */
+void kernel_residual_norm(__nv_bfloat16 *normed, __nv_bfloat16 *residual,
+                          const __nv_bfloat16 *sublayer, const __nv_bfloat16 *raw_weight,
+                          int hidden, int rows, float eps, int gemma, cudaStream_t stream);
+
 void kernel_residual_add(__nv_bfloat16 *dst, const __nv_bfloat16 *src,
                          int n, cudaStream_t stream);
 

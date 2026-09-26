@@ -1642,7 +1642,7 @@ decode step in F0's table), and the plan's F2/F3 rows.
   permanent duplicate BF16 weights. GEMM N changes from I to 2I and may select a
   different reduction; compare pre-activation outputs before attributing any
   difference to SiLU. Do not claim a GEMM+SwiGLU epilogue exists in current cuBLAS.
-- [ ] **F2 — Fuse residual addition with the following norm.** First specify
+- [x] **F2 — Fuse residual addition with the following norm.** First specify
   two outputs: the updated BF16 residual and the normalized activation.
   The fused kernel must compute `r = BF16(old_r + sublayer_out)` and normalize
   that rounded r, not an unrounded FP32 sum. Retain plain versus Gemma weight
@@ -1652,13 +1652,60 @@ decode step in F0's table), and the plan's F2/F3 rows.
   The replicated path in `forward_replicated` is a separate caller: all-reduce
   must finish before this fused boundary, with residual addition exactly once.
   Cross-layer fusion is deferred until ownership and placement boundaries pass.
-- [ ] **F3 — Expand only where F0 shows a bottleneck.** Candidates are merged
+- [x] **F3 — Expand only where F0 shows a bottleneck.** Candidates are merged
   Q/K/V projections, compatible GDN projections, Q/gate split plus per-head
   norm/RoPE/cache write, and conv+SiLU. Preserve the Q/gate interleave, head
   expansion and checkpoint row ordering. GDN convolution explicitly rounds to
   BF16 before SiLU today; a fused kernel must retain that conversion if it claims
   unchanged arithmetic. Do not absorb MLA projections or replace FLA recurrence
   as incidental fusion cleanup: those are distinct algorithm/numerical changes.
+
+**F2 status (2026-09-26): implemented, gated, and measured - not admitted.** `kernel_residual_norm`
+computes the plan's two outputs in one pass: `r = BF16(old_r + sublayer_out)` is written back into
+the residual stream, so the norm reduces over the *rounded* r rather than an unrounded FP32 sum,
+and it takes the weight convention as a parameter (`weight + 1` for Gemma, the weight as stored
+for a plain RMSNorm). The FFN gained a prepared-activation entry point, so the fused path consumes
+what the pass produced instead of normalizing a second time, and the dispatch chooses it per
+engine through `INFER_FUSED_RESIDUAL_NORM` - opt-in, because a fusion can only be admitted against
+the unfused path. The fused path applies to the dense pipelined case: a MoE layer keeps its own
+norm path and the replicated caller keeps the unfused one, because its all-reduce has to finish
+before this boundary and the residual has to be added exactly once.
+The kernel gate (`tests/test_residual_norm.py`) passes on the device: the updated residual is
+**bitwise** the reference, the normalized activation is bitwise the reference on seven of eight
+shapes (1.9e-3 on a 5000-wide row) across T = 1, multi-row, a hidden size that is not a multiple
+of the launch block, and both weight conventions - and it is **1.6 closer to the rounded-residual
+reference than to an unrounded one**, which is what makes the plan's rounding rule a *tested*
+discriminator: a kernel that normalized the unrounded sum would pass the first check and fail
+this one.
+The measurement then declines it, which is what the F gates exist to decide. The identity
+discipline holds - the fusion moves `numerical_policy_id` (recorded as `residual_norm_fused` in
+the manifest's fusion field) while `semantic_id` and `deployment_id` do not - so the two captures
+are compared as *different policies*, not as a bitwise regression: on Qwen3-4B the logits differ
+by rms 0.024-0.15 (max_abs up to 0.68) purely because this norm's arithmetic is not FlashInfer's.
+And the workload gets *slower*: the fusion removes **72 scopes per step** (651 -> 579) exactly as
+intended, yet decode goes 16.834 -> **17.031 ms (+1.2%)** and prefill M=2/64/128 go +1.0/+0.6/+0.4%.
+The reason is the kernels rather than the launches: a scalar custom reduction that reads the row
+twice costs more than FlashInfer's optimized norm plus the separate residual add, so this is a
+launch-count question whose answer is that the launches were not the cost. The fusion stays in the
+tree, off by default, with its gate and its numbers; vectorizing the reduction (and a vectorized
+residual read) is what would make it worth revisiting, and no golden or gate is affected while the
+option is off, which the full 34/34 suite re-run with it off confirms.
+
+**F3 status (2026-09-26): its own rule answers it - no candidate is indicated, and none was
+built.** The item's instruction is to expand "only where F0 shows a bottleneck", and F0's table
+says the remaining candidates are not it. At M = 1 the projections F3 would merge (merged Q/K/V,
+compatible GDN projections, the Q/gate split with per-head norm/RoPE/cache write, conv+SiLU) are
+already one GEMM per output group whose cost is *weight traffic* - 48 layers x 168 MB for GDN's
+QKV and Z alone - and merging two GEMMs into one does not reduce the bytes they read, so the merge
+cannot address the measured bottleneck even where it removes a launch. That is the same finding
+F1's admission rests on, seen from the other side: F1 won because the packed gate/up GEMM and the
+row-interleaved activation removed a GEMM *and* a kernel from a path that was already bandwidth-
+bound, not because merging GEMMs is free. At prefill M = 128 the elementwise work is the
+prefill-specific cost F0 measured (`mlp.silu_mul`, 22% of the MLP), and F1 already routes the
+fused form there. So F3 is left unexpanded by its own criterion rather than by omission, the four
+candidates stay available, and the condition that would make one of them worth building is stated:
+a workload where the *reduction* in launches is the cost, which the F2 measurement above shows it
+is not at M = 1.
 
 **F gates:** compare intermediate outputs and persistent state against the
 unfused path and an independent reference; include nonzero residual/state,

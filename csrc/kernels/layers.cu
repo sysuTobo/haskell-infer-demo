@@ -98,26 +98,25 @@ void kernel_q_gate_split(__nv_bfloat16 *q, __nv_bfloat16 *gate,
     check_launch();
 }
 
-int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
-                const __nv_bfloat16 *residual, __nv_bfloat16 *ws,
-                __nv_bfloat16 *layer_out, const MlpWeights *w,
-                int tokens, const ModelDims *dims) {
-    check_tokens(tokens, dims);
-    bind_stream(cublas, stream);
+/* The dense MLP from an already-normalized activation: the packed gate/up GEMM (plan F1), the
+ * row-interleaved activation, and the down projection (with plan Q2's INT4 operands at M = 1).
+ * Both entry points below share this body, so the fused and unfused paths cannot drift apart. */
+static int mlp_from_normed(cublasHandle_t cublas, cudaStream_t stream,
+                           const __nv_bfloat16 *normed, __nv_bfloat16 *ws,
+                           __nv_bfloat16 *layer_out, const MlpWeights *w,
+                           int tokens, const ModelDims *dims) {
     const int H = dims->hidden_size;
     const int I = dims->intermediate_size;
     const size_t TI = (size_t)tokens * I;
-    __nv_bfloat16 *normed = ws;
     /* gate_proj_w and up_proj_w are one packed [2I, H] buffer (plan F1: the loader loads
      * each role into its half of a single allocation), so one GEMM with N = 2I produces
      * [T, 2I] with gate then up per row and the activation consumes that layout. The
      * workspace is unchanged: T*(H + 2I + I) is the T*(H + 3I) the pool is sized for. */
-    __nv_bfloat16 *packed = normed + (size_t)tokens * H;   // [T, 2I], row-interleaved
-    __nv_bfloat16 *mlp_act = packed + 2 * TI;              // [T, I]
+    /* The scratch is addressed from the workspace base (the activation aliases its start),
+     * so the prepared-activation entry point can pass a const view of it. */
+    __nv_bfloat16 *packed = ws + (size_t)tokens * H;   // [T, 2I], row-interleaved
+    __nv_bfloat16 *mlp_act = packed + 2 * TI;          // [T, I]
 
-    { PROFILE_SCOPE("mlp.post_norm", stream);
-    layer_norm(normed, residual, w->post_norm_w, H, tokens, dims, stream);
-    }
     /* Decode reads the weight-only INT4 operands when the engine loaded them (plan Q2): the
      * weights are unpacked and scaled inside the thread, so a quarter of a BF16 weight's bytes
      * are read, and at M = 1 that is where the format's advantage is (measured 2.25x). Batched
@@ -145,6 +144,30 @@ int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
     }
     }
     return 0;
+}
+
+int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
+                const __nv_bfloat16 *residual, __nv_bfloat16 *ws,
+                __nv_bfloat16 *layer_out, const MlpWeights *w,
+                int tokens, const ModelDims *dims) {
+    check_tokens(tokens, dims);
+    bind_stream(cublas, stream);
+    __nv_bfloat16 *normed = ws;
+    { PROFILE_SCOPE("mlp.post_norm", stream);
+    layer_norm(normed, residual, w->post_norm_w, dims->hidden_size, tokens, dims, stream);
+    }
+    return mlp_from_normed(cublas, stream, normed, ws, layer_out, w, tokens, dims);
+}
+
+/* Plan F2: the FFN consumes the activation the fused residual+norm produced, so it must not
+ * normalize again - that is the whole reason this entry point exists. */
+int forward_mlp_prepared(cublasHandle_t cublas, cudaStream_t stream,
+                         const __nv_bfloat16 *normed, __nv_bfloat16 *ws,
+                         __nv_bfloat16 *layer_out, const MlpWeights *w,
+                         int tokens, const ModelDims *dims) {
+    check_tokens(tokens, dims);
+    bind_stream(cublas, stream);
+    return mlp_from_normed(cublas, stream, normed, ws, layer_out, w, tokens, dims);
 }
 
 int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,

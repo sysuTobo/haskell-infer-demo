@@ -167,6 +167,10 @@ struct ManifestInputs {
      * numerical_policy_id even though the architecture and the deployment are unchanged. */
     int weight_only_int4;
 
+    /* Plan F2: the mixer's residual update and the FFN's post-norm are one pass, which changes
+     * the region table's entries and the arithmetic the norm sees - a numerical policy. */
+    int fuse_residual_norm;
+
     /* Deployment: placement plus allocation/transfer choices. layer_device holds
      * internal device indices (the engine's own numbering); device_ordinals maps
      * them to CUDA ordinals. */

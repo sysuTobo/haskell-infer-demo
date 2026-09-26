@@ -164,12 +164,51 @@ static int run_ffn(const LayerContext *ctx, const struct LayerWeights *w,
     }
 }
 
+/* Plan F2's fused FFN entry: the activation arrives prepared, so this must not normalize. Only
+ * a dense feed-forward has a post-norm inside this layer's boundary; a MoE layer keeps its own
+ * path (and the replicated caller keeps the unfused one, because its all-reduce has to finish
+ * before this boundary and the residual has to be added exactly once). */
+static int forward_ffn_prepared(const LayerContext *ctx, const struct LayerWeights *w,
+                                const __nv_bfloat16 *normed, __nv_bfloat16 *layer_out) {
+    MlpWeights mw{w->gate_proj_w, w->up_proj_w, w->down_proj_w, w->post_norm_w,
+                  w->gate_up_i4, w->gate_up_i4_scales, w->down_i4, w->down_i4_scales,
+                  w->i4_group};
+    return forward_mlp_prepared(ctx->cublas, ctx->stream, normed, ctx->workspace, layer_out,
+                                &mw, ctx->tokens, ctx->dims);
+}
+
 int forward_layer(const LayerContext *ctx, const struct LayerWeights *w,
                   const __nv_bfloat16 *residual, __nv_bfloat16 *layer_out) {
     const size_t elements = (size_t)ctx->tokens * ctx->dims->hidden_size;
+    const bool fused = ctx->fused_residual_norm && w->plan.ffn == ENGINE_FFN_DENSE;
 
     int status = forward_mixer(ctx, w, residual, layer_out);
     if (status != 0) return status;
+    if (fused) {
+        /* F2: one pass computes the rounded residual and the activation the FFN consumes. The
+         * norm reads the residual *after* it was rounded, which is what makes this the same
+         * function the unfused path computes rather than a new one. */
+        const int gemma = ctx->dims->norm_style == 1 ? 0 : 1;
+        __nv_bfloat16 *normed = ctx->workspace;
+        { PROFILE_SCOPE("dispatch.residual_norm", ctx->stream);
+        kernel_residual_norm(normed, const_cast<__nv_bfloat16 *>(residual), layer_out,
+                             w->post_norm_w, ctx->dims->hidden_size, ctx->tokens,
+                             ctx->dims->rms_eps, gemma, ctx->stream);
+        }
+        status = with_cuda_error(0);
+        if (status != 0) {
+            fprintf(stderr, "[engine] layer %d fused residual+norm failed (status %d)\n",
+                    ctx->layer_index, status);
+            return status;
+        }
+        status = forward_ffn_prepared(ctx, w, normed, layer_out);
+        if (status != 0) return status;
+        { PROFILE_SCOPE("dispatch.residual_add", ctx->stream);
+        kernel_residual_add(const_cast<__nv_bfloat16 *>(residual), layer_out, elements,
+                            ctx->stream);
+        }
+        return with_cuda_error(0);
+    }
     { PROFILE_SCOPE("dispatch.residual_add", ctx->stream);
     kernel_residual_add(const_cast<__nv_bfloat16 *>(residual), layer_out, elements, ctx->stream);
     }

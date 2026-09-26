@@ -107,6 +107,37 @@ greedy-token agreement — never a relaxation of the top-1 check.
 
 ## Recently completed
 
+**F2: the fused residual+norm is implemented, gated, and measured - and not admitted** (plan F2;
+verified 2026-09-26).
+
+- `kernel_residual_norm` does the plan's two outputs in one pass: `r = BF16(old_r + sublayer_out)`
+  is stored back into the residual stream so the norm reduces over the **rounded** r, and the
+  weight convention is a parameter (`weight + 1` for Gemma, the weight as stored for a plain
+  RMSNorm). `forward_mlp_prepared` is the FFN from a prepared activation, so the fused path does
+  not normalize a second time, and the dispatch selects it per engine through
+  `INFER_FUSED_RESIDUAL_NORM` - opt-in, because the F gates admit a fusion only against the
+  unfused path. Dense pipelined layers take it; a MoE layer keeps its own norm path and the
+  replicated caller keeps the unfused one (its all-reduce must finish before this boundary).
+- The kernel gate (`tests/test_residual_norm.py`) passes: the updated residual is **bitwise** the
+  reference, the normalized activation is bitwise on seven of eight shapes (1.9e-3 on a 5000-wide
+  row) over T = 1, multi-row, a hidden size that is not a multiple of the launch block and both
+  weight conventions, and it is **1.6 closer to the rounded-residual reference than to an
+  unrounded one** - the plan's rounding rule as a discriminator, since a kernel normalizing the
+  unrounded sum would pass the bitwise check on the residual and fail this one.
+- **The measurement declines it.** The identity discipline holds (`numerical_policy_id` moves, the
+  manifest records `residual_norm_fused`, `semantic_id` and `deployment_id` do not), so the two
+  captures are a policy comparison rather than a bitwise regression: on Qwen3-4B the logits differ
+  by rms 0.024-0.15 (max_abs to 0.68) purely because this norm's arithmetic is not FlashInfer's.
+  And it is **slower**: the fusion removes 72 scopes per step (651 -> 579) as intended, yet decode
+  goes **16.834 -> 17.031 ms (+1.2%)** and prefill M=2/64/128 go +1.0/+0.6/+0.4%. The launches were
+  not the cost - a scalar custom reduction that reads the row twice costs more than FlashInfer's
+  optimized norm plus the separate residual add. That is the F gates' own criterion ("admit a
+  fusion only when the intended workload improves... kernel timing alone is insufficient")
+  answering no, and it is the second stage in this plan whose deliverable is a measured refusal.
+- The path stays in the tree, off by default, with its gate and its numbers; vectorizing the
+  reduction is what would make it worth revisiting. No golden or gate sees it while it is off,
+  which the full **34/34** suite re-run with it off confirms.
+
 **S3: the cross-case gates pass, and the measurement declines to admit the acceleration** (plan
 S3; verified 2026-09-26).
 

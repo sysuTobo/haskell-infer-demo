@@ -289,6 +289,10 @@ struct EngineHandle {
     /* Dense FFN layers whose INT4 operands engine_load_quantized_ffn installed. Nonzero makes
      * the execution manifest report the weight-quantization numerical policy. */
     int quantized_ffn_layers = 0;
+    /* Plan F2: fuse the mixer's residual update with the FFN's post-norm. Opt-in through
+     * INFER_FUSED_RESIDUAL_NORM so the same binary can run both paths, which is what the F
+     * gates compare, and so the fusion is recorded as a numerical policy in the manifest. */
+    int fused_residual_norm = 0;
     bool replicated = false; // tp_size > 1 || ep_size > 1: every rank holds every layer
     int tp_size = 1;
     int ep_size = 1;         // > 1: experts are split across the ranks
@@ -965,6 +969,9 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             ::free(desc_text);
         }
 
+        eng->fused_residual_norm = std::getenv("INFER_FUSED_RESIDUAL_NORM") != nullptr ? 1 : 0;
+        if (eng->fused_residual_norm) fprintf(stderr, "[engine] fused residual+norm: on\n");
+
         int device_count = 0;
         check_cuda(cudaGetDeviceCount(&device_count), "Get device count");
         if (num_devices > device_count)
@@ -1348,6 +1355,7 @@ int engine_manifest(const EngineHandle *eng, char *buf, int buf_len) {
     in.device_count = eng->num_devices;
     in.weights = &eng->weights;
     in.weight_only_int4 = eng->quantized_ffn_layers > 0 ? 1 : 0;
+    in.fuse_residual_norm = eng->fused_residual_norm;
     in.replicated = eng->replicated ? 1 : 0;
     in.ep_size = eng->ep_size;
     in.declared_tp_rank = eng->desc.tp_rank;
@@ -1408,6 +1416,10 @@ static LayerContext make_layer_context(EngineHandle *eng, int layer, int dev_idx
     lctx.dims = eng->replicated ? &eng->local_dims : &eng->dims;
     lctx.taps = with_taps ? &eng->taps : nullptr;
     lctx.reduce = nullptr;
+    /* The replicated caller drives the two halves itself (its all-reduce sits between them), so
+     * the fusion applies to the pipelined path; the plan's F2 note says the replicated path is a
+     * separate caller whose reduction must finish before this boundary. */
+    lctx.fused_residual_norm = eng->fused_residual_norm && !eng->replicated;
     lctx.reduce_opaque = nullptr;
     lctx.split_phase = 0;
     return lctx;

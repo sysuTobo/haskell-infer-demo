@@ -947,6 +947,25 @@ recording because the *reason* it is faster is not the reason it looks like:
   `deployment_id` do not, so the fusion is recorded as a numerical-policy fact rather than
   disguised as an unchanged-arithmetic refactor.
 
+### Fusions: what was built, and what the measurements refused
+
+Two fusions were built to the plan's specifications and then decided by measurement rather than
+by intent. **F1** (the packed gate/up GEMM with the row-interleaved activation) is in the tree and
+routed, because it removed a GEMM and a kernel from every decode step and the shapes made that a
+win. **F2** (the mixer's residual update fused with the FFN's post-norm) is implemented, gated,
+and **off by default and not admitted**: `kernel_residual_norm` produces both of the plan's
+outputs in one pass - the rounded residual written back to the stream, so the norm reduces over
+the value the next sublayer will read - and the FFN takes a prepared activation so nothing
+normalizes twice. The kernel gate passes, including a *discriminating* check that the norm is
+closer to the rounded-residual reference than to an unrounded one. But the workload got slower:
+the fusion removes 72 launches per step and decode goes 16.834 -> 17.031 ms on Qwen3-4B, because a
+scalar custom reduction that reads the row twice costs more than FlashInfer's optimized norm plus
+the separate residual add. That is the F gates' criterion - "admit a fusion only when the intended
+workload improves... kernel timing alone is insufficient" - answering no, and the honest place for
+it is the tree, off, with its numbers. The same discipline decided **F3**: F0's table shows the
+candidates there are weight-traffic-bound at M = 1, which merging does not reduce, so no candidate
+is indicated and none was built.
+
 ### The weight-only INT4 format
 
 F0's baseline made the ordering decision for the optimization track: a decode step is

@@ -93,3 +93,21 @@ extern "C" int test_gemm_int4(void *out, const void *a, const void *packed, cons
         return -1;
     }
 }
+
+/* Plan F2: the fused residual update + norm. The caller passes BF16 buffers; `residual` is
+ * updated in place as well as read, which is what makes the norm see the rounded value. */
+extern "C" int test_residual_norm(void *normed, void *residual, const void *sublayer,
+                                  const void *weight, int hidden, int rows, float eps,
+                                  int gemma) {
+    try {
+        kernel_residual_norm(static_cast<__nv_bfloat16 *>(normed),
+                             static_cast<__nv_bfloat16 *>(residual),
+                             static_cast<const __nv_bfloat16 *>(sublayer),
+                             static_cast<const __nv_bfloat16 *>(weight), hidden, rows, eps,
+                             gemma, nullptr);
+        return int(cudaDeviceSynchronize());
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "test_residual_norm: %s\n", error.what());
+        return -1;
+    }
+}

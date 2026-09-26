@@ -727,6 +727,41 @@ backward and the placements are named in the plan's Stage-5 status as the remain
 rather than implied to exist, and a group's G completions are collected by looping (there
 is no batched group driver).
 
+### The alignment decision, the group objectives and the rollout queue
+
+The plan's later stages are where a measured deviation, a group objective and a staleness
+budget become objects rather than prose. Each is CUDA-free and gated on the CPU, and each
+carries its own honest remainder:
+
+- **Alignment is a decision derived from the measurement, not a new kernel.**
+  `csrc/include/alignment.h` gives one verdict per region, read back out of `regions.c`
+  rather than restated beside it, so a region cannot carry two stories: a measured
+  `exception` pair makes the region a *declared exception* carrying its widest measured
+  bound, an `unverified` pair makes it *invariant-kernel-pending* with the option that
+  would remove it named, and the rest are exact by construction. The gate refuses the two
+  mislabels the plan names: a difference measured with different weights (a policy change)
+  or on the sampler's own logprob (a sampler difference) may not be scored against a
+  numerical bound, and an exact-by-construction region has no tolerance to check against.
+  That is what makes "report numerical mismatch separately from real policy changes and
+  sampler differences" a refusal rather than a convention.
+- **The group objectives normalise over responses, and the gate found the corner where
+  they did not.** `backward_group_objective` is the plan's GSPO in its `mean_i` form — one
+  term per *response*, with the length-normalized sequence ratio `s_i = exp((1/T_i) sum_t
+  (ell_theta - ell_b))` and the population group advantage — plus a token-level GRPO mode
+  so the two can be compared on the same fixed groups. The gradient is checked against an
+  independent FP64 reference's central difference, which is how the *first* version's
+  per-token accumulation (which silently weights a longer response more heavily) was
+  caught, along with a latent sign-dependent clamp in Stage 4's `backward_clipped_objective`
+  whose value contradicted its own gradient in the `r < 1-eps, A < 0` corner.
+- **Staleness is admissibility, not a number.** `csrc/include/rollout_queue.h` is a bounded
+  queue of whole completed groups with the plan's lag
+  `learner_committed_version - behavior_version` enforced at admission, a bounded allowlist
+  of live behavior versions, and a consumed-group ledger. At lag zero it reproduces the
+  synchronous objective and gradient bitwise; at positive lag the drift exists and is
+  reported as a policy change. The GPU half — snapshots, device leases, publication
+  transfer — is deliberately absent, because the plan defers it until after the
+  lag-zero protocol passes.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:
@@ -754,6 +789,9 @@ stops at the first failure, so one command answers "is the tree green".
 | Generation (CPU) | `cabal test infer-generation-tests` | budget/EOS/error semantics of the real generation loop, with a scriptable engine stub instead of a GPU |
 | Backward | `ctest -R test_backward` (CPU) + `test_backward_kernels` (GPU) | every Stage-4 region's backward against a double-precision definition or a central difference of it; the attention pair against an analytic reading of the device's own base-2 LSE; the GDN core backward with a nonzero initial state across one and three chunks; the losses and AdamW against independent FP64; and a checkpoint resume bitwise equal to an uninterrupted run |
 | SFT step | `ctest -R test_sft` (GPU) + `test_train_loop` (CPU) | the first step's loss against a `transformers` training run (6.3e-05 relative), the per-parameter gradient direction against torch (cosine 0.999), the fixture overfitting, a bitwise state round-trip, and the phase/budget/record/sampler contract |
+| Alignment | `ctest -R test_alignment` (CPU) | every Stage-1 region resolves to a verdict derived from the inventory rather than restated beside it; a declared exception carries a finite measured bound, a pending region names its tracked work, a policy change or a sampler difference is refused as a numerical comparison, and an exact-by-construction region is not checked by a tolerance |
+| Group objective | `ctest -R test_gspo` (CPU) | the GSPO and GRPO objectives match an independent FP64 reference and its central difference on an unequal-length group; both advantage signs and both clip boundaries; masks, zero-variance and truncated groups; and the unclipped analytic gradient `A_i s_i / T_i` |
+| Rollout admission | `ctest -R test_rollout_queue` (CPU) | whole completed groups only; bounds in groups, tokens and live behavior versions; lag enforced at admission; a consumed group cannot be re-enqueued; and lag zero reproduces the synchronous objective and gradient bitwise while larger lag is reported as a policy change |
 | Resource safety | `ctest -R test_engine_resources` | repeated failing creations return no handle, explain the error and move no device memory; a valid checkpoint still builds afterwards |
 | Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set; configured `--rms-tolerance` (default 0.1, family-specific overrides) |
 | Chunking | same prompt, different prefill splits | top-1 equal, rms ≤ 5 (state-loss guard) |
@@ -766,8 +804,11 @@ selection can move logits; exact reference ties are accepted as a set, while a
 near-tie top-1 disagreement is not silently accepted. Different prefill splits
 can also change GDN grouping and attention execution; whole-model RMS alone does
 not attribute the difference to cuBLAS. Training gradient checks, cross-case
-bitwise admission and provenance enforcement are planned gates, not current
-coverage; see `plan-numeric-contract.md`.
+bitwise admission and provenance enforcement are current coverage (the `test_backward` and
+`test_backward_kernels` rows, the invariance suites and the manifest suites above); what
+remains *planned* is the temperature-sampling migration and the inference-optimization
+track, plus the alignment kernels the Stage-6 decision left as tracked work. See
+`plan-numeric-contract.md`.
 
 ## What this demo is NOT
 

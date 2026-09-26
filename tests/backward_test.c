@@ -128,10 +128,9 @@ static double ref_clipped(const double *logp, const double *old_logp, const doub
         if (mask != NULL && mask[r] == 0) continue;
         const double ratio = sequence_mode ? exp(seq_log_ratio) : exp(logp[r] - old_logp[r]);
         const double a = advantage[r];
-        const double unclipped = ratio * a;
-        const double clipped = a > 0.0 ? fmin(ratio, 1.0 + clip_high) * a
-                                       : fmax(ratio, 1.0 - clip_low) * a;
-        objective += (a > 0.0 ? fmin(unclipped, clipped) : fmax(unclipped, clipped)) * inv;
+        /* The plan's Stage-7 form: one min() for either sign of A. */
+        const double clamped = fmin(fmax(ratio, 1.0 - clip_low), 1.0 + clip_high);
+        objective += fmin(ratio * a, clamped * a) * inv;
     }
     return objective;
 }
@@ -583,6 +582,49 @@ static void test_clipped_objective(void) {
           "the far-ratio case failed");
     check(ratio[0] > 1.2f, "the far row's ratio is not outside the band (%.4f)", ratio[0]);
     check(d_logp[0] == 0.0f, "a clipped row has a nonzero gradient (%.3e)", (double)d_logp[0]);
+
+    /* The mirror corner: a *negative* advantage whose ratio is far below the band. The
+     * lower clip is what caps a negative advantage that has fallen too far, so the hinge
+     * there is the clamped value ((1-clip_low)*A) and its gradient is zero. Deriving the
+     * clamped value per sign used to report the *uncapped* ratio*A in this corner while
+     * already zeroing the gradient, so the objective contradicted its own derivative in
+     * exactly this region - the one corner the reference and the implementation shared a
+     * wrong formula for. */
+    {
+        const float low_logp[1] = {-2.0f};
+        const float low_old[1] = {0.0f};
+        const float neg_adv[1] = {-1.0f};
+        const uint8_t one[1] = {1};
+        float d1[1];
+        float ratio1[1];
+        double objective1 = 0.0;
+        long long selected1 = 0;
+        check(backward_clipped_objective(low_logp, low_old, neg_adv, one, 1, clip_low, clip_high,
+                                         BACKWARD_CLIP_TOKEN, d1, ratio1, &objective1, &selected1) ==
+                  BACKWARD_OK,
+              "the negative-advantage out-of-band case failed");
+        check(selected1 == 1 && ratio1[0] < 1.0f - clip_low,
+              "the ratio is not below the band (%.4f)", (double)ratio1[0]);
+        /* ratio = exp(-2) = 0.1353, so the clamped hinge is (1-0.2)*(-1) = -0.8, not
+         * 0.1353*(-1) = -0.1353. */
+        check_close(objective1, (1.0 - (double)clip_low) * -1.0, 1e-6,
+                    "the negative-advantage hinge is not the clamped value");
+        check(d1[0] == 0.0f, "the negative-advantage out-of-band gradient is nonzero (%.3e)",
+              (double)d1[0]);
+        /* And the flat value and the zero gradient agree: the hinge does not move. */
+        const double h = 1e-5;
+        const float hi[1] = {-2.0f + (float)h};
+        const float lo[1] = {-2.0f - (float)h};
+        double oh = 0.0, ol = 0.0;
+        long long s = 0;
+        check(backward_clipped_objective(hi, low_old, neg_adv, one, 1, clip_low, clip_high,
+                                         BACKWARD_CLIP_TOKEN, NULL, NULL, &oh, &s) == BACKWARD_OK &&
+                  backward_clipped_objective(lo, low_old, neg_adv, one, 1, clip_low, clip_high,
+                                             BACKWARD_CLIP_TOKEN, NULL, NULL, &ol, &s) == BACKWARD_OK,
+              "the finite-difference pair failed");
+        check_close(-(oh - ol) / (2.0 * h), (double)d1[0], 1e-4,
+                    "the negative-advantage corner's finite difference");
+    }
 
     check(backward_clipped_objective(logp, old_logp, advantage, mask, rows, -0.1f, 0.2f,
                                      BACKWARD_CLIP_TOKEN, NULL, NULL, NULL, NULL) ==

@@ -70,7 +70,8 @@ add_custom_command(
 
 add_library(engine SHARED
     engine.cu memory.cu safetensors_loader.cu safetensors.cpp model_desc.c manifest.c sha256.c
-    regions.c train.c backward.c train_loop.c layer_dispatch.cu collective.cu moe.cu tap.cu
+    regions.c train.c backward.c train_loop.c alignment.c rollout_queue.c
+    layer_dispatch.cu collective.cu moe.cu tap.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu kernels/mla.cu
@@ -147,6 +148,43 @@ add_executable(test_train_loop ../tests/train_loop_test.c train_loop.c train.c b
 target_include_directories(test_train_loop PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(test_train_loop PRIVATE m)
 add_test(NAME test_train_loop COMMAND test_train_loop)
+
+# CPU-only: the Stage-6 numerical-alignment decision. The verdicts are derived from the
+# Stage-1 inventory (so the two cannot drift), an exception must carry a finite measured
+# bound, an unverified region must name the work that would remove it, and a policy
+# change or sampler difference is refused as a numerical comparison rather than scored
+# against a numerical bound. The region/case comparisons themselves and the
+# gradient/update regression stay Stage 2's and Stage 4's device/CPU gates.
+add_executable(test_alignment ../tests/alignment_test.c alignment.c regions.c manifest.c
+               sha256.c model_desc.c)
+target_include_directories(test_alignment PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(test_alignment PRIVATE m)
+add_test(NAME test_alignment COMMAND test_alignment)
+
+# CPU-only: the Stage-7 group objectives (plan Stage 7). An independent FP64 reference in
+# the test computes the GSPO and GRPO objectives, and the analytic gradient the
+# implementation returns is checked against the reference's central difference, so an
+# implementation and a reference that share a formula cannot certify each other. The
+# fixture is unequal-length on purpose: GSPO weights responses equally and GRPO tokens,
+# and the sequence and token clipping statistics are asserted separately.
+add_executable(test_gspo ../tests/gspo_test.c backward.c regions.c manifest.c sha256.c
+               model_desc.c)
+target_include_directories(test_gspo PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(test_gspo PRIVATE m)
+add_test(NAME test_gspo COMMAND test_gspo)
+
+# CPU-only: the Stage-8 bounded-staleness admission protocol. Whole completed groups only,
+# bounded in groups, tokens and live behavior versions; lag enforced at admission; a
+# consumed-group ledger so a retry cannot count a response twice. It also does the plan's
+# async gate 1 (lag zero reproduces the synchronous objective and gradient bitwise) and
+# gate 3 (lag 0/1/2 injection, reported as a policy change through Stage 6's classifier)
+# at the level the protocol can carry them. The GPU half - snapshots, device leases and
+# publication transfer - is not here and is recorded as such.
+add_executable(test_rollout_queue ../tests/rollout_queue_test.c rollout_queue.c backward.c
+               alignment.c regions.c manifest.c sha256.c model_desc.c)
+target_include_directories(test_rollout_queue PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(test_rollout_queue PRIVATE m)
+add_test(NAME test_rollout_queue COMMAND test_rollout_queue)
 
 # CPU-only: the Stage-4 differentiation contract, the losses, AdamW and the checkpoint
 # format. The losses and the optimizer are compared against an independent FP64

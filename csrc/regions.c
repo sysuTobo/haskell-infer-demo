@@ -411,8 +411,8 @@ static const struct RegionInventoryEntry kInventory[] = {
     {"masked_loss", 1, "all families",
      "kernels/logprob.cu (one row at a time, so no [tokens, vocab] tensor is "
      "materialised) plus csrc/backward.c's masked cross entropy, dense reverse KL, "
-     "clipped objective and group advantage reduction; the masked reduction and its "
-     "backward landed in Stage 4",
+     "clipped objective, group advantage reduction and the GSPO/GRPO group objective; the "
+     "masked reduction and its backward landed in Stage 4",
      "fp32 logits[tokens,vocab_size] and int targets[tokens] with a loss mask",
      "fp32 per-token log-softmax, the masked mean loss and its dlogits",
      "none",
@@ -442,7 +442,8 @@ static const struct RegionInventoryEntry kInventory[] = {
      "the trainer's backward path, implemented in Stage 4 and gated by ctest "
      "test_backward (the contract, the losses, AdamW, the checkpoint format) and ctest "
      "test_backward_kernels (every kernel against a double-precision reference or a "
-     "central difference of it). The region's own `cases` column stays `none`: a "
+     "central difference of it), while the Stage-7 group objectives have their own ctest "
+     "test_gspo. The region's own `cases` column stays `none`: a "
      "backward is a traversal, not a forward execution case, so it is not registered "
      "as one",
      0, NULL},

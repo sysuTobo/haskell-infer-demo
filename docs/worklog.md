@@ -5,14 +5,20 @@ where it is knowingly incomplete. [README.md](../README.md) describes the
 component layout and how to build and test; [design.md](design.md) holds the
 architecture rationale; [plan-numeric-contract.md](plan-numeric-contract.md) is the
 proposal for the trainer, RL and inference-optimization work — of which **Stages 0
-through 3 are implemented here**: the execution manifest with capture provenance
-(specified in [manifest-contract.md](manifest-contract.md)), the region inventory with
-its cross-case harness (`csrc/regions.c`), the feasibility/invariance experiments that
-measured what those regions actually guarantee, and the trainable runtime's parameter
-lifecycle (`csrc/include/train.h`, `src/Infer/Trainer.hs`). All four are described
-below.
+through 5, Stage 6's decision layer, Stage 7's group objectives and Stage 8's lag-zero
+admission protocol are implemented here**: the execution manifest with capture
+provenance (specified in [manifest-contract.md](manifest-contract.md)), the region
+inventory with its cross-case harness (`csrc/regions.c`), the feasibility/invariance
+experiments that measured what those regions actually guarantee, the trainable
+runtime's parameter lifecycle (`csrc/include/train.h`, `src/Infer/Trainer.hs`), the
+backward/loss/optimizer layer and the synchronous SFT/rollout baseline
+(`csrc/include/backward.h`, `csrc/include/train_loop.h`), the numerical-alignment
+decision (`csrc/include/alignment.h`), the GSPO/GRPO group objectives and the bounded
+rollout queue (`csrc/include/rollout_queue.h`). All are described below. The rest of
+Stage 8, the temperature-sampling migration (T0-T4) and the inference-optimization
+track (F/Q/S) are proposals and unimplemented.
 
-Last updated: 2026-09-25.
+Last updated: 2026-09-26.
 
 ## Verified
 
@@ -27,7 +33,7 @@ and hardware" are the exceptions, and they say so.
 | Gate | Result |
 |---|---|
 | `cargo test --locked --offline` | 11/11 |
-| `ctest --test-dir csrc/build-libs` | 25/25 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_backward`, `test_train_loop`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_backward_kernels`, `test_sft`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops` (on a **shared** GPU `test_engine_resources` reads the device's free memory before and after four failing `engine_create` rounds, so it needs a quiescent device: 2026-09-26 a co-tenant holding 28 GB on device 0 moved the reading by 736 MiB and failed a 16 MiB slack, the same test passed on the idle device 1, and the suite's second run of the day — with the device free — was 25/25) |
+| `ctest --test-dir csrc/build-libs` | 28/28 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_backward`, `test_train_loop`, `test_alignment`, `test_gspo`, `test_rollout_queue`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_backward_kernels`, `test_sft`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops` (on a **shared** GPU `test_engine_resources` reads the device's free memory before and after four failing `engine_create` rounds, so it needs a quiescent device: 2026-09-26 a co-tenant holding 28 GB on device 0 moved the reading by 736 MiB and failed a 16 MiB slack, the same test passed on the idle device 1, and the suite's second run of the day — with the device free — was 25/25) |
 | `ctest test_backward` (CPU, Stage 4) | the Stage-4 region table against the Stage-1 inventory in both directions; masked CE, reverse KL, the token/sequence clipped objective and the group advantage reduction against an independent FP64 implementation with its gradient checked by central difference; AdamW against FP64 in PyTorch's own order (including the bias-correction/eps ordering) plus the BF16 publication; the checkpoint round-trip with every failure mode refused; a deterministic fixture overfitting 32/32 through this stage's own loss and optimizer, and a 12+8 resumed run landing bitwise on the uninterrupted 20-step parameters, moments and cursor |
 | `ctest test_backward_kernels` (Stage 4, 2× A40) | every backward against a double-precision definition or a central difference of one: elementwise gates, residual branches, plain/Gemma RMSNorm, the GDN L2 norm, the gated norm, embedding (repeated ids summed), RoPE (the transposed rotation inverting the forward's), the Q/gate re-interleave, GEMM dX/dW, masked CE, AdamW, conv1d (d_x, d_weight, d_bias, d_state_in), GDN prepare (d_conv_out, d_a, d_b, d_A_log, d_dt_bias) — all 1e-8…1e-6 except the finite-difference rows at 1e-7…1e-3; attention forward+LSE vs the definition (2.1e-3 BF16 out, 1.5e-3 LSE) and its backward vs the FD of the definition (dQ 2.5e-4, dK 2.8e-4, dV 1.0e-3), with an analytic double reading of the device LSE reproducing the FD, so the base-2 convention is pinned; the GDN core backward with a nonzero initial state and a nonzero final-state gradient, one chunk and three chunks both matching the same reference (≤1.0e-7), d_state_start included; dQ and the whole GDN core backward bitwise reproducible, dK/dV reported (atomics) |
 | `ctest test_sft` (Stage 5, A40/L20) | SFT on the tiny dense checkpoint (0.72M params, tied embeddings, prompt-masked target) against a `transformers` training run: the first step's loss matches to 6.3e-05 relative; the tied parameter's gradient (after one large-lr AdamW step, where the move's sign *is* the gradient's) has cosine **0.9990** over all 131072 elements; the engine overfits 7.0322 → 0.6084 and the reference 7.0318 → 0.5652; the forward is bitwise reproducible run to run; the training state (FP32 masters and both optimizer moments) round-trips through export/import bitwise; and a pipeline/TP placement, an optimizer step during a live step and a NaN logit are each refused. The rollout section drives `engine_rollout_sample`: the record's fields, the seed reproducing a completion bitwise and a shorter rollout being its prefix, EOS vs the length limit, **20000 draws** whose mean `-log p` is 6.90837 ± 0.00162 against the distribution's entropy of 6.90495 (+2.11 sigma) with all 415 counted bins inside 4.5 sigma (worst 2.94), the record's version being the one the engine *read* (a +1 stamp refused) and an optimizer step refused while the borrow is live, and — for the same completion — the trainer's FP32 denominator differing from the sampler's FP64 one by 4.768e-07 (ratio 0.99999976), with the recorded denominator bitwise unchanged after a publish. Its **group** section generates four completions of one prompt (seeds as part of the fixture), gives each a reward from a deterministic check on the completion, records them into one `TrainGroup` whose version is pinned (a fifth completion generated *after* a publication is refused), reads the rewards back, reduces the advantages (+1.000/−1.000/+1.000/−1.000 at mean 0.5 and population std 0.5), refuses a zero-variance subset unless the caller waives it, runs the **sequence-level objective over the engine's own record** (ratio exactly 1 at unchanged parameters, the gradient's sign following the advantage, +0.25 nat/row giving 1.284025 against the records' 1.284025), and checks the offload declaration round-trips and is cleared at the boundary |
@@ -99,6 +105,54 @@ greedy-token agreement — never a relaxation of the top-1 check.
   (`cuobjdump`) only — there is no H200 here.
 
 ## Recently completed
+
+**Stage 6's alignment decision, Stage 7's group objectives and Stage 8's lag-zero
+protocol** (plan Stages 6-8, verified 2026-09-26).
+These three stages are where the plan stops specifying a trainer and starts specifying
+what to do about what it measured:
+
+- `csrc/include/alignment.h` + `csrc/alignment.c` are Stage 6's **decision layer**: one
+  verdict per Stage-1 region, *derived* from the committed inventory rather than copied
+  from it, so a region cannot carry two different stories. The four regions Stage 2
+  measured (attention core, both GEMM outputs, GDN core) are declared exceptions carrying
+  the measured bound; the four it did not establish (both norms, the conv scan and the
+  gated norm) are invariant-kernel-pending with the option that would remove them named;
+  the rest are exact by construction. The gate also enforces the plan's reporting rule:
+  `alignment_classify` decides what a difference *is*, and scoring a policy change or a
+  sampler difference against a numerical bound is refused, as is checking an
+  exact-by-construction region against a tolerance. **No alignment kernel was written** —
+  a declared exception is the plan's own third option, and the tracked work is named.
+- `backward_group_objective` in `csrc/backward.c` is Stage 7's **GSPO and GRPO**: the
+  plan's `min(s_i A_i, clip(s_i) A_i)` with the length-normalized sequence ratio and the
+  population group advantage, in the plan's `mean_i` form (one term per *response*), with
+  a token-level mode alongside it so the two can be compared on the same fixed groups.
+  `ctest test_gspo` checks both against an independent FP64 reference and, decisively,
+  against that reference's central difference: the analytic gradient matches to < 1e-4
+  everywhere, including the unclipped branch's `A_i s_i / T_i` (s_i not detached).
+  Sequence and token clipping statistics are reported separately, and the named cases
+  (both advantage signs, both clip boundaries, masks, unequal lengths, π_θ = π_b,
+  zero-variance groups, truncated groups) each have their own check.
+- **the gate caught a latent bug in Stage 4's objective**: `backward_clipped_objective`
+  derived its clamped value per sign (min for A>0, max for A<0), so the `r < 1-eps_low,
+  A < 0` corner reported the *uncapped* product while already zeroing its gradient — an
+  objective that disagreed with its own derivative, in the one corner the Stage-4 fixture
+  never entered and where the implementation and its "independent" reference shared the
+  same wrong formula. It now computes the plan's single `min(r*A, clip(r)*A)`, and
+  `test_backward` pins the corner with a case where the value (the clamped `(1-eps)*A`,
+  not `r*A`) and the gradient agree under a finite difference.
+- `csrc/include/rollout_queue.h` + `csrc/rollout_queue.c` are Stage 8's **lag-zero
+  protocol**, which is the plan's own first step ("build A's protocol first, with lag
+  zero"): a bounded `LearnerQueue` over whole completed groups, an admission lag
+  `learner_committed_version - behavior_version` enforced at dequeue, a bounded allowlist
+  of live behavior versions, and a consumed-group ledger so a retry cannot count a
+  response twice. The gate checks the plan's async gate 1 (a group dequeued at lag zero
+  reproduces the synchronous objective and gradient **bitwise**) and gate 3 (lag 0/1/2
+  injected on a fixed group: lag zero gives s_i = 1 and a zero objective, larger lag
+  drifts the objective and gradient, and Stage 6's classifier names that drift a **policy
+  change** rather than a numerical mismatch). **The asynchronous GPU half is not
+  implemented** — snapshots, device leases, publication transfer and every throughput
+  measurement are recorded as open, because they need the actor/learner resource split
+  the plan defers.
 
 **The SFT step and the synchronous training/rollout baseline** (plan Stage 5, verified
 2026-09-26).
@@ -551,7 +605,7 @@ CPU case pinning the behaviour.
   put a coverage claim in the registry that no fixture backs, so it is an open item rather
   than a partial edit. The registry's `masked_loss` row is what the trainer's arrival *did*
   change: it moved out of `not_implemented` into `unverified`.
-- **The training path's gradient pairings are not bitwise, and that is Stage 6's.**
+- **The training path's gradient pairings are not bitwise, and Stage 6 declared them.**
   Stage 4 delivers the backward, the losses and the optimizer, but three pairings stop
   short of bitwise and are recorded rather than glossed: attention's backward
   recomputes P in FP32 while the forward's PV product rounds it to BF16 (dV carries
@@ -559,7 +613,32 @@ CPU case pinning the behaviour.
   differentiates the recurrence rather than the cubin's `(I+A)^{-1}`/BF16-MMA
   decomposition; and the attention dK/dV group sums accumulate with atomics, so they
   are reported by the gate rather than required to be reproducible (dQ, which finishes
-  inside its own block, and the whole GDN core backward are bitwise).
+  inside its own block, and the whole GDN core backward are bitwise). Stage 6's
+  `alignment.c` records these as **declared exceptions for the regions that were measured**
+  (the attention core and both GEMM outputs) and as **invariant-kernel-pending for the four
+  it did not establish** (both norms, the conv scan and the gated norm), so "the pairings
+  are not bitwise" is a decision with a named bound rather than a silent remainder. The
+  kernels that would remove a pending region were **not written**.
+- **No online RL loop, and no algorithm beyond SFT.** Stage 7 delivers the GSPO and GRPO
+  *objectives* and their gradient gate (`csrc/backward.c`, `ctest test_gspo`), not a
+  trainer that runs them: there is no rollout→reward→update trajectory, no policy-distance
+  or stability measurement, no `mean_groups` accumulation (a group objective is computed
+  per group and the caller accumulates), and OPD, DAPO and PPO have no implementation. The
+  plan's Stage-7 table is a plan, not this repository's state.
+- **Stage 8's asynchronous half does not exist.** `csrc/rollout_queue.c` is the lag-zero
+  protocol: a bounded queue, version admission and a consumed ledger. Weight snapshots,
+  device cache leases, publication transfer, the actor/learner resource split, the named
+  stale-data objective (`J_decoupled`) and every throughput/lag-distribution/per-device
+  memory measurement are **not implemented**, which is what the plan's "start only after a
+  synchronous algorithm and parameter publication protocol pass all relevant gates" defers.
+- **`test_train_forward`'s tied-update rms is marginal at its 0.05 tolerance.** On
+  2026-09-26 one full-suite run failed it at rms 0.05093 (top-1 still 12/12) while three
+  immediate re-runs of the same binary passed, and the same library re-ran green; the
+  likely mechanism is cuBLAS selecting a different algorithm/workspace for the projection
+  when another process holds device memory, which is exactly the module-level difference
+  Stage 2's claim D measured. The gate was not loosened — the observation is recorded, and
+  the check should be read as "within band at the time of the run" rather than as a stable
+  two-decimal guarantee.
 - **The SFT step's layer wiring covers the attention and dense-MLP path.** The GDN
   mixer's backward (prepare, conv and core - Stage 4's kernels) is not yet chained into
   the walk, and MoE and MLA remain outside the first trainer allowlist as Stage 1 says, so

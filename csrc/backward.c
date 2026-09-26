@@ -541,29 +541,21 @@ BackwardStatus backward_clipped_objective(const float *logp, const float *old_lo
                                                           : (float)exp((double)(logp[r] - old_logp[r]));
         const float a = advantage[r];
         if (out_ratio != NULL) out_ratio[r] = ratio;
+        /* The plan's surrogate, in the plan's form: min(r*A, clip(r, 1-eps_low, 1+eps_high)*A),
+         * the same expression for either sign of A. Deriving the clamped value per sign by
+         * hand (min for A>0, max for A<0) leaves the r < 1-eps_low / A < 0 corner reporting
+         * the *uncapped* product while zeroing its gradient, i.e. an objective that
+         * disagrees with its own derivative; that corner is where a negative advantage
+         * below the band actually lives. */
+        const float clamped = fminf(fmaxf(ratio, 1.0f - clip_low), 1.0f + clip_high);
         const float unclipped = ratio * a;
-        float clipped_limit;
-        float clipped;
-        if (a > 0.0f) {
-            clipped_limit = 1.0f + clip_high;
-            clipped = fminf(ratio, clipped_limit) * a;
-        } else {
-            clipped_limit = 1.0f - clip_low;
-            clipped = fmaxf(ratio, clipped_limit) * a;
-        }
-        const float hinge = a > 0.0f ? fminf(unclipped, clipped) : fmaxf(unclipped, clipped);
+        const float clipped = clamped * a;
+        const float hinge = fminf(unclipped, clipped);
         objective += (double)hinge * (double)inv_count;
-        /* In the clipped region the hinge is flat in the ratio, so the gradient is
-         * zero; the test is the hinge's own condition rather than a comparison of the
-         * two values, because exp() rarely lands exactly on the boundary. */
-        int linear;
-        if (a > 0.0f) {
-            linear = ratio <= clipped_limit;
-        } else if (a < 0.0f) {
-            linear = ratio >= clipped_limit;
-        } else {
-            linear = 0; /* a zero advantage has no gradient whichever branch is taken */
-        }
+        /* The hinge is flat exactly where it took the clamped value, so the branch is
+         * whichever of the two the fminf chose - the sign of A falls out of it rather
+         * than needing its own range test. */
+        const int linear = unclipped <= clipped;
         if (linear) sequence_hinge_slope += (double)a;
         if (d_logp == NULL) continue;
         if (!linear) {
@@ -575,13 +567,11 @@ BackwardStatus backward_clipped_objective(const float *logp, const float *old_lo
         /* SEQUENCE mode is filled in after the loop, once the shared slope is known. */
     }
     if (d_logp != NULL && mode == BACKWARD_CLIP_SEQUENCE) {
+        const float clamped = fminf(fmaxf(seq_ratio, 1.0f - clip_low), 1.0f + clip_high);
         for (int r = 0; r < rows; ++r) {
             if (!row_selected(mask, NULL, r)) continue;
             const float a = advantage[r];
-            const float ratio = seq_ratio;
-            float clipped_limit = a > 0.0f ? 1.0f + clip_high : 1.0f - clip_low;
-            int linear = a > 0.0f ? (ratio <= clipped_limit)
-                                  : (a < 0.0f ? (ratio >= clipped_limit) : 0);
+            const int linear = seq_ratio * a <= clamped * a;
             d_logp[r] = linear ? (float)(-(double)inv_count * inv_count * (double)seq_ratio *
                                          sequence_hinge_slope)
                                : 0.0f;
@@ -638,6 +628,219 @@ BackwardStatus backward_group_advantage(const float *rewards, const uint8_t *mas
     }
     if (out_mean != NULL) *out_mean = mean;
     if (out_std != NULL) *out_std = std;
+    return BACKWARD_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Group objectives: GSPO and GRPO                                    */
+/* ------------------------------------------------------------------ */
+
+/* A response's trainable-token count T_i. */
+static long long response_selected(const struct BackwardResponse *response) {
+    if (response->response_mask == NULL) return response->tokens;
+    long long n = 0;
+    for (int t = 0; t < response->tokens; ++t) {
+        if (response->response_mask[t] != 0) ++n;
+    }
+    return n;
+}
+
+static int response_row_selected(const struct BackwardResponse *response, int t) {
+    return response->response_mask == NULL || response->response_mask[t] != 0;
+}
+
+BackwardStatus backward_group_objective(const struct BackwardGroupConfig *config,
+                                        BackwardGroupMode mode,
+                                        const struct BackwardResponse *responses, int count,
+                                        const float *rewards, float *d_logp, float *out_ratio,
+                                        float *out_advantages,
+                                        struct BackwardGroupStats *out_stats,
+                                        double *out_objective) {
+    if (config == NULL || responses == NULL || rewards == NULL) {
+        return fail(BACKWARD_ERR_ARG, "backward_group_objective: null argument");
+    }
+    if (count < 2) {
+        return fail(BACKWARD_ERR_ARG,
+                    "backward_group_objective: a group needs at least two responses (got %d); a "
+                    "single response has no group-relative advantage", count);
+    }
+    if (mode != BACKWARD_GROUP_GSPO && mode != BACKWARD_GROUP_GRPO) {
+        return fail(BACKWARD_ERR_ARG, "backward_group_objective: unknown group mode %d", (int)mode);
+    }
+    if (!isfinite(config->clip_low) || !isfinite(config->clip_high) ||
+        !isfinite(config->eps_adv) || config->clip_low < 0.0f || config->clip_high < 0.0f ||
+        config->eps_adv < 0.0f) {
+        return fail(BACKWARD_ERR_RANGE,
+                    "backward_group_objective: invalid clip or advantage epsilon");
+    }
+
+    /* Admission and T_i. An excluded response contributes nothing at all - no token, no
+     * ratio, no advantage - and an admitted but empty one is an error rather than a
+     * quiet zero, because the plan makes a zero-length response invalid. */
+    int admitted = 0;
+    long long total_tokens = 0;
+    for (int i = 0; i < count; ++i) {
+        const struct BackwardResponse *r = &responses[i];
+        if (r->tokens < 0) {
+            return fail(BACKWARD_ERR_RANGE, "backward_group_objective: response %d has %d rows",
+                        i, r->tokens);
+        }
+        if (!r->admitted) continue;
+        if (r->logp == NULL || r->behavior_logp == NULL) {
+            return fail(BACKWARD_ERR_ARG,
+                        "backward_group_objective: response %d is admitted without "
+                        "log-probabilities", i);
+        }
+        const long long t_i = response_selected(r);
+        if (t_i <= 0) {
+            return fail(BACKWARD_ERR_STATE,
+                        "backward_group_objective: response %d is admitted but has no selected "
+                        "response token; a zero-length response is invalid", i);
+        }
+        total_tokens += t_i;
+        ++admitted;
+    }
+    if (admitted < 2) {
+        return fail(BACKWARD_ERR_STATE,
+                    "backward_group_objective: %d of %d responses admitted; a group is normalised "
+                    "over its complete responses, so a smaller group is refused rather than "
+                    "partially normalised", admitted, count);
+    }
+
+    /* The group-relative advantage, the population normalisation of
+     * backward_group_advantage. GSPO's stated rule for a zero-variance group is a zero
+     * advantage (which eps_adv gives: 0/eps = 0), so allow_zero_variance is the caller's
+     * explicit choice rather than a default. */
+    double sum = 0.0;
+    for (int i = 0; i < count; ++i) {
+        if (!responses[i].admitted) continue;
+        if (!isfinite(rewards[i])) {
+            return fail(BACKWARD_ERR_DIVERGED, "backward_group_objective: response %d has a "
+                                               "non-finite reward", i);
+        }
+        sum += (double)rewards[i];
+    }
+    const double mean = sum / (double)admitted;
+    double variance = 0.0;
+    for (int i = 0; i < count; ++i) {
+        if (!responses[i].admitted) continue;
+        const double d = (double)rewards[i] - mean;
+        variance += d * d;
+    }
+    variance /= (double)admitted;
+    const double std = sqrt(variance);
+    if (std <= 0.0 && !config->allow_zero_variance) {
+        return fail(BACKWARD_ERR_STATE,
+                    "backward_group_objective: the group has zero variance (all rewards equal); "
+                    "pass allow_zero_variance to take GSPO's zero advantage deliberately");
+    }
+
+    const double inv_group = 1.0 / (double)admitted;
+    const double inv_tokens = 1.0 / (double)total_tokens;
+    long long offset = 0;
+    long long clipped_sequences = 0;
+    long long clipped_tokens = 0;
+    double ratio_sum = 0.0;
+    double max_abs_log_ratio = 0.0;
+    double max_abs_token_log_ratio = 0.0;
+    double objective = 0.0;
+
+    for (int i = 0; i < count; ++i) {
+        const struct BackwardResponse *r = &responses[i];
+        if (!r->admitted) {
+            if (out_ratio != NULL) out_ratio[i] = 0.0f;
+            if (out_advantages != NULL) out_advantages[i] = 0.0f;
+            continue;
+        }
+        const long long t_i = response_selected(r);
+        const double a = ((double)rewards[i] - mean) / (std + (double)config->eps_adv);
+        if (out_advantages != NULL) out_advantages[i] = (float)a;
+
+        /* The response's whole-block log ratio, which is GSPO's ratio and the statistic
+         * both modes report (length normalisation is what can hide a token tail). */
+        double log_s = 0.0;
+        double worst_token = 0.0;
+        for (int t = 0; t < r->tokens; ++t) {
+            if (!response_row_selected(r, t)) continue;
+            const double log_ratio = (double)r->logp[t] - (double)r->behavior_logp[t];
+            if (!isfinite(log_ratio)) {
+                return fail(BACKWARD_ERR_DIVERGED,
+                            "backward_group_objective: response %d token %d has a non-finite "
+                            "log ratio", i, t);
+            }
+            log_s += log_ratio;
+            if (fabs(log_ratio) > worst_token) worst_token = fabs(log_ratio);
+        }
+        log_s /= (double)t_i;
+        const double s_i = exp(log_s);
+        if (out_ratio != NULL) out_ratio[i] = (float)s_i;
+        ratio_sum += s_i;
+        if (fabs(log_s) > max_abs_log_ratio) max_abs_log_ratio = fabs(log_s);
+        if (worst_token > max_abs_token_log_ratio) max_abs_token_log_ratio = worst_token;
+
+        /* GSPO's ratio is shared by the whole response, so one hinge decides every token's
+         * gradient and the sequence clipping statistic. GRPO decides per token. The flat
+         * d_logp layout packs only selected rows, so `slot` - not `t` - is the index. */
+        int response_clipped = 0;
+        int slot = 0;
+        double response_hinge = 0.0;
+        for (int t = 0; t < r->tokens; ++t) {
+            if (!response_row_selected(r, t)) continue;
+            const double ratio = mode == BACKWARD_GROUP_GSPO
+                                     ? s_i
+                                     : exp((double)r->logp[t] - (double)r->behavior_logp[t]);
+            const double unclipped = ratio * a;
+            const double clamped =
+                fmin(fmax(ratio, 1.0 - (double)config->clip_low), 1.0 + (double)config->clip_high);
+            const double clipped = clamped * a;
+            const int linear = unclipped <= clipped;
+            const double hinge = fmin(unclipped, clipped);
+            /* GSPO's objective is the plan's `mean_i`: one term *per response*, so the
+             * response's single hinge is added once, not once per token (which would
+             * weight a longer response more heavily - that is GRPO's normalisation, and
+             * the finite difference of the independent reference is what caught the
+             * difference). */
+            if (mode == BACKWARD_GROUP_GSPO) {
+                response_hinge = hinge;
+            } else {
+                objective += inv_tokens * hinge;
+            }
+            if (!linear) {
+                ++clipped_tokens;
+                response_clipped = 1;
+            }
+            if (d_logp != NULL) {
+                if (!linear) {
+                    d_logp[offset + slot] = 0.0f;
+                } else if (mode == BACKWARD_GROUP_GSPO) {
+                    /* dJ/dlogp_it = (1/G) * A_i * s_i / T_i: s_i is not detached, so the
+                     * sequence ratio's own dependence on every token is carried. */
+                    d_logp[offset + slot] = (float)(inv_group * a * s_i / (double)t_i);
+                } else {
+                    /* dJ/dlogp_it = (1/sum T) * A_i * r_it. */
+                    d_logp[offset + slot] = (float)(inv_tokens * a * ratio);
+                }
+            }
+            ++slot;
+        }
+        if (mode == BACKWARD_GROUP_GSPO) objective += inv_group * response_hinge;
+        if (response_clipped) ++clipped_sequences;
+        offset += t_i;
+    }
+
+    if (out_stats != NULL) {
+        out_stats->responses = count;
+        out_stats->admitted = admitted;
+        out_stats->trainable_tokens = total_tokens;
+        out_stats->clipped_sequences = clipped_sequences;
+        out_stats->clipped_tokens = clipped_tokens;
+        out_stats->mean_ratio = ratio_sum * inv_group;
+        out_stats->max_abs_log_ratio = max_abs_log_ratio;
+        out_stats->max_abs_token_log_ratio = max_abs_token_log_ratio;
+        out_stats->advantage_mean = mean;
+        out_stats->advantage_std = std;
+    }
+    if (out_objective != NULL) *out_objective = objective;
     return BACKWARD_OK;
 }
 

@@ -1,13 +1,17 @@
 # Plan: Numerical Execution Contract, Haskell Training, and Asynchronous RL
 
-Status: Stages 6–8 proposed, not implemented; **Stages 0-5 are implemented**
-(the versioned execution manifest with capture provenance, the region inventory
-with its cross-case harness, the feasibility/invariance experiments, the
-trainable runtime's parameter lifecycle, the backward/loss/optimizer layer, and
-the synchronous SFT/rollout baseline —
+Status: **Stages 0-5 are implemented**, and so are Stage 6's decision layer,
+Stage 7's GSPO/GRPO objectives and Stage 8's lag-zero admission protocol; the rest
+of Stage 8 and the temperature-sampling and inference-optimization tracks below are
+proposals (the versioned execution manifest with capture provenance, the region
+inventory with its cross-case harness, the feasibility/invariance experiments, the
+trainable runtime's parameter lifecycle, the backward/loss/optimizer layer, the
+synchronous SFT/rollout baseline, the numerical-alignment decision, the GSPO/GRPO
+group objectives and their gate, and the bounded-staleness rollout queue —
 see
 [manifest-contract.md](manifest-contract.md), [worklog.md](worklog.md),
-`csrc/regions.c`, `csrc/include/train.h` and `csrc/include/backward.h`).
+`csrc/regions.c`, `csrc/include/train.h`, `csrc/include/backward.h`,
+`csrc/include/alignment.h` and `csrc/include/rollout_queue.h`).
 Revised after the design review, 2026-09-23.
 Extends [design.md](design.md). This document separates current capabilities,
 proposed interfaces, measured observations and hypotheses requiring experiments.
@@ -63,22 +67,25 @@ debuggability and attributable experiments, not promised reward or speed gains.
 
 | Area | Present | Missing or not established |
 |---|---|---|
-| Orchestration | Haskell model/configuration/placement/generation; C layer/chunk loops | Training traversal, activation lifetimes, region-level opaque handles |
-| Inference API | `engine_create/prefill/decode/reset/destroy`; final-row logits | All-token loss/logprob evaluation, parameter updates, trainer API |
-| Mixers/FFNs | Full attention, GDN, MLA; dense and MoE | All backward paths; training support matrix |
+| Orchestration | Haskell model/configuration/placement/generation; C layer/chunk loops; the fixed training traversal (Stage 3: `Infer.Trainer`) | Activation lifetimes, region-level opaque handles |
+| Inference API | `engine_create/prefill/decode/reset/destroy`; final-row logits; the trainer API and the all-position retained forward (Stages 4-5) | Multi-device training, OPD/DAPO/PPO and an online RL loop |
+| Mixers/FFNs | Full attention, GDN, MLA; dense and MoE | The GDN mixer's backward is not chained into the layer walk, and MoE/MLA stay outside the first trainer allowlist (Stages 4-5) |
 | Placement | `Pipelined` and `Replicated tp ep`; separate TP and EP | Combined TP+EP; trainer collectives; PP bitwise-invariance evidence |
 | GDN | Chunked path plus recurrent `tokens == 1`, including one-token tails | Cross-case bitwise invariance; prepare/core/backward pairing |
 | Attention | One FlashInfer prefill dispatcher; null split-KV workspace | Invariance across query/KV lengths, cached and training layouts |
 | GEMM | cuBLAS BF16 and FP32-output paths | Batch-invariant forward; specified dW/gradient accumulation order |
 | Descriptor | Strict flat schema and canonical C formatting | Semantic/numerical digests and resolved execution manifest |
 | Artifacts | nvcc SASS `86;89;90a` plus `90-virtual`; Triton cubins `86;89;90` | Capture provenance identifying the actual selected kernels; Triton has no PTX fallback |
-| Weights | Engine-owned BF16; derived GDN norm FP32 copy | Shared trainable ownership, tied-gradient merging, derived-copy refresh |
+| Weights | Engine-owned BF16; derived GDN norm FP32 copy; shared trainable ownership with tied-gradient merging and derived-copy refresh (Stage 3) | Refresh of derived copies under a concurrent writer, and any multi-device gradient merge |
 | Fusion | FlashInfer attention, SiLU-multiply and GDN gated norm; dense gate/up still separate GEMMs | Combined projection layouts, residual-add/norm fusion and measured end-to-end benefit |
 | Quantization | Weight-role loading requires BF16; GEMM uses BF16 inputs with FP32 compute | Packed low-bit weights, scales, format validation, quantized GEMM and quality gates |
 | Speculative decoding | Batched prefill internally, but only final-row logits; reset clears all sequence state | Draft/target orchestration, per-position verification, prefix rollback and GDN state snapshots |
 | Sampling | Four argmax call sites in streaming/non-streaming generation; host `[Float]` logits; no temperature/seed options or RNG dependency | Shared token selector, temperature categorical distribution, request-owned RNG, sampler logprobs and distribution/replay gates |
-| Training | No optimizer, objectives or saved-activation runtime | Full training path, checkpoint/resume and independent gradient tests |
-| Rollout | Greedy single-request inference | Stochastic sampling, behavior logprobs, groups, rewards, versioned queues |
+| Training | The parameter lifecycle, the backward/loss/AdamW layer and the SFT bring-up, with checkpoint/resume and independent gradient tests (Stages 3-5) | OPD/DAPO/PPO, an online RL loop, and more than one device |
+| Rollout | Greedy single-request inference; an engine-driven stochastic rollout bound to a borrowed version, group objectives (GSPO/GRPO) and a bounded admission queue (Stages 5-8) | An online RL loop, asynchronous GPU scheduling (snapshots, device leases, publication transfer) and throughput measurement |
+
+This table is the audit the plan started from; each stage's own status block below
+records what has since landed and what it left open.
 
 Evidence anchors: `csrc/engine.cu::load_role`, `compute_logits`, `forward_tokens`;
 `csrc/kernels/fla_gdn.cu::kernel_fla_gdn`;
@@ -722,6 +729,47 @@ positive advantages, EOS/truncation, zero-variance groups and reproducible resum
 
 ### Stage 6 — Numerical alignment, driven by evidence
 
+**Status: the decision layer and its gate are implemented, 2026-09-26; no
+alignment kernel was written, and this stage's options say why.** Stage 6 exists to
+decide, *from Stage 2's evidence*, between an invariant kernel, a constrained
+library configuration and a declared exception — and Stage 2 already measured the
+answer, so the deliverable is the decision made checkable rather than a new
+implementation. `csrc/include/alignment.h` + `csrc/alignment.c` derive one verdict
+per Stage-1 region **from the committed inventory** (`region_inventory`) so the two
+cannot drift, and `ctest test_alignment` is the gate:
+
+- **the four measured regions are declared exceptions carrying the Stage-2 bound.**
+  `attention_core` (1.0e-03 max_abs / 1.0e-04 rms), `gemm_bf16` (1.3e-01 / 1.2e-02),
+  `gemm_fp32_lmhead` (8.0e-04 / 1.3e-04) and `gdn_core` (4.3e-04 / 4.8e-05) each
+  resolve to `declared_exception`, and the bound *is* the widest over the region's
+  pairs, so a declared exception cannot be tighter than what was measured; a decision
+  of `exact_by_construction` for a region with an `exception` or `unverified` pair is
+  refused rather than derived.
+- **the four regions Stage 2 did not establish name the option that would remove
+  them.** `rmsnorm`, `per_head_norm`, `gdn_conv1d` and `gdn_gated_norm` are
+  `invariant_kernel_pending` with their tracked work named (a fixed reduction-tree
+  kernel, a fixed conv scan order, or an explicitly constrained library
+  configuration with a tested claim); adding an `unverified` pair to `regions.c`
+  fails the gate until that work is named, and a stale entry for a region that is no
+  longer pending fails it too. The remaining regions are `exact_by_construction`.
+- **the reporting rule has teeth.** `alignment_classify` decides what a difference
+  *is* before any bound is applied, and `alignment_check_observation` refuses to
+  score a policy change or a sampler difference against a numerical bound — a
+  3.0-magnitude difference from a stale group is not a numerical mismatch — and
+  refuses to check an exact-by-construction region against a tolerance at all.
+
+Three limits are recorded. **The alignment kernels were not built**: `alignment.c`
+names them as tracked work, which is the plan's third option ("or a declared
+numerical exception") and a decision rather than an omission, so an RL experiment
+may run on tolerance and report its error. The region and end-to-end same-weight
+logprob comparisons the gate names are **Stage 2's device gates**
+(`test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`,
+`test_attention_lse`) and the gradient/update regression is **Stage 4's**
+(`test_backward`, `test_backward_kernels`); Stage 6 adds the decision those
+measurements feed and the separation that stops them being relabelled. And the
+bounds are absolute logit differences at the measured shapes, not a bound on any
+other workload's deviation.
+
 CPR for GDN and batch-invariant GEMM/attention remain optional implementation
 choices until Stage 2 identifies the actual gaps. CPR must preserve the corrected
 recurrence and supply a compatible backward. Re-run Stage 4 gradient/update gates
@@ -741,6 +789,53 @@ experiments must report their error and learning stability rather than relabel
 exceptions as bitwise guarantees.
 
 ### Stage 7 — Algorithm bring-up and GSPO
+
+**Status: the GSPO and GRPO objectives and their gate are implemented,
+2026-09-26; no online RL loop is.** The objectives are
+`backward_group_objective` in `csrc/backward.c` (the plan's `min(s_i A_i,
+clip(s_i, 1-eps_low, 1+eps_high) A_i)` with `s_i = exp((1/T_i) sum_t (ell_theta -
+ell_b))`, the group-relative population advantage, and one term per *response*) in
+GSPO mode and the token-level analogue in GRPO mode; `ctest test_gspo` is the gate:
+
+- **an independent FP64 reference and its central difference pin both modes.** On
+  an unequal-length group (G = 4, T = 3/2/1/2, rewards 1,0,1,0 so the advantages are
+  +1/-1/+1/-1), GSPO's objective is **0.126292** and GRPO's is **0.113146** — the two
+  differ because equal-response and equal-token normalisation are different
+  objectives, which is what "compare GSPO against GRPO on the same fixed rollout
+  groups" needs. The analytic gradient matches the reference's finite difference to
+  **< 1e-4** over every token of every response, including the unclipped branch's
+  closed form `A_i s_i / T_i` (s_i is not detached).
+- **both advantage signs and both clip boundaries are exercised.** Response 0
+  (A = +1, s = 1.4918) is clipped by the upper clip and response 1 (A = -1,
+  s = 0.4493) by the lower, so GSPO reports **2 clipped sequences / 5 clipped
+  tokens** while GRPO reports **4 clipped tokens** with the two statistics asserted
+  separately, and `mean_ratio`, `max_abs_log_ratio` and the token tail
+  `max_abs_token_log_ratio` are reported so length normalisation cannot hide an
+  extreme token.
+- **the plan's named cases hold.** At `pi_theta = pi_b` every `s_i` is exactly 1
+  and the objective is exactly 0 with the gradient `A_i/(G T_i)`; a mask removes a
+  token from `T_i`, the layout and the objective together; a zero-variance group is
+  refused by default and gives zero advantages under GSPO's stated rule (which the
+  caller opts into); a zero-length or one-response group is refused rather than
+  partially normalised; and an unadmitted (truncated) response is excluded from both
+  the objective and the `d_logp` layout.
+
+**The bug the gate caught**, recorded because it is what a finite-difference check
+is for: the Stage-4 `backward_clipped_objective` derived its clamped value *per
+sign* (min for A>0, max for A<0), which left the `r < 1-eps_low, A < 0` corner
+reporting the **uncapped** product while already zeroing its gradient — an
+objective that disagreed with its own derivative in exactly the corner the Stage-4
+fixture never entered, and the corner where its "independent" reference shared the
+same wrong formula. It now computes the plan's single `min(r*A, clip(r)*A)`, and
+`ctest test_backward` pins the corner with a case whose value (the clamped
+`(1-eps)*A`, not `r*A`) and gradient agree under a finite difference.
+
+Three limits are recorded. **No online RL loop is implemented**: SFT is the only
+bring-up, and the objectives here are the arithmetic and its gate, not a trainer
+trajectory, a reward-collection run, a policy-distance measurement or a learning
+stability result. OPD, DAPO and PPO remain unimplemented — their rows in the table
+below are the plan's, not this repository's. And `mean_groups` is the caller's: a
+group objective is computed per group, and the caller accumulates groups.
 
 | Algorithm | Rollout | Additional models | Ratio/objective | First validation |
 |---|---|---|---|---|
@@ -812,6 +907,54 @@ against GRPO on the same fixed rollout groups before comparing online rewards.
 Report sequence/token clipping statistics separately. No reward-gain guarantee.
 
 ### Stage 8 — Bounded-staleness asynchronous RL (proposal)
+
+**Status: the lag-zero protocol half is implemented, 2026-09-26; the asynchronous
+GPU half is not.** This stage's own order is "build A's protocol first, with lag
+zero", and that is what `csrc/include/rollout_queue.h` + `csrc/rollout_queue.c` are:
+the bounded `LearnerQueue` over whole completed groups, the immutable behavior
+version each group is admitted under, and the plan's lag
+`learner_committed_version - behavior_version` enforced at admission.
+`ctest test_rollout_queue` is the gate:
+
+- **only whole completed groups, and only one version each.** A group with fewer
+  than two responses, fewer than two admitted responses or no trainable token is
+  refused (the plan's "do not renormalize a partial failed group"), and every
+  response must carry the group's declared behavior version, so "do not combine
+  different behavior versions into one group" is a refusal rather than a comment.
+- **the queue is bounded in groups, in tokens and in live behavior versions**, and
+  each bound is backpressure (`ROLLOUT_ERR_FULL`, a distinct status) rather than a
+  silent drop; a refused group leaves the queue's counts unchanged. A group at an
+  already-live version is still admitted, which is the "bounded allowlist" behaving
+  as an allowlist.
+- **lag is enforced at admission.** A behavior version *ahead* of the learner's
+  committed one is an unknown version and is refused (`ROLLOUT_ERR_STALE`), and so
+  is one further behind than the declared cap; the admitted group is stamped with
+  the learner's committed version as its proximal anchor.
+- **consumption is a ledger.** A consumed group cannot be enqueued again — "retries
+  cannot count a response twice and restart cannot silently retrain a consumed
+  batch" — while a group that was *dropped* (rejected with a reason) was never
+  trained on and may be regenerated. The ledger lives in the queue, so a destroyed
+  queue loses it, which is the documented cost of discarding the record.
+- **the plan's async gate 1 holds.** A group dequeued at lag zero produces
+  **bitwise** the same GSPO objective and gradient as the same group computed
+  directly, and its anchor version equals its behavior version: the queue is a
+  container and does not move a number.
+- **the plan's async gate 3 holds at the protocol level.** With lag injected as
+  0/1/2 on a fixed toy group, lag zero gives `s_i = 1` and a zero objective while
+  larger lag moves both the objective and the gradient — and that drift is named a
+  **policy change** through Stage 6's `alignment_classify`, not a numerical
+  mismatch, and no ratio is claimed to repair it. A zero-lag cap admits only the
+  lag-zero group, which is "GSPO remains lag-zero until its separate objective gate
+  is satisfied" as behaviour.
+
+What is deliberately **not** implemented, because the plan defers it "before
+positive-lag async experiments": weight snapshots and their publication transfer,
+device cache leases, the actor/learner resource split, the `J_decoupled` stale-data
+objective, deadline/drop policy monitoring, and every throughput, queue/lag
+distribution and per-device memory measurement. The protocol half is what can be
+built and checked without them; the plan's rule that Stage 8 "starts only after a
+synchronous algorithm and parameter publication protocol pass all relevant gates"
+is also why GSPO has no validated stale-policy support here.
 
 Start only after a synchronous algorithm and parameter publication protocol pass
 all relevant gates. Asynchrony is a scheduling property, not another name for
@@ -1013,6 +1156,11 @@ for controlled replay tests.
 ## Temperature-sampling migration
 
 ### Target behavior and scope
+
+**Status: proposed and unimplemented.** No part of T0-T4 exists in this repository:
+the CLI still has neither a temperature nor a seed option, `src/Infer/Sampling.hs` and
+its test modules are not present, and the milestones below remain unchecked. The
+`sampler_softmax_cdf` region in `regions.c` is what a later revision would fill in.
 
 The current implementation is **greedy decoding**, not stochastic sampling:
 `src/Infer/Generation.hs::generate` and `generateStreaming` select argmax at
@@ -1289,6 +1437,12 @@ sampler alone does not satisfy that extension or Stage 5's trajectory ledger.
 ## Inference optimization track
 
 ### Scope, dependencies and numerical identities
+
+**Status: proposed and unimplemented.** None of F, Q or S exists: no fusion was applied,
+no quantized artifact or `weights.manifest.json` sidecar was produced, and no draft/target
+speculative path was written. The region inventory notes where each change would land. This
+track was not touched by the Stage 6-8 work, which is per the recommendation below - it is
+"a prioritization, not a hard dependency".
 
 Recommended implementation order: **baseline/provenance → fusion → weight-only
 quantization → speculative decoding → measured combinations**. This is a

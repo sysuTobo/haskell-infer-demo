@@ -246,6 +246,86 @@ BackwardStatus backward_group_advantage(const float *rewards, const uint8_t *mas
                                         double *out_mean, double *out_std);
 
 /* ------------------------------------------------------------------ */
+/* Group objectives: GSPO and GRPO                                    */
+/* ------------------------------------------------------------------ */
+
+/* One response's contribution to a group objective. `logp` is the current learner's
+ * per-token log-probability (pi_theta), `behavior_logp` the behavior policy's captured at
+ * rollout (pi_b, a constant), and `response_mask` marks the trainable response tokens
+ * (prompt, padding and external environment tokens excluded; a generated EOS is included
+ * when the mask says so). `tokens` is the row count, so T_i is the number of selected
+ * rows. `admitted == 0` excludes a response entirely - a truncated or otherwise invalid
+ * one, by an explicit caller rule - while an admitted response with no selected row is an
+ * error, because a zero-length response is invalid rather than a quiet zero. */
+struct BackwardResponse {
+    const float *logp;
+    const float *behavior_logp;
+    const uint8_t *response_mask;
+    int tokens;
+    int admitted;
+};
+
+/* Which group objective. GSPO builds one length-normalized ratio per response and
+ * weights each response equally; GRPO builds one ratio per token and weights by token
+ * count. They share the group-relative advantage and the clip range on purpose, so the
+ * two can be compared on the same fixed rollout groups before any online comparison. */
+typedef enum {
+    BACKWARD_GROUP_GSPO = 0,
+    BACKWARD_GROUP_GRPO = 1,
+} BackwardGroupMode;
+
+struct BackwardGroupConfig {
+    float clip_low;          /* 1 - clip_low is the lower clip; the plan's symmetric eps is clip_low == clip_high */
+    float clip_high;         /* 1 + clip_high is the upper clip */
+    float eps_adv;           /* the group normalisation's epsilon */
+    int allow_zero_variance; /* 0: refuse a zero-variance group; 1: zero advantages (GSPO's rule) */
+};
+
+/* The clipping and ratio statistics the plan asks to be reported separately: how many
+ * responses (GSPO) or tokens (GRPO) took the flat branch, how far the sequence ratio
+ * moved, and the group's advantage spread. `mean_ratio` and `max_abs_log_ratio` are over
+ * the admitted responses; `clipped_tokens` counts selected tokens whose gradient was
+ * zeroed, which for GSPO is the whole of a clipped response's tokens. */
+struct BackwardGroupStats {
+    int responses;               /* G, as passed */
+    int admitted;                /* how many entered the objective (>= 2) */
+    long long trainable_tokens;  /* sum of T_i over the admitted responses */
+    long long clipped_sequences; /* admitted responses that took the clamped branch */
+    long long clipped_tokens;    /* selected tokens whose hinge was flat */
+    double mean_ratio;           /* mean s_i over admitted responses */
+    double max_abs_log_ratio;    /* max |(1/T_i) sum_t log_ratio| over admitted responses */
+    double max_abs_token_log_ratio; /* max |log_ratio| over selected tokens (the tail s_i hides) */
+    double advantage_mean;
+    double advantage_std;        /* population */
+};
+
+/* The GSPO/GRPO objective over a group of unequal-length responses (plan Stage 7):
+ *
+ *   A_i    = stop_gradient((R_i - mean(R)) / (std_pop(R) + eps_adv))
+ *   GSPO:  log s_i = (1/T_i) * sum_t (logp_it - behavior_logp_it);  one ratio per response
+ *   GRPO:  r_it    = exp(logp_it - behavior_logp_it);               one ratio per token
+ *   hinge  = min(ratio * A_i, clip(ratio, 1-clip_low, 1+clip_high) * A_i)
+ *   GSPO:  J = mean_i hinge_i                      (each response weighted equally)
+ *   GRPO:  J = (1/sum_i T_i) * sum_i sum_t hinge_it (each token weighted equally)
+ *
+ * `d_logp` receives dJ/dlogp, laid out contiguously in response order (response i starts
+ * at sum_{j<i} T_j), so the caller adds it to the region gradients. Nothing is detached:
+ * the behavior log-probabilities, the rewards and the advantages are the only constants,
+ * and the ratio's own dependence on logp is what the gradient carries - in the linear
+ * branch that is `A_i * s_i / T_i` for GSPO (the plan's "do not detach s_i"), not `A_i`.
+ * `out_ratio` (may be null) is the per-response s_i for GSPO and is not defined for GRPO;
+ * `out_advantages` (may be null) is per response. A zero-variance group follows
+ * `allow_zero_variance`: GSPO's stated rule is zero advantages, which the plan admits
+ * rather than refusing. */
+BackwardStatus backward_group_objective(const struct BackwardGroupConfig *config,
+                                        BackwardGroupMode mode,
+                                        const struct BackwardResponse *responses, int count,
+                                        const float *rewards, float *d_logp, float *out_ratio,
+                                        float *out_advantages,
+                                        struct BackwardGroupStats *out_stats,
+                                        double *out_objective);
+
+/* ------------------------------------------------------------------ */
 /* AdamW                                                             */
 /* ------------------------------------------------------------------ */
 

@@ -317,8 +317,10 @@ struct TrainForcedPosition {
 
 /* Build the selected-position list:
  *   - `shift` is normally 1 (the label of query t is token t+shift);
- *   - `mask` is optional; 0 marks a prompt/padding position and is skipped — the
- *     loss must not include it, so it is not selected;
+ *   - `mask` is optional and is indexed by the *predicted* position, not the query:
+ *     the mask marks the response/padding split, so `mask[query + shift] == 0` means
+ *     "this target is a prompt or padding token and its loss must not count". A caller
+ *     that masks by query instead would train on the prompt and drop a response token;
  *   - the last `shift` positions have no label and are never selected;
  *   - `labels` is optional and parallel to the token ids. When it is null the target
  *     at position `tt` is `token_ids[tt]` (self-supervised next-token prediction);

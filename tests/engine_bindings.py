@@ -77,6 +77,23 @@ def bind(lib):
         lib.train_store_stale_derived_count.argtypes = [ctypes.c_void_p]
         lib.train_store_stale_derived_count.restype = ctypes.c_int
         lib.train_last_error.restype = ctypes.c_char_p
+    # Stage 5: the SFT step. Bound only when the library exports it.
+    if hasattr(lib, "engine_train_forward_retain"):
+        lib.engine_train_forward_retain.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                                   ctypes.c_void_p, ctypes.c_void_p,
+                                                   ctypes.c_int]
+        lib.engine_train_loss.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                         ctypes.c_int, ctypes.c_void_p]
+        lib.engine_train_backward.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+        lib.engine_train_zero_grads.argtypes = [ctypes.c_void_p]
+        lib.engine_train_apply.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        lib.engine_train_export_state.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                 ctypes.c_void_p, ctypes.c_void_p,
+                                                 ctypes.c_void_p]
+        lib.engine_train_import_state.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                 ctypes.c_void_p, ctypes.c_void_p,
+                                                 ctypes.c_void_p]
     if hasattr(lib, "model_desc_role_from_name"):
         lib.model_desc_role_from_name.argtypes = [ctypes.c_char_p]
         lib.model_desc_role_from_name.restype = ctypes.c_int

@@ -180,7 +180,7 @@ equal highest BF16 reference logits are treated as ties.
 
 ## Tests
 
-- `ctest --test-dir csrc/build-libs` runs six suites that need no GPU at all:
+- `ctest --test-dir csrc/build-libs` runs seven suites that need no GPU at all:
   `test_model_desc` (descriptor parsing, structural validation, the
   engine-capability gate for the AOT GDN layout, canonical echo and the tp-role
   coverage rule), `test_safetensors` (malformed headers, offsets, shapes and
@@ -193,7 +193,11 @@ equal highest BF16 reference logits are treated as ties.
   `test_region_inventory`, which checks the plan's in-scope forward path is
   inventoried region by region, that the inventory and the manifest registry cannot
   drift apart, and that every registered case-pair verdict carries the evidence it
-  needs, `test_backward`, which checks the Stage-4 differentiation contract: the
+  needs, `test_train_loop`, which checks Stage 5's training/rollout baseline: the phase
+  budgets, the phase machine (a rollout's borrow is what makes the store refuse an
+  update), the version-bound selection records, the exactly-one ratio at unchanged
+  parameters and the host FP64 sampler's measured frequencies; `test_backward`, which
+  checks the Stage-4 differentiation contract: the
   Stage-4 region table against that same inventory in both directions, the losses and
   AdamW against an independent FP64 implementation, the checkpoint's refusals, a
   deterministic fixture that overfits to 32/32 and a resume that has to land on the
@@ -223,6 +227,10 @@ equal highest BF16 reference logits are treated as ties.
   log-probabilities, tied roles, a synthetic update that must refresh both readers and
   the derived FP32 copy, and the training-step lifetime; it skips itself when the
   checkpoint is absent), and the
+  `test_sft` (the Stage-5 gate: the SFT step against a `transformers` training run on the
+  tiny dense checkpoint - the loss, the per-parameter gradient direction and the overfit -
+  plus determinism, a bitwise state round-trip and the refusals; it skips itself when the
+  checkpoint is absent, and the
   operator-level regressions `test_attention` (causal GQA, KV write, output
   gate), `test_gdn` (FLA recurrent decode, causal-conv1d, gated norm), `test_moe`
   (router, permute, expert GEMMs, combine, EP shards), `test_mla` (MLA chunking
@@ -326,6 +334,7 @@ migrated from handwritten CUDA to FlashInfer + FLA + causal-conv1d.
 | 11 | Execution manifest and capture provenance (plan Stage 0): content identities `semantic_id`/`numerical_policy_id`/`deployment_id` over canonical blocks, build-time provenance generation, parameter identity, region/case determinism registry, and strict/diagnostic/legacy capture comparison | ✅ CPU gates (ctest `test_manifest` + `test_manifest_hashes`, hspec manifest specs, CLI runner); engine query verified on sm_86 |
 | 12 | Region inventory and cross-case harness (plan Stage 1): a committed inventory of every in-scope dense/dense-hybrid forward region (inputs, outputs, persistent state, saved-for-backward values, case availability) with a per-case-pair verdict (`exact`/`exception`/`unverified`/`not_applicable`), the device fixtures that compare identical inputs and state across cases, explicit unsupported-shape/case rejection, and the region entry-point cost | ✅ CPU gate `test_region_inventory` + device harness `test_region_cases` on sm_86 |
 | 14 | Trainable runtime and parameter lifecycle (plan Stage 3): a parameter store with logical ids, tying, frozen parameters, versions and derived copies; exclusive update windows whose publication casts masters and refreshes every derived copy; teacher-forced all-position forward with a fused row-by-row log-softmax; a training step that retains activations and GDN chunk-boundary states; and the Haskell schedule with its typed handles | ✅ CPU store/lifetime gate + device gate on the synthetic checkpoint + the Haskell schedule cross-check |
+| 16 | Synchronous training/rollout baseline (plan Stage 5): the layer-level backward that chains the Stage-4 regions into an SFT step (attention with its fused output gate and per-head norms, the dense MLP, the residual adds and the four norms, recomputed per sublayer from the three retained boundaries), AdamW and publication over the parameter store, resumable training state, and the CUDA-free phase/budget/selection-record/host-FP64-sampler contract for the rollout half | ✅ CPU gate `test_train_loop`; device gate `test_sft` against a `transformers` training run on sm_86 (first-step loss 6.3e-05 relative, the tied parameter's gradient cosine 0.999, the fixture overfits 7.03 -> 0.61) |
 | 15 | Backward, losses and optimizer (plan Stage 4): a CUDA-free differentiation contract (cast-is-identity, the saved-statistic rule, the losses, AdamW, a CRC-checked checkpoint over parameters/moments/RNG/cursor) and one backward per Stage-4 table row — elementwise, the four norms, embedding scatter-add, RoPE, Q/gate split, GEMM dX/dW, GDN conv1d/prepare, the paired attention-from-LSE and GDN-core-from-chunk-states, plus the losses' gradient | ✅ CPU gate `test_backward` (losses/AdamW vs FP64, checkpoint refusals, an overfit that resumes bitwise) + device gate `test_backward_kernels` (every kernel vs a double-precision definition or its central difference) on sm_86 |
 | 13 | Feasibility and invariance experiments (plan Stage 2): PP inertness on a one-GPU model (logits + 324 tap dumps), GDN decomposition with prepare/core attribution, attention tiling across head dims/GQA/KV lengths, GEMM shape invariance at the real projection shapes, and the attention forward/backward pair (LSE availability, convention, gradient check, resource estimate) | ✅ six experiments on sm_86; six case pairs became measured `exception`s; no pair promoted to `exact` |
 

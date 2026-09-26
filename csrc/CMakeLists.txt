@@ -70,11 +70,12 @@ add_custom_command(
 
 add_library(engine SHARED
     engine.cu memory.cu safetensors_loader.cu safetensors.cpp model_desc.c manifest.c sha256.c
-    regions.c train.c backward.c layer_dispatch.cu collective.cu moe.cu tap.cu
+    regions.c train.c backward.c train_loop.c layer_dispatch.cu collective.cu moe.cu tap.cu
     kernels/gemm.cu kernels/layers.cu kernels/flashinfer_norm.cu
     kernels/attention.cu kernels/gdn_conv.cu kernels/fla_gdn.cu
     kernels/gdn_norm.cu kernels/silu.cu kernels/embedding.cu kernels/mla.cu
     kernels/logprob.cu kernels/backward.cu kernels/backward_paired.cu
+    backward_layers.cu
     "${GENERATED}/aot_kernels.cpp" "${GENERATED}/aot_kernels.h"
     "${GENERATED}/causal_conv1d.h" "${GENERATED}/causal_conv1d_update.cuh"
     "${BUILD_INFO_HEADER}"
@@ -136,6 +137,16 @@ add_executable(test_train ../tests/train_test.c train.c model_desc.c)
 target_include_directories(test_train PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 add_test(NAME test_train COMMAND test_train
          "${CMAKE_CURRENT_SOURCE_DIR}/../descriptors/qwen3-4b.json")
+
+# CPU-only: the Stage-5 training/rollout baseline. The phase budgets, the phase machine
+# (a rollout's borrow is what makes the store refuse an update), the version-bound
+# selection records, the exactly-one ratio at unchanged parameters and the host FP64
+# sampler's measured frequencies. No GPU and no weights.
+add_executable(test_train_loop ../tests/train_loop_test.c train_loop.c train.c backward.c
+               model_desc.c sha256.c)
+target_include_directories(test_train_loop PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(test_train_loop PRIVATE m)
+add_test(NAME test_train_loop COMMAND test_train_loop)
 
 # CPU-only: the Stage-4 differentiation contract, the losses, AdamW and the checkpoint
 # format. The losses and the optimizer are compared against an independent FP64
@@ -218,6 +229,19 @@ if(BUILD_TESTS)
              --library $<TARGET_FILE:engine>
              --model-dir "${ENGINE_SYNTH_MODEL_DIR}"
              --desc "${CMAKE_CURRENT_SOURCE_DIR}/../descriptors/qwen3-next-synth.json")
+    # Stage 5's device gate: the SFT step on the tiny dense checkpoint, against a
+    # transformers training run (the loss, the gradient's direction per parameter, the
+    # overfit), plus determinism, a bitwise state round-trip and the refusals. It needs
+    # the synthetic checkpoint (tests/synth/make_qwen3_dense.py) and torch, so it skips
+    # itself when the checkpoint is not there, like test_train_forward.
+    set(ENGINE_SFT_MODEL_DIR "/var/pony/cache/bohaotu-haskell/synth-qwen3-dense"
+        CACHE STRING "Synthetic dense Qwen3 checkpoint for the Stage-5 gate")
+    add_test(NAME test_sft COMMAND ${Python3_EXECUTABLE}
+             "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_sft.py"
+             --library $<TARGET_FILE:engine>
+             --model-dir "${ENGINE_SFT_MODEL_DIR}"
+             --desc "${CMAKE_CURRENT_SOURCE_DIR}/../descriptors/qwen3-dense-synth.json"
+             --torch)
     # Initialization resource safety: a checkpoint that cannot be loaded must
     # leave no handle and no device memory behind. Skips itself when no GPU is
     # visible.

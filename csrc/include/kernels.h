@@ -169,6 +169,15 @@ void kernel_silu_mul_backward(float *d_gate, float *d_up, const float *d_out,
 void kernel_silu_inplace_backward(float *d_x, const float *d_out, const float *pre_activation,
                                   int n, int accumulate, cudaStream_t stream);
 
+/* out = a + b elementwise, FP32. The residual reconstruction a training step needs
+ * (`r1 = r0 + mixer` in BF16) is an FP32 add of the two widened boundaries followed by
+ * one rounding, so the layer backward can rebuild the forward's own stream. */
+void kernel_f32_add(float *out, const float *a, const float *b, long long n,
+                    cudaStream_t stream);
+
+/* dst += src elementwise, FP32: a branch contribution into a running gradient. */
+void kernel_f32_accumulate(float *dst, const float *src, long long n, cudaStream_t stream);
+
 /* y = a + b: both branches receive d_out. */
 void kernel_branch_backward(float *d_a, float *d_b, const float *d_out, long long n,
                             int accumulate, cudaStream_t stream);
@@ -225,11 +234,16 @@ void kernel_qgate_merge_backward(float *d_raw, const float *d_q, const float *d_
  * product; and it is the honest contract, because a BF16-by-BF16 product inside the
  * backward would be a third rounding that the forward's own MMA does not perform.
  * Pairing dX/dW with the forward's BF16 MMA is therefore a Stage-6 alignment question,
- * recorded in csrc/backward.c. */
+ * recorded in csrc/backward.c.
+ *
+ * `accumulate` selects between assigning (0, a fresh gradient) and adding (1): a
+ * projection whose input has more than one consumer (the gate/up pair, or Q/K/V sharing
+ * one normed activation) must add its contribution, and a GEMM that overwrote it would
+ * silently drop the other consumer's gradient. */
 int gemm_backward_dx(cublasHandle_t handle, float *d_x, const float *d_out, const float *W_fp32,
-                     int M, int N, int K);
+                     int M, int N, int K, int accumulate);
 int gemm_backward_dw(cublasHandle_t handle, float *d_w, const float *x_fp32, const float *d_out,
-                     int M, int N, int K);
+                     int M, int N, int K, int accumulate);
 
 /* Log-softmax + gather backward for one row at a time, the fused counterpart of
  * kernel_logprob_gather: d_logits[row] = d_out[row] * (softmax - onehot(label)),

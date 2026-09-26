@@ -534,9 +534,11 @@ void gemm(cudaStream_t stream) {
     d_dw.upload(std::vector<float>(want_dw.size(), 0.0f), stream);
     cublasHandle_t handle = nullptr;
     cublasCreate(&handle);
-    require(gemm_backward_dx(handle, d_dx.get(), d_dout.get(), w_fp32.data(), M, N, K) == 0,
+    /* accumulate=1 on a freshly zeroed buffer is the value itself; it is the flag the
+     * training step uses, so the gate exercises that path. */
+    require(gemm_backward_dx(handle, d_dx.get(), d_dout.get(), w_fp32.data(), M, N, K, 1) == 0,
             "gemm_backward_dx returned nonzero");
-    require(gemm_backward_dw(handle, d_dw.get(), xf.data(), d_dout.get(), M, N, K) == 0,
+    require(gemm_backward_dw(handle, d_dw.get(), xf.data(), d_dout.get(), M, N, K, 1) == 0,
             "gemm_backward_dw returned nonzero");
     cublasDestroy(handle);
     report_worst("gemm_backward_dx", d_dx.download(stream), want_dx, 1e-5);

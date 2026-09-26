@@ -1,4 +1,5 @@
 /** Weight loading and chunked, layer-partitioned multi-GPU inference. */
+#include "backward_layers.h"
 #include "engine.h"
 #include "kernels.h"
 #include "layers.h"
@@ -282,6 +283,27 @@ struct EngineHandle {
     /* Training state attach allocated (masters, gradients, optimizer slots), freed at
      * destroy. A frozen parameter contributes nothing here. */
     std::vector<void *> train_buffers;
+    /* Stage 5: one FP32 pool for the SFT step's scratch (the retained final hidden
+     * state, the running gradients, the loss's per-row LM-head buffers, and the layer
+     * backward's cast/gradient pools), sized on the first step from the token count and
+     * the vocabulary. One allocation keeps the leak accounting in one place. */
+    float *train_pool = nullptr;
+    size_t train_pool_floats = 0;
+    size_t train_pool_tokens = 0;
+    struct TrainStepOffsets {
+        size_t final_hidden = 0;   /* tokens * hidden */
+        size_t d_hidden = 0;
+        size_t d_next = 0;
+        size_t lm_weight = 0;      /* vocab * hidden (the widened LM head) */
+        size_t logits_row = 0;     /* vocab */
+        size_t d_logits_row = 0;   /* vocab */
+        size_t row_hidden = 0;     /* hidden, the widened row */
+        size_t row_normed = 0;     /* hidden */
+        size_t row_extra = 0;      /* 2: inv_rms and the loss slope */
+        size_t layer_cast = 0;
+        size_t layer_grad = 0;
+        size_t total = 0;
+    } train_off;
 };
 
 /* Weights of `layer` on device index `dev` (rank index when replicated). */
@@ -984,7 +1006,13 @@ EngineHandle *engine_create(const char *model_dir, const char *descriptor_json,
             check_cublas(cublasSetStream(ctx.cublas, ctx.stream), "Set cuBLAS stream");
             check_cuda(cudaMalloc(&ctx.residual, activation_bytes), "Allocate residual");
             check_cuda(cudaMalloc(&ctx.layer_out, activation_bytes), "Allocate layer output");
-            ctx.ws_size = layer_workspace_size(max_chunk, &eng->local_dims);
+            /* The Stage-5 layer backward reuses the workspace for its recompute and
+             * needs one hidden-state-sized BF16 tail beyond the forward's own layout
+             * (the narrowed residual). Two chunks' worth leaves room for the widest
+             * kind at the largest chunk. */
+            ctx.ws_size = layer_workspace_size(max_chunk, &eng->local_dims) +
+                          2 * (size_t)max_chunk * eng->local_dims.hidden_size *
+                              sizeof(__nv_bfloat16);
             check_cuda(cudaMalloc(&ctx.workspace, ctx.ws_size), "Allocate layer workspace");
             check_cuda(cudaMalloc(&ctx.token_ids, max_chunk * sizeof(int64_t)),
                        "Allocate token IDs");
@@ -1608,6 +1636,7 @@ void engine_destroy(EngineHandle *eng) {
             cleanup_cuda(cudaSetDevice(eng->ctx[logits_index].device_id));
         }
         if (eng->train_scratch != nullptr) cleanup_cuda(cudaFree(eng->train_scratch));
+        if (eng->train_pool != nullptr) cleanup_cuda(cudaFree(eng->train_pool));
         if (eng->train_labels != nullptr) cleanup_cuda(cudaFree(eng->train_labels));
         eng->train_scratch = nullptr;
         eng->train_labels = nullptr;
@@ -2327,5 +2356,650 @@ int engine_train_step_end(struct TrainStep *step) {
         set_error("engine_train_step_end: %s", train_last_error());
         return ENGINE_ERR_STATE;
     }
+    return ENGINE_OK;
+}
+
+/* ==================================================================== */
+/* Stage 5: the SFT step                                                */
+/* ==================================================================== */
+
+namespace {
+
+/* (layer, role) -> the BF16 compute weight the forward reads and the FP32 gradient
+ * accumulator the optimizer consumes. A role the layer does not have has both null; a
+ * frozen role has a compute weight and no gradient, which is why they are separate
+ * answers rather than one "exists" flag. */
+struct RoleAccess {
+    __nv_bfloat16 *compute;
+    float *grad;
+};
+
+RoleAccess role_access(EngineHandle *eng, int layer, int role) {
+    RoleAccess out{nullptr, nullptr};
+    out.compute = layer_role_buffer(eng, layer, role, 0);
+    if (eng->train_store != nullptr) {
+        const int logical = train_store_logical_of(eng->train_store, layer, role);
+        if (logical >= 0 && train_store_is_trainable(eng->train_store, logical) == 1) {
+            out.grad = static_cast<float *>(
+                train_store_slot(eng->train_store, logical, TRAIN_SLOT_GRAD));
+        }
+    }
+    return out;
+}
+
+struct TrainRole train_role(EngineHandle *eng, int layer, int role) {
+    RoleAccess access = role_access(eng, layer, role);
+    struct TrainRole out;
+    out.compute = access.compute;
+    out.grad = access.grad;
+    return out;
+}
+
+/* The step's retained buffer for one name, or null. The plan's names are how the
+ * forward and the backward agree on which buffer holds which boundary. */
+void *step_value(struct TrainStep *step, const std::string &name) {
+    const int count = train_step_saved_count(step);
+    for (int i = 0; i < count; ++i) {
+        const char *saved_name = nullptr;
+        int layer = 0;
+        long long elements = 0;
+        void *buffer = nullptr;
+        if (train_step_saved_at(step, i, &saved_name, &layer, &elements, &buffer) != TRAIN_OK) {
+            continue;
+        }
+        if (saved_name != nullptr && name == saved_name) return buffer;
+    }
+    return nullptr;
+}
+
+/* Size the step's pool for `tokens`. The layer backward reports what it needs, so the
+ * pool is the sum of reported sizes rather than a formula duplicated here. */
+int ensure_train_pool(EngineHandle *eng, int tokens) {
+    if (eng->train_pool != nullptr && eng->train_pool_tokens >= tokens) return ENGINE_OK;
+    const int H = eng->dims.hidden_size;
+    const int V = eng->dims.vocab_size;
+    const size_t TH = (size_t)tokens * H;
+
+    struct LayerBackwardScratch scratch{};
+    size_t cast = 0;
+    size_t grad = 0;
+    for (int layer = 0; layer < eng->num_layers; ++layer) {
+        layer_backward_scratch(&eng->dims, tokens, eng->desc.layer_mixers[layer],
+                               eng->desc.layer_ffns[layer], &scratch);
+        cast = std::max(cast, (size_t)scratch.cast_elements);
+        grad = std::max(grad, (size_t)scratch.grad_elements);
+    }
+
+    struct EngineHandle::TrainStepOffsets off;
+    off.final_hidden = 0;
+    off.d_hidden = off.final_hidden + TH;
+    off.d_next = off.d_hidden + TH;
+    off.lm_weight = off.d_next + TH;
+    off.logits_row = off.lm_weight + (size_t)V * H;
+    off.d_logits_row = off.logits_row + V;
+    off.row_hidden = off.d_logits_row + V;
+    off.row_normed = off.row_hidden + H;
+    /* row_extra holds four scalars per row: the loss slope, the row's log-probability,
+     * the inverse RMS the final norm's backward consumes, and a spare. They must be
+     * distinct: an earlier version reused one slot for the log-probability and the
+     * inverse RMS and reported a *negative* cross-entropy, which is how the collision
+     * was found. */
+    off.row_extra = off.row_normed + H;
+    off.layer_cast = off.row_extra + 4;
+    off.layer_grad = off.layer_cast + cast;
+    off.total = off.layer_grad + grad;
+
+    if (eng->train_pool != nullptr) {
+        cleanup_cuda(cudaFree(eng->train_pool));
+        eng->train_pool = nullptr;
+    }
+    const int logits_index = eng->num_devices > 0 ? eng->num_devices - 1 : 0;
+    const cudaError_t selected = cudaSetDevice(eng->ctx[logits_index].device_id);
+    if (selected != cudaSuccess) {
+        set_error("ensure_train_pool: cannot select the device");
+        return ENGINE_ERR_CUDA;
+    }
+    if (cudaMalloc(&eng->train_pool, off.total * sizeof(float)) != cudaSuccess ||
+        eng->train_pool == nullptr) {
+        set_error("ensure_train_pool: cannot allocate %zu bytes", off.total * sizeof(float));
+        return ENGINE_ERR_ALLOC;
+    }
+    /* The Stage-3 forward allocated these lazily on its own path; the SFT step needs
+     * them too, and only on the device that holds the LM head. */
+    if (eng->train_labels == nullptr) {
+        if (cudaMalloc(&eng->train_labels, (size_t)eng->dims.max_chunk * sizeof(int)) !=
+            cudaSuccess) {
+            set_error("ensure_train_pool: cannot allocate the label scratch");
+            return ENGINE_ERR_ALLOC;
+        }
+    }
+    if (eng->train_scratch == nullptr) {
+        if (cudaMalloc(&eng->train_scratch, (size_t)eng->dims.max_chunk * sizeof(float)) !=
+            cudaSuccess) {
+            set_error("ensure_train_pool: cannot allocate the loss scratch");
+            return ENGINE_ERR_ALLOC;
+        }
+    }
+    eng->train_off = off;
+    eng->train_pool_floats = off.total;
+    eng->train_pool_tokens = tokens;
+    return ENGINE_OK;
+}
+
+/* Copy a retained boundary into the step's FP32 buffer as the widening of the BF16
+ * activation the forward produced. */
+void retain_boundary(struct TrainStep *step, const std::string &name,
+                     const __nv_bfloat16 *src, size_t elements, cudaStream_t stream) {
+    void *dst = step_value(step, name);
+    if (dst == nullptr) {
+        throw EngineError(ENGINE_ERR_STATE, "the step did not retain " + name);
+    }
+    kernel_cast_bf16_f32(static_cast<float *>(dst), src, (int)elements, stream);
+    check_cuda(cudaGetLastError(), "Retain a training boundary");
+}
+
+}  // namespace
+
+int engine_train_forward_retain(EngineHandle *eng, struct TrainStep *step, const int *token_ids,
+                                const int64_t *positions, int tokens) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr || !eng->state_valid) {
+        set_error("engine_train_forward_retain: engine is null or needs engine_reset");
+        return ENGINE_ERR_STATE;
+    }
+    if (eng->train_store == nullptr) {
+        set_error("engine_train_forward_retain: no training store attached");
+        return ENGINE_ERR_STATE;
+    }
+    if (step == nullptr || token_ids == nullptr || positions == nullptr || tokens < 1) {
+        set_error("engine_train_forward_retain: a step, tokens and positions are required");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (tokens > eng->dims.max_chunk) {
+        set_error("engine_train_forward_retain: %d tokens exceed the %d-token chunk", tokens,
+                  eng->dims.max_chunk);
+        return ENGINE_ERR_SEQ_FULL;
+    }
+    if (eng->seq_len != 0) {
+        set_error("engine_train_forward_retain: the sequence is at position %d; reset first",
+                  eng->seq_len);
+        return ENGINE_ERR_STATE;
+    }
+    /* A pipeline split would have to move gradients between devices and a replicated
+     * (tensor-parallel) placement would have to reduce sharded ones. Both are real work
+     * the plan places after this bring-up, and both are refused rather than approximated
+     * silently. */
+    if (eng->replicated || (eng->num_devices > 1 && !eng->replicated)) {
+        set_error("engine_train_forward_retain: training is wired for a single device; "
+                  "a pipeline or tensor-parallel placement is not supported yet");
+        return ENGINE_ERR_CONFIG;
+    }
+    for (int t = 0; t < tokens; ++t) {
+        if (token_ids[t] < 0 || token_ids[t] >= eng->dims.vocab_size) {
+            set_error("engine_train_forward_retain: token %d at offset %d is out of range",
+                      token_ids[t], t);
+            return ENGINE_ERR_CONFIG;
+        }
+    }
+    const int status = ensure_train_pool(eng, tokens);
+    if (status != ENGINE_OK) return status;
+
+    try {
+        DeviceCtx &ctx = eng->ctx[0];
+        const int H = eng->dims.hidden_size;
+        const size_t TH = (size_t)tokens * H;
+        check_cuda(cudaSetDevice(ctx.device_id), "Select the training device");
+        std::vector<int64_t> ids64(tokens);
+        for (int t = 0; t < tokens; ++t) ids64[t] = token_ids[t];
+        check_cuda(cudaMemcpyAsync(ctx.token_ids, ids64.data(), tokens * sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, ctx.stream),
+                   "Upload the training token IDs");
+        check_cuda(cudaMemcpyAsync(ctx.positions, positions, tokens * sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, ctx.stream),
+                   "Upload the training positions");
+        check_cuda(cudaStreamSynchronize(ctx.stream), "Finish the training upload");
+
+        kernel_embedding(ctx.residual, ctx.embed_w, ctx.token_ids, H, tokens, ctx.stream);
+        check_cuda(cudaGetLastError(), "Training embedding");
+
+        for (int i = 0; i < eng->num_layers; ++i) {
+            const std::string prefix = "layer" + std::to_string(i) + ".";
+            LayerContext lctx = make_layer_context(eng, i, 0, tokens, /*with_taps=*/true);
+            /* r0: the layer's input, before the mixer. */
+            retain_boundary(step, prefix + "residual", ctx.residual, TH, ctx.stream);
+            if (forward_mixer(&lctx, &eng->layers[i], ctx.residual, ctx.layer_out) != 0) {
+                throw EngineError(ENGINE_ERR_CUDA, "training mixer failed");
+            }
+            retain_boundary(step, prefix + "mixerOut", ctx.layer_out, TH, ctx.stream);
+            kernel_residual_add(ctx.residual, ctx.layer_out, (int)TH, ctx.stream);
+            check_cuda(cudaGetLastError(), "Training mixer residual");
+            if (forward_ffn(&lctx, &eng->layers[i], ctx.residual, ctx.layer_out) != 0) {
+                throw EngineError(ENGINE_ERR_CUDA, "training feed-forward failed");
+            }
+            retain_boundary(step, prefix + "ffnOut", ctx.layer_out, TH, ctx.stream);
+            kernel_residual_add(ctx.residual, ctx.layer_out, (int)TH, ctx.stream);
+            check_cuda(cudaGetLastError(), "Training feed-forward residual");
+        }
+        /* The final hidden state: the loss and the final norm's backward read it after
+         * the layer walk has reused the per-device activations. */
+        kernel_cast_bf16_f32(eng->train_pool + eng->train_off.final_hidden, ctx.residual, (int)TH,
+                             ctx.stream);
+        check_cuda(cudaGetLastError(), "Retain the final hidden state");
+        eng->seq_len += tokens;
+        return ENGINE_OK;
+    } catch (const std::exception &e) {
+        return forward_error(eng, e);
+    }
+}
+
+int engine_train_loss(EngineHandle *eng, struct TrainStep *step, const int *token_ids,
+                      const int *labels, const uint8_t *mask, int shift, int tokens,
+                      struct TrainLossOutput *output) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr || !eng->state_valid || eng->train_pool == nullptr) {
+        set_error("engine_train_loss: run engine_train_forward_retain first");
+        return ENGINE_ERR_STATE;
+    }
+    if (step == nullptr || token_ids == nullptr || labels == nullptr || output == nullptr ||
+        tokens < 1) {
+        set_error("engine_train_loss: a step, tokens and labels are required");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (tokens > eng->train_pool_tokens) {
+        set_error("engine_train_loss: the pool was sized for %d tokens, not %d",
+                  eng->train_pool_tokens, tokens);
+        return ENGINE_ERR_STATE;
+    }
+
+    /* The same pure selection plan the Stage-3 forward uses, so the mapping is testable
+     * on the CPU and identical between the two entry points. */
+    std::vector<int64_t> positions(tokens);
+    for (int t = 0; t < tokens; ++t) positions[t] = t;
+    std::vector<int> ids(token_ids, token_ids + tokens);
+    std::vector<TrainForcedPosition> selected(tokens);
+    const int count = train_plan_teacher_forcing(tokens, ids.data(), labels, mask, positions.data(),
+                                                 shift, selected.data(), (int)selected.size());
+    if (count < 0) {
+        set_error("engine_train_loss: %s", train_last_error());
+        return ENGINE_ERR_CONFIG;
+    }
+
+    try {
+        DeviceCtx &ctx = eng->ctx[0];
+        const int H = eng->dims.hidden_size;
+        const int V = eng->dims.vocab_size;
+        const size_t TH = (size_t)tokens * H;
+        float *pool = eng->train_pool;
+        const struct EngineHandle::TrainStepOffsets &off = eng->train_off;
+        check_cuda(cudaSetDevice(ctx.device_id), "Select the training device");
+        output->sum = 0.0;
+        output->count = count;
+        if (count == 0) {
+            /* Nothing selected: the loss is zero and so is the hidden state's gradient,
+             * which is a result rather than an error. */
+            check_cuda(cudaMemsetAsync(pool + off.d_hidden, 0, TH * sizeof(float), ctx.stream),
+                       "Zero the hidden gradient");
+            return ENGINE_OK;
+        }
+        check_cuda(cudaMemsetAsync(pool + off.d_hidden, 0, TH * sizeof(float), ctx.stream),
+                   "Zero the hidden gradient");
+        /* The LM head's operand: the FP32 widening of the BF16 weight the forward reads
+         * (not the master, which differs by the publication rounding). */
+        kernel_cast_bf16_f32(pool + off.lm_weight, ctx.lm_head_w, V * H, ctx.stream);
+        check_cuda(cudaGetLastError(), "Widen the LM head");
+        /* The log-softmax kernel multiplies the row by `(softmax - onehot)`, which is
+         * already the *negative* log-likelihood's gradient with respect to the logits;
+         * so the slope the loss contributes is the positive 1/count. Passing -1/count
+         * inverted every parameter's gradient through the LM head (measured: the tied
+         * embedding's gradient had cosine -0.998 against torch's, and the loss climbed). */
+        const float slope = 1.0f / (float)count;
+        /* The BF16 row scratch rides in the layer workspace: the loss runs before the
+         * backward, so they never overlap in time. */
+        __nv_bfloat16 *row_hidden = ctx.workspace;
+        __nv_bfloat16 *row_normed = ctx.workspace + H;
+
+        double total = 0.0;
+        for (int j = 0; j < count; ++j) {
+            const int row = selected[j].query;
+            const int label = selected[j].label;
+            if (label < 0 || label >= V) {
+                set_error("engine_train_loss: label %d is out of range", label);
+                return ENGINE_ERR_CONFIG;
+            }
+            /* The final norm for this row, from the retained hidden state. */
+            kernel_cast_f32_bf16(row_hidden, pool + off.final_hidden + (size_t)row * H, H,
+                                 ctx.stream);
+            if (eng->dims.norm_style == 1) {
+                kernel_rms_norm_plain(row_normed, row_hidden, ctx.final_norm_w, H, 1,
+                                      eng->dims.rms_eps, ctx.stream);
+            } else {
+                kernel_gemma_rms_norm(row_normed, row_hidden, ctx.final_norm_w, H, 1,
+                                      eng->dims.rms_eps, ctx.stream);
+            }
+            check_cuda(cudaGetLastError(), "Final norm for the loss");
+            if (gemm_bf16_f32out(ctx.cublas, pool + off.logits_row, row_normed, ctx.lm_head_w, 1, V,
+                                 H) != 0) {
+                throw EngineError(ENGINE_ERR_CUDA, "LM head for the loss failed");
+            }
+            std::vector<int> one_label{label};
+            check_cuda(cudaMemcpyAsync(eng->train_labels, one_label.data(), sizeof(int),
+                                       cudaMemcpyHostToDevice, ctx.stream),
+                       "Upload the loss label");
+            /* The slope lives in its own slot: the log-probability's slot is written by
+             * the gather below, and an earlier version shared the two, so the backward
+             * read the log-probability (about -7) as the loss's upstream slope and
+             * produced an over-scaled, inverted gradient. */
+            float slope_host = slope;
+            check_cuda(cudaMemcpyAsync(pool + off.row_extra + 3, &slope_host, sizeof(float),
+                                       cudaMemcpyHostToDevice, ctx.stream),
+                       "Upload the loss slope");
+            kernel_logprob_gather(pool + off.row_extra + 1, pool + off.logits_row,
+                                  eng->train_labels, 1, V, ctx.stream);
+            check_cuda(cudaGetLastError(), "Log-probability for the loss");
+            /* The diagonal gradient of the log-softmax, row by row: the fused
+             * counterpart of `backward_masked_ce`, so no [tokens, vocab] tensor is
+             * materialised. */
+            kernel_logprob_gather_backward(pool + off.d_logits_row, pool + off.row_extra + 3,
+                                           pool + off.logits_row, eng->train_labels,
+                                           /*mask=*/nullptr, 1, V, ctx.stream);
+            check_cuda(cudaGetLastError(), "Log-probability backward");
+            /* The LM head: dW accumulates into the store (the tied embedding sums its own
+             * contribution into the same slot), dX accumulates into this row's hidden
+             * state gradient. */
+            kernel_cast_bf16_f32(pool + off.row_hidden, row_normed, H, ctx.stream);
+            check_cuda(cudaGetLastError(), "Widen the normed row");
+            if (gemm_backward_dw(ctx.cublas, role_access(eng, -1, ROLE_LM_HEAD).grad,
+                                 pool + off.row_hidden, pool + off.d_logits_row, 1, V, H, 1) != 0) {
+                throw EngineError(ENGINE_ERR_CUDA, "LM head dW failed");
+            }
+            float *d_hidden_row = pool + off.d_hidden + (size_t)row * H;
+            if (gemm_backward_dx(ctx.cublas, d_hidden_row, pool + off.d_logits_row,
+                                 pool + off.lm_weight, 1, V, H, 1) != 0) {
+                throw EngineError(ENGINE_ERR_CUDA, "LM head dX failed");
+            }
+            /* The final norm's own backward, for the same row. */
+            kernel_rms_inv(pool + off.row_extra + 2, pool + off.final_hidden + (size_t)row * H, H,
+                           1, eng->dims.rms_eps, ctx.stream);
+            check_cuda(cudaGetLastError(), "Final norm inverse RMS");
+            kernel_cast_bf16_f32(pool + off.row_normed, ctx.final_norm_w, H, ctx.stream);
+            check_cuda(cudaGetLastError(), "Widen the final norm weight");
+            RoleAccess final_norm = role_access(eng, -1, ROLE_FINAL_NORM);
+            /* A frozen final norm discards its weight gradient into a row scratch,
+             * never into d_next: that buffer is the layer walk's running gradient. */
+            float *dw = final_norm.grad != nullptr ? final_norm.grad : pool + off.row_hidden;
+            kernel_rmsnorm_backward(d_hidden_row, dw, d_hidden_row,
+                                    pool + off.final_hidden + (size_t)row * H, pool + off.row_normed,
+                                    pool + off.row_extra + 2, H, 1,
+                                    eng->dims.norm_style == 0 ? 1 : 0, 1, ctx.stream);
+            check_cuda(cudaGetLastError(), "Final norm backward");
+            float logprob = 0.0f;
+            check_cuda(cudaMemcpyAsync(&logprob, pool + off.row_extra + 1, sizeof(float),
+                                       cudaMemcpyDeviceToHost, ctx.stream),
+                       "Download the loss's log-probability");
+            check_cuda(cudaStreamSynchronize(ctx.stream), "Finish the loss row");
+            total += -(double)logprob;
+        }
+        output->sum = total;
+        return ENGINE_OK;
+    } catch (const std::exception &e) {
+        return forward_error(eng, e);
+    }
+}
+
+int engine_train_backward(EngineHandle *eng, struct TrainStep *step, int tokens) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr || !eng->state_valid || eng->train_pool == nullptr) {
+        set_error("engine_train_backward: run engine_train_forward_retain first");
+        return ENGINE_ERR_STATE;
+    }
+    if (step == nullptr || tokens < 1 || tokens > eng->train_pool_tokens) {
+        set_error("engine_train_backward: invalid step or token count");
+        return ENGINE_ERR_CONFIG;
+    }
+    try {
+        DeviceCtx &ctx = eng->ctx[0];
+        check_cuda(cudaSetDevice(ctx.device_id), "Select the training device");
+        const int H = eng->dims.hidden_size;
+        const size_t TH = (size_t)tokens * H;
+        float *pool = eng->train_pool;
+        const struct EngineHandle::TrainStepOffsets &off = eng->train_off;
+
+        /* The layer backward reuses the forward's scratch for its recompute, and its
+         * pools come from the step's one allocation. */
+        const size_t forward_scratch = layer_workspace_size(tokens, &eng->local_dims);
+        struct LayerBackwardScratch scratch{};
+        size_t cast_max = 0;
+        size_t grad_max = 0;
+        for (int layer = 0; layer < eng->num_layers; ++layer) {
+            layer_backward_scratch(&eng->dims, tokens, eng->desc.layer_mixers[layer],
+                                   eng->desc.layer_ffns[layer], &scratch);
+            cast_max = std::max(cast_max, (size_t)scratch.cast_elements);
+            grad_max = std::max(grad_max, (size_t)scratch.grad_elements);
+        }
+        if (off.layer_cast + cast_max > off.layer_grad ||
+            off.layer_grad + grad_max > eng->train_pool_floats) {
+            set_error("engine_train_backward: the step pool does not hold the layer scratch");
+            return ENGINE_ERR_STATE;
+        }
+
+        float *d_cur = pool + off.d_hidden;
+        float *d_next = pool + off.d_next;
+        for (int layer = eng->num_layers - 1; layer >= 0; --layer) {
+            const std::string prefix = "layer" + std::to_string(layer) + ".";
+            struct LayerBackwardCtx bc;
+            bc.cublas = ctx.cublas;
+            bc.stream = ctx.stream;
+            bc.dims = &eng->dims;
+            bc.tokens = tokens;
+            bc.layer = layer;
+            bc.seq_len = tokens; /* a full sequence: Stage 4 requires seq_len == tokens */
+            bc.mixer = eng->desc.layer_mixers[layer];
+            bc.ffn = eng->desc.layer_ffns[layer];
+            bc.w.input_norm = train_role(eng, layer, ROLE_INPUT_NORM);
+            bc.w.post_norm = train_role(eng, layer, ROLE_POST_NORM);
+            bc.w.q_proj = train_role(eng, layer, ROLE_ATTN_Q);
+            bc.w.k_proj = train_role(eng, layer, ROLE_ATTN_K);
+            bc.w.v_proj = train_role(eng, layer, ROLE_ATTN_V);
+            bc.w.o_proj = train_role(eng, layer, ROLE_ATTN_O);
+            bc.w.q_norm = train_role(eng, layer, ROLE_ATTN_Q_NORM);
+            bc.w.k_norm = train_role(eng, layer, ROLE_ATTN_K_NORM);
+            bc.w.gate_proj = train_role(eng, layer, ROLE_MLP_GATE);
+            bc.w.up_proj = train_role(eng, layer, ROLE_MLP_UP);
+            bc.w.down_proj = train_role(eng, layer, ROLE_MLP_DOWN);
+            bc.workspace = ctx.workspace;
+            bc.ws_backward_offset = forward_scratch;
+            bc.cast_f32 = pool + off.layer_cast;
+            bc.cast_f32_elements = cast_max;
+            bc.grad_f32 = pool + off.layer_grad;
+            bc.grad_f32_elements = grad_max;
+            bc.positions = ctx.positions;
+            bc.kv_cache = eng->layers[layer].kv_cache;
+            bc.residual_in = static_cast<const float *>(step_value(step, prefix + "residual"));
+            bc.mixer_out = static_cast<const float *>(step_value(step, prefix + "mixerOut"));
+            if (bc.residual_in == nullptr || bc.mixer_out == nullptr) {
+                set_error("engine_train_backward: %s was not retained", prefix.c_str());
+                return ENGINE_ERR_STATE;
+            }
+            backward_layer(&bc, d_cur, d_next);
+            std::swap(d_cur, d_next);
+        }
+        /* The embedding gather's scatter, which sums a repeated token's contributions
+         * and lands in the same gradient slot the tied LM head wrote to. */
+        RoleAccess embed = role_access(eng, -1, ROLE_EMBED);
+        if (embed.grad != nullptr) {
+            kernel_embedding_backward(embed.grad, d_cur, ctx.token_ids, H, tokens, ctx.stream);
+            check_cuda(cudaGetLastError(), "Embedding backward");
+        }
+        return ENGINE_OK;
+    } catch (const std::exception &e) {
+        return forward_error(eng, e);
+    }
+}
+
+int engine_train_zero_grads(EngineHandle *eng) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr || eng->train_store == nullptr) {
+        set_error("engine_train_zero_grads: no training store attached");
+        return ENGINE_ERR_STATE;
+    }
+    const int logits_index = eng->num_devices > 0 ? eng->num_devices - 1 : 0;
+    check_cuda(cudaSetDevice(eng->ctx[logits_index].device_id), "Select the gradient device");
+    try {
+        const int count = train_store_logical_count(eng->train_store);
+        for (int logical = 0; logical < count; ++logical) {
+            if (train_store_is_trainable(eng->train_store, logical) != 1) continue;
+            float *grad = static_cast<float *>(
+                train_store_slot(eng->train_store, logical, TRAIN_SLOT_GRAD));
+            if (grad == nullptr) continue;
+            const long long elements = train_store_elements(eng->train_store, logical);
+            check_cuda(cudaMemsetAsync(grad, 0, (size_t)elements * sizeof(float),
+                                       eng->ctx[logits_index].stream),
+                       "Zero a parameter gradient");
+        }
+        check_cuda(cudaStreamSynchronize(eng->ctx[logits_index].stream), "Finish zeroing");
+        return ENGINE_OK;
+    } catch (const std::exception &e) {
+        return forward_error(eng, e);
+    }
+}
+
+int engine_train_apply(EngineHandle *eng, const struct TrainOptimizerOptions *options,
+                       long long *out_changed) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr || eng->train_store == nullptr) {
+        set_error("engine_train_apply: no training store attached");
+        return ENGINE_ERR_STATE;
+    }
+    if (options == nullptr || options->step_index < 1) {
+        set_error("engine_train_apply: hyper-parameters and a 1-based step index are required");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (train_store_in_update(eng->train_store)) {
+        set_error("engine_train_apply: an update window is already open");
+        return ENGINE_ERR_STATE;
+    }
+    check_cuda(cudaSetDevice(eng->ctx[0].device_id), "Select the optimizer device");
+    try {
+        const struct TrainOptimizerOptions &o = *options;
+        cudaStream_t ctx_stream = eng->ctx[0].stream;
+        /* The window opens first: writing masters is a write, and the store's rule is
+         * that a write needs exclusive ownership (no reader, no live step). */
+        if (engine_train_begin_update(eng) != ENGINE_OK) return ENGINE_ERR_STATE;
+        long long changed = 0;
+        for (int logical = 0; logical < train_store_logical_count(eng->train_store); ++logical) {
+            if (train_store_is_trainable(eng->train_store, logical) != 1) continue;
+            float *master = static_cast<float *>(
+                train_store_slot(eng->train_store, logical, TRAIN_SLOT_MASTER));
+            float *grad = static_cast<float *>(
+                train_store_slot(eng->train_store, logical, TRAIN_SLOT_GRAD));
+            float *m_slot = static_cast<float *>(
+                train_store_slot(eng->train_store, logical, TRAIN_SLOT_OPT_M));
+            float *v_slot = static_cast<float *>(
+                train_store_slot(eng->train_store, logical, TRAIN_SLOT_OPT_V));
+            if (master == nullptr || grad == nullptr || m_slot == nullptr || v_slot == nullptr) {
+                continue;
+            }
+            const long long elements = train_store_elements(eng->train_store, logical);
+            kernel_adamw(master, grad, m_slot, v_slot, elements, o.lr, o.beta1, o.beta2, o.eps,
+                         o.weight_decay, o.step_index, /*bf16_out=*/nullptr, ctx_stream);
+            check_cuda(cudaGetLastError(), "AdamW step");
+            /* The publication (the store's) is what casts and reports the BF16 refresh;
+             * this count is the parameters the optimizer actually stepped, so a step
+             * over a store with nothing trainable is visible as 0. */
+            ++changed;
+        }
+        /* The publication is the store's: it casts every master into its readers'
+         * compute buffers, refreshes the derived copies and *closes the window* — so
+         * there is no end_update call here, and a second one would fail. */
+        if (engine_train_publish(eng) != ENGINE_OK) return ENGINE_ERR_STATE;
+        if (out_changed != nullptr) *out_changed = changed;
+        return ENGINE_OK;
+    } catch (const std::exception &e) {
+        return forward_error(eng, e);
+    }
+}
+
+int engine_train_export_state(EngineHandle *eng, int logical, float *master_out, float *m_out,
+                              float *v_out) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr || eng->train_store == nullptr) {
+        set_error("engine_train_export_state: no training store attached");
+        return ENGINE_ERR_STATE;
+    }
+    if (logical < 0 || logical >= train_store_logical_count(eng->train_store)) {
+        set_error("engine_train_export_state: logical %d is out of range", logical);
+        return ENGINE_ERR_CONFIG;
+    }
+    if (master_out == nullptr || m_out == nullptr || v_out == nullptr) {
+        set_error("engine_train_export_state: three host buffers are required");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (train_store_is_trainable(eng->train_store, logical) != 1) {
+        set_error("engine_train_export_state: logical %d is not trainable", logical);
+        return ENGINE_ERR_STATE;
+    }
+    check_cuda(cudaSetDevice(eng->ctx[0].device_id), "Select the export device");
+    const long long elements = train_store_elements(eng->train_store, logical);
+    const size_t bytes = (size_t)elements * sizeof(float);
+    for (int slot = 0; slot < 3; ++slot) {
+        const TrainSlot which = slot == 0 ? TRAIN_SLOT_MASTER
+                                          : (slot == 1 ? TRAIN_SLOT_OPT_M : TRAIN_SLOT_OPT_V);
+        const void *src = train_store_slot(eng->train_store, logical, which);
+        void *dst = slot == 0 ? (void *)master_out : (slot == 1 ? (void *)m_out : (void *)v_out);
+        if (src == nullptr) {
+            set_error("engine_train_export_state: logical %d has no %s slot", logical,
+                      slot == 0 ? "master" : (slot == 1 ? "moment m" : "moment v"));
+            return ENGINE_ERR_STATE;
+        }
+        check_cuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, eng->ctx[0].stream),
+                   "Export training state");
+    }
+    check_cuda(cudaStreamSynchronize(eng->ctx[0].stream), "Finish the export");
+    return ENGINE_OK;
+}
+
+int engine_train_import_state(EngineHandle *eng, int logical, const float *master, const float *m,
+                              const float *v) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr || eng->train_store == nullptr) {
+        set_error("engine_train_import_state: no training store attached");
+        return ENGINE_ERR_STATE;
+    }
+    if (logical < 0 || logical >= train_store_logical_count(eng->train_store)) {
+        set_error("engine_train_import_state: logical %d is out of range", logical);
+        return ENGINE_ERR_CONFIG;
+    }
+    if (master == nullptr || m == nullptr || v == nullptr) {
+        set_error("engine_train_import_state: three host buffers are required");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (train_store_is_trainable(eng->train_store, logical) != 1) {
+        set_error("engine_train_import_state: logical %d is not trainable", logical);
+        return ENGINE_ERR_STATE;
+    }
+    /* Importing a parameter is a write, so it needs the exclusive window: a reader that
+     * held the old version would otherwise see a half-restored set. */
+    if (!train_store_in_update(eng->train_store)) {
+        set_error("engine_train_import_state: open an update window first");
+        return ENGINE_ERR_STATE;
+    }
+    check_cuda(cudaSetDevice(eng->ctx[0].device_id), "Select the import device");
+    const long long elements = train_store_elements(eng->train_store, logical);
+    const size_t bytes = (size_t)elements * sizeof(float);
+    for (int slot = 0; slot < 3; ++slot) {
+        const TrainSlot which = slot == 0 ? TRAIN_SLOT_MASTER
+                                          : (slot == 1 ? TRAIN_SLOT_OPT_M : TRAIN_SLOT_OPT_V);
+        void *dst = train_store_slot(eng->train_store, logical, which);
+        const void *src = slot == 0 ? (const void *)master
+                                    : (slot == 1 ? (const void *)m : (const void *)v);
+        if (dst == nullptr) {
+            set_error("engine_train_import_state: logical %d has no %s slot", logical,
+                      slot == 0 ? "master" : (slot == 1 ? "moment m" : "moment v"));
+            return ENGINE_ERR_STATE;
+        }
+        check_cuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, eng->ctx[0].stream),
+                   "Import training state");
+    }
+    check_cuda(cudaStreamSynchronize(eng->ctx[0].stream), "Finish the import");
     return ENGINE_OK;
 }

@@ -655,6 +655,42 @@ cubin's `(I+A)^{-1}`/BF16-MMA decomposition of it. Both are alignment work the p
 assigns to Stage 6, and saying so is what keeps a passing gate from reading as a
 bitwise pairing.
 
+### The training step and the synchronous baseline
+
+Stages 3 and 4 built the ownership objects and the region backwards; Stage 5 chains them
+into a step, and the chaining is where the interesting decisions are:
+
+- **The step retains boundaries, not activations.** A layer keeps its input residual, its
+  mixer output and its feed-forward output; everything finer (the normalised input, the
+  projections' inputs, the attention's queries) is *recomputed* by the sublayer's own
+  backward from those three values into the layer workspace. That trades arithmetic for
+  memory, which is the side of the plan's "saved or recomputed statistics" a small-memory
+  trainer wants; retaining the fine values is the same code path with a larger
+  `step_plan`.
+- **A gradient's operand is the value the forward read.** A GEMM's dX and dW consume the
+  FP32 *widening* of the BF16 weight (`float(bf16(w))`), never the FP32 master: the two
+  differ by the publication rounding, and a cast is identity for gradient propagation, so
+  the faithful operand is the rounded one.
+- **The residual's identity branch is explicit.** `r1 = r0 + m` and `r2 = r1 + f` are BF16
+  adds whose gradient is the identity in FP32, so the incoming gradient is seeded into the
+  running residual gradient and each sublayer's internal backward *adds* to it. Not doing
+  that (accumulating into whatever the buffer held) produced a *growing* loss, which is how
+  the wiring bug was found.
+- **The loss keeps both normalisations and both log-probabilities.** The masked cross
+  entropy's mean is taken inside the loss, and the record keeps the model's log-probability
+  *and* the sampler's, because with a transformation the objective has to say which one it
+  optimises.
+- **A phase is a state machine, not a flag.** SFT holds a step's retained values and the
+  optimizer state; a rollout borrows the parameter version through Stage 3's context object
+  (so the store itself refuses an update while it reads) and holds a KV cache and the GDN
+  state instead. A phase boundary resets the sequence, and a record is bound to the version
+  it was generated under — reading it after an update is refused, which is the plan's
+  "never reconstruct an old denominator using updated weights".
+
+The step is wired for the attention and dense-MLP path on one device; the GDN mixer's
+backward, the placements and the rollout's engine driver are named in the plan's Stage-5
+status as the remaining work rather than implied to exist.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:
@@ -681,6 +717,7 @@ stops at the first failure, so one command answers "is the tree green".
 | Kernel | `ctest`: test_attention, test_gdn, test_collective, test_moe, test_norm, test_rope, test_mla, test_library_ops | vs CPU/PyTorch reference, BF16 tolerances; test_mla additionally re-cuts one sequence to catch block-shape-dependent defects; test_collective runs the same all-reduce once per element type |
 | Generation (CPU) | `cabal test infer-generation-tests` | budget/EOS/error semantics of the real generation loop, with a scriptable engine stub instead of a GPU |
 | Backward | `ctest -R test_backward` (CPU) + `test_backward_kernels` (GPU) | every Stage-4 region's backward against a double-precision definition or a central difference of it; the attention pair against an analytic reading of the device's own base-2 LSE; the GDN core backward with a nonzero initial state across one and three chunks; the losses and AdamW against independent FP64; and a checkpoint resume bitwise equal to an uninterrupted run |
+| SFT step | `ctest -R test_sft` (GPU) + `test_train_loop` (CPU) | the first step's loss against a `transformers` training run (6.3e-05 relative), the per-parameter gradient direction against torch (cosine 0.999), the fixture overfitting, a bitwise state round-trip, and the phase/budget/record/sampler contract |
 | Resource safety | `ctest -R test_engine_resources` | repeated failing creations return no handle, explain the error and move no device memory; a valid checkpoint still builds afterwards |
 | Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set; configured `--rms-tolerance` (default 0.1, family-specific overrides) |
 | Chunking | same prompt, different prefill splits | top-1 equal, rms ≤ 5 (state-loss guard) |

@@ -27,9 +27,11 @@ and hardware" are the exceptions, and they say so.
 | Gate | Result |
 |---|---|
 | `cargo test --locked --offline` | 11/11 |
-| `ctest --test-dir csrc/build-libs` | 23/23 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_backward`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_backward_kernels`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops` |
+| `ctest --test-dir csrc/build-libs` | 25/25 — `test_model_desc`, `test_safetensors`, `test_manifest`, `test_manifest_hashes`, `test_region_inventory`, `test_backward`, `test_train_loop`, `test_engine_resources`, `test_collective`, `test_attention`, `test_gdn`, `test_moe`, `test_mla`, `test_norm`, `test_rope`, `test_region_cases`, `test_backward_kernels`, `test_sft`, `test_gdn_invariance`, `test_attention_invariance`, `test_gemm_invariance`, `test_attention_lse`, `test_train`, `test_train_forward`, `test_library_ops` |
 | `ctest test_backward` (CPU, Stage 4) | the Stage-4 region table against the Stage-1 inventory in both directions; masked CE, reverse KL, the token/sequence clipped objective and the group advantage reduction against an independent FP64 implementation with its gradient checked by central difference; AdamW against FP64 in PyTorch's own order (including the bias-correction/eps ordering) plus the BF16 publication; the checkpoint round-trip with every failure mode refused; a deterministic fixture overfitting 32/32 through this stage's own loss and optimizer, and a 12+8 resumed run landing bitwise on the uninterrupted 20-step parameters, moments and cursor |
 | `ctest test_backward_kernels` (Stage 4, 2× A40) | every backward against a double-precision definition or a central difference of one: elementwise gates, residual branches, plain/Gemma RMSNorm, the GDN L2 norm, the gated norm, embedding (repeated ids summed), RoPE (the transposed rotation inverting the forward's), the Q/gate re-interleave, GEMM dX/dW, masked CE, AdamW, conv1d (d_x, d_weight, d_bias, d_state_in), GDN prepare (d_conv_out, d_a, d_b, d_A_log, d_dt_bias) — all 1e-8…1e-6 except the finite-difference rows at 1e-7…1e-3; attention forward+LSE vs the definition (2.1e-3 BF16 out, 1.5e-3 LSE) and its backward vs the FD of the definition (dQ 2.5e-4, dK 2.8e-4, dV 1.0e-3), with an analytic double reading of the device LSE reproducing the FD, so the base-2 convention is pinned; the GDN core backward with a nonzero initial state and a nonzero final-state gradient, one chunk and three chunks both matching the same reference (≤1.0e-7), d_state_start included; dQ and the whole GDN core backward bitwise reproducible, dK/dV reported (atomics) |
+| `ctest test_sft` (Stage 5, A40) | SFT on the tiny dense checkpoint (0.72M params, tied embeddings, prompt-masked target) against a `transformers` training run: the first step's loss matches to 6.3e-05 relative; the tied parameter's gradient (after one large-lr AdamW step, where the move's sign *is* the gradient's) has cosine **0.999** over all 131072 elements; the engine overfits 7.0322 → 0.6129 and the reference 7.0318 → 0.0733; the forward is bitwise reproducible run to run; the training state (FP32 masters and both optimizer moments) round-trips through export/import bitwise; and a pipeline/TP placement, an optimizer step during a live step and a NaN logit are each refused |
+| `ctest test_train_loop` (CPU, Stage 5) | the phase budgets (only SFT holds optimizer state, activations and retained values; a rollout's total is strictly smaller), the phase machine (a rollout creates a real borrowing context, so the store refuses an update while it reads; a phase boundary resets the sequence), the selection records (a record stamped with a superseded version cannot be read, and a group cannot mix versions), the sequence-level ratio at unchanged parameters being exactly 1, the objective/advantage items (masks, negative and positive advantages, a zero-variance group refused), and the host FP64 sampler (frequencies 0.6652/0.2447/0.0902 against the softmax 0.6652/0.2447/0.0900 over 200k draws, inside three standard deviations; the same seed reproduces the draw sequence) |
 | `ctest test_train` (CPU, Stage 3) | tying (35 specs into 34 logical parameters on Qwen3-4B's descriptor), frozen parameters with no training state, the borrow/update/free lifetime rules, publication with derived-copy refresh, the accumulation schedule, replica sync, and the teacher-forcing plan |
 | `ctest test_train_forward` (Stage 3, synthetic checkpoint) | all-position forward 12/12 top-1 vs a transformers forward (rms 0.004); teacher-forced selection and log-probabilities vs the reference's own log-softmax (gap 0.007); tied roles one logical parameter with two readers; a no-op publication bitwise inert; an updated tied weight and an updated GDN norm weight each matching a torch recomputation with the same edit (rms 0.004-0.01, 12/12); an update refused while a step is live |
 | `cabal test infer-trainer-tests` (CPU, Stage 3) | the Haskell teacher-forcing plan and the C implementation of the same schedule agree across shifts, masks, forced labels and explicit positions |
@@ -97,6 +99,46 @@ greedy-token agreement — never a relaxation of the top-1 check.
   (`cuobjdump`) only — there is no H200 here.
 
 ## Recently completed
+
+**The SFT step and the training/rollout baseline** (plan Stage 5, verified 2026-09-26).
+Stages 3 and 4 built the ownership objects and the region backwards; this stage chains them
+into an actual step and adds the baseline the plan's RL work reads from:
+
+- `csrc/backward_layers.cu` is the layer walk: the full-attention mixer (fused QKV with the
+  output gate, per-head Q/K norms, partial RoPE, the KV write, the attention core from its
+  recomputed base-2 LSE, the output gate, the output projection) and the dense MLP, with the
+  residual adds and the four norms. Each sublayer **recomputes** its own fine-grained
+  activations from the three boundaries the step retains, so the retained set stays at three
+  values per layer and the trade is arithmetic for memory.
+- the engine's step is five entry points (`engine_train_forward_retain`, `_loss`,
+  `_backward`, `_apply`, `_zero_grads`) plus a state export/import pair, so a caller can
+  inspect the loss, run the backward, step AdamW and publish through Stage 3's store.
+- `csrc/include/train_loop.h` + `csrc/train_loop.c` are the synchronous baseline's
+  contract: the phase budgets, the phase machine (a rollout *borrows* the store, so the
+  store refuses an update while it reads), the version-bound selection records, the
+  sequence-level ratio, and a host FP64 temperature-1 sampler. All CUDA-free and gated on
+  the CPU.
+- **the step is checked against an independent training run**, not just against itself: the
+  first step's loss matches `transformers` + `torch.autograd` to 6.3e-05 relative, the tied
+  parameter's gradient direction (read from one large-lr AdamW step, where the move's sign
+  is the gradient's) has cosine 0.999 against torch's, and the fixture overfits on both
+  sides (7.03 → 0.61 and 7.03 → 0.07). The forward is bitwise reproducible; the backward's
+  atomic weight-gradient accumulation is measured (~1e-2 after twelve steps) and reported,
+  which is the plan's "determinism tested separately from closeness".
+- **four bugs came out of that comparison**, and each was silent: the log-probability and
+  the loss's slope shared one pool slot, so the backward consumed the log-probability
+  (~-7) as the loss's upstream slope and every gradient came out inverted and 140× too
+  large (the diagnostic that found it: cosine -0.998 on the tied parameter); the layer walk
+  never seeded the residual gradient, so it accumulated the sublayer terms into whatever the
+  buffer held (a *growing* loss); the publication closes the update window itself, so a
+  second close was an error; and the pool-sizing formula under-counted the pre-norm
+  snapshots (a named refusal, which is what the pools are for).
+- **the rollout half's rules are behaviours**: a phase budget that distinguishes SFT from a
+  rollout, an update refused while a rollout borrows, a record unreadable under a superseded
+  version, a ratio of exactly 1 at unchanged parameters, and a sampler whose measured
+  frequencies match its softmax within three standard deviations.
+- What is **not** wired is named in the plan's Stage-5 status and the gaps list: the GDN
+  mixer's backward in the walk, the placements, and the rollout's engine driver.
 
 **Backward, losses and optimizer** (plan Stage 4, verified 2026-09-25). The engine can
 now differentiate every region the dense/dense-hybrid path runs, and the three pieces a
@@ -478,6 +520,22 @@ CPU case pinning the behaviour.
   decomposition; and the attention dK/dV group sums accumulate with atomics, so they
   are reported by the gate rather than required to be reproducible (dQ, which finishes
   inside its own block, and the whole GDN core backward are bitwise).
+- **The SFT step's layer wiring covers the attention and dense-MLP path.** The GDN
+  mixer's backward (prepare, conv and core - Stage 4's kernels) is not yet chained into
+  the walk, and MoE and MLA remain outside the first trainer allowlist as Stage 1 says, so
+  a hybrid or sparse model trains only its dense path today.
+- **Training is wired for a single device.** A pipeline split would have to move gradients
+  between devices and a tensor-parallel placement would have to reduce sharded ones; both
+  are refusals rather than silent approximations, and the placement work is what Stage 6+
+  would have to carry.
+- **The rollout half's contract is gated on the CPU, not driven from the engine yet.**
+  `train_loop`'s phases, budgets, records, version binding and sampler are exercised by
+  `test_train_loop`, and the engine supplies neither a phase driver nor a live rollout; the
+  sampler itself is complete and reusable, which is what "reuse the temperature-sampling
+  migration" asks for.
+- **The phase budgets are an estimate from the descriptor's shapes**, not a measured
+  allocation watermark: they are what a phase choice is made from, and proving a phase fits
+  is a measurement the engine does not take yet.
 - **The GDN core backward's reduction is correct but not blocked.** Each coordinate
   sums over the key range rather than tiling the way the forward's kernels do, so its
   constant factor is the next thing to fix when training throughput (not correctness)
@@ -546,5 +604,5 @@ CPU case pinning the behaviour.
 | [README.md](../README.md) | Build, test entry points, usage, phase status, model weights |
 | [design.md](design.md) | Architecture rationale, per-family layout differences, testing strategy |
 | [manifest-contract.md](manifest-contract.md) | The execution manifest: canonical encoding, field ownership and projections, the region determinism registry, and the comparison modes |
-| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stages 0-4 are implemented; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
+| [plan-numeric-contract.md](plan-numeric-contract.md) | **Proposal, not implemented** (Stages 0-4 are implemented and Stage 5's SFT bring-up is; see above) — trainer (SFT/OPD/GRPO/DAPO/GSPO/PPO), bounded-staleness async RL, temperature-sampling migration, and an inference-optimization track (fusion, W4A16, speculative decoding) |
 | [reference-output.json](reference-output.json) | Transformers reference tokens for the 27B debugging prompt |

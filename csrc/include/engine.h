@@ -302,6 +302,83 @@ int engine_train_forward(EngineHandle *engine, const int *token_ids, int tokens,
                          const int64_t *positions, const int *labels, const uint8_t *mask,
                          int shift, struct TrainForwardOutput *output);
 
+/* ------------------------------------------------------------------ */
+/* The SFT step (plan Stage 5)                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Run the training forward and retain what the backward consumes: one mixer output, one
+ * feed-forward output and the residual stream per layer, into the buffers
+ * `engine_train_step_begin` allocated, plus the final hidden state (the loss and the
+ * final norm's backward read it after the walk has reused the per-device activations).
+ *
+ * Requires a *full sequence* from position 0 and a single-device placement: a pipeline
+ * split would have to move gradients between devices and a tensor-parallel placement
+ * would have to reduce sharded ones, and neither is this stage's bring-up. Both are
+ * refusals rather than silent approximations.
+ */
+int engine_train_forward_retain(EngineHandle *engine, struct TrainStep *step,
+                                const int *token_ids, const int64_t *positions, int tokens);
+
+/** The loss and its gradient's seed. */
+struct TrainLossOutput {
+    double sum;          /* the summed negative log-likelihood over the selected rows */
+    long long count;     /* how many rows the teacher forcing selected */
+};
+
+/**
+ * For every position the teacher forcing selects, recompute the final norm and the LM
+ * head row by row (so no [tokens, vocab] logits tensor is materialised), accumulate the
+ * LM head's dW into the store, and leave the hidden state's gradient for
+ * `engine_train_backward`. A mask byte of 0 and a label below zero both deselect.
+ */
+int engine_train_loss(EngineHandle *engine, struct TrainStep *step, const int *token_ids,
+                      const int *labels, const uint8_t *mask, int shift, int tokens,
+                      struct TrainLossOutput *output);
+
+/**
+ * Walk the layers in reverse from the hidden state's gradient the loss left, accumulate
+ * every role's FP32 gradient, and scatter the embedding's. `step` must be the one
+ * `engine_train_forward_retain` filled; the gradients are *added* to the store's slots,
+ * so a caller that wants a fresh step zeroes them first.
+ */
+int engine_train_backward(EngineHandle *engine, struct TrainStep *step, int tokens);
+
+/** AdamW over every trainable logical parameter, then a publication. */
+struct TrainOptimizerOptions {
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    int step_index;      /* 1-based: the bias correction continues across resumes */
+};
+
+/**
+ * One optimizer step over every trainable logical parameter, then a publication: the
+ * FP32 masters step, the derived copies are refreshed and each compute weight becomes
+ * the single BF16 rounding of its new master. Refused while a step is live (an optimizer
+ * write must not overlap a reader), so end the step first. `out_changed` reports how many
+ * BF16 elements actually moved, which is what distinguishes a step from a no-op.
+ */
+int engine_train_apply(EngineHandle *engine, const struct TrainOptimizerOptions *options,
+                       long long *out_changed);
+
+/** Zero every trainable parameter's FP32 gradient accumulator. */
+int engine_train_zero_grads(EngineHandle *engine);
+
+/**
+ * Copy one trainable logical parameter's training state out to (or in from) the host:
+ * the FP32 master and the optimizer's two moments. The checkpoint *format* is
+ * `backward_checkpoint_write/read` (plan Stage 4, gated on the CPU); these two entry
+ * points are what a device run uses to fill or restore those buffers, so a resume can
+ * be tested without a second copy of the state in the engine.
+ */
+int engine_train_export_state(EngineHandle *engine, int logical, float *master_out,
+                              float *m_out, float *v_out);
+int engine_train_import_state(EngineHandle *engine, int logical, const float *master,
+                              const float *m, const float *v);
+
 #ifdef __cplusplus
 }
 #endif

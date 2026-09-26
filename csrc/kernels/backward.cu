@@ -217,6 +217,45 @@ void kernel_silu_inplace_backward(float *d_x, const float *d_out, const float *p
     check_launch("kernel_silu_inplace_backward");
 }
 
+namespace {
+
+__global__ void f32_add_kernel(float *__restrict__ out, const float *__restrict__ a,
+                              const float *__restrict__ b, long long n) {
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n;
+         i += (long long)gridDim.x * blockDim.x) {
+        out[i] = a[i] + b[i];
+    }
+}
+
+__global__ void f32_accumulate_kernel(float *__restrict__ dst, const float *__restrict__ src,
+                                      long long n) {
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n;
+         i += (long long)gridDim.x * blockDim.x) {
+        dst[i] += src[i];
+    }
+}
+
+}  // namespace
+
+void kernel_f32_add(float *out, const float *a, const float *b, long long n,
+                    cudaStream_t stream) {
+    if (n < 0 || (n > 0 && (out == nullptr || a == nullptr || b == nullptr))) {
+        throw std::runtime_error("kernel_f32_add: invalid buffer");
+    }
+    if (n == 0) return;
+    f32_add_kernel<<<grid_for(n), 256, 0, stream>>>(out, a, b, n);
+    check_launch("kernel_f32_add");
+}
+
+void kernel_f32_accumulate(float *dst, const float *src, long long n, cudaStream_t stream) {
+    if (n < 0 || (n > 0 && (dst == nullptr || src == nullptr))) {
+        throw std::runtime_error("kernel_f32_accumulate: invalid buffer");
+    }
+    if (n == 0) return;
+    f32_accumulate_kernel<<<grid_for(n), 256, 0, stream>>>(dst, src, n);
+    check_launch("kernel_f32_accumulate");
+}
+
 void kernel_branch_backward(float *d_a, float *d_b, const float *d_out, long long n, int accumulate,
                             cudaStream_t stream) {
     if (n < 0) throw std::runtime_error("kernel_branch_backward: negative element count");
@@ -552,12 +591,12 @@ void kernel_qgate_merge_backward(float *d_raw, const float *d_q, const float *d_
  * row-major-to-column-major reading csrc/kernels/gemm.cu documents; the gradient test
  * compares both against a matmul in double, which is what pins them. */
 int gemm_backward_dx(cublasHandle_t handle, float *d_x, const float *d_out, const float *W_fp32,
-                     int M, int N, int K) {
+                     int M, int N, int K, int accumulate) {
     if (handle == nullptr || d_x == nullptr || d_out == nullptr || W_fp32 == nullptr || M <= 0 ||
         N <= 0 || K <= 0) {
         return -1;
     }
-    const float alpha = 1.0f, beta = 0.0f;
+    const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
     /* dX(M,K) = dOut(M,N) @ W(N,K): no transpose on the mathematical operands, because
      * the gradient of out = x W^T with respect to x contracts dOut with W itself. Read
      * column-major, the result is dX^T (K,M) = W^T(K,N) . dOut^T(N,M), and each operand
@@ -569,12 +608,16 @@ int gemm_backward_dx(cublasHandle_t handle, float *d_x, const float *d_out, cons
 }
 
 int gemm_backward_dw(cublasHandle_t handle, float *d_w, const float *x_fp32, const float *d_out,
-                     int M, int N, int K) {
+                     int M, int N, int K, int accumulate) {
     if (handle == nullptr || d_w == nullptr || x_fp32 == nullptr || d_out == nullptr || M <= 0 ||
         N <= 0 || K <= 0) {
         return -1;
     }
-    const float alpha = 1.0f, beta = 0.0f;
+    /* dW always accumulates into the role's gradient buffer: a weight has exactly one
+     * gradient slot but may be touched by more than one call (a tied reader, or a
+     * micro-batch), so assigning would drop contributions. `accumulate` is accepted for
+     * one contract across both functions and must be 1 for a training step. */
+    const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
     /* dW(N,K) = dOut(M,N)^T @ x(M,K): the contraction runs over M, the first operand is
      * read as-is (col-major (K,M) with ld=K, which is x's own memory) and the second is
      * transposed (dOut's memory as col-major (N,M) with ld=N). */

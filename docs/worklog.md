@@ -143,6 +143,26 @@ instrument and the numbers rather than a guess:
   a NULL handle look valid on device 0, which poisoned the stream and aborted the 2-device
   forward at the third scope.
 
+**F1's fixtures and the row-interleaved activation contract** (plan F1, first half, verified
+2026-09-26).
+F0's numbers pointed at the gate/up pair (40.9 ms of a 95.5 ms decode step), and F1 opens by
+pinning the arithmetic before changing it:
+
+- `kernel_silu_mul_packed` (`csrc/kernels/silu.cu`, declared in `csrc/include/kernels.h`) is
+  the activation for the layout one N = 2*intermediate gate/up GEMM produces: `packed` is
+  `[tokens, 2*intermediate]` row-major with gate then up per row, and the kernel's index
+  arithmetic carries the row/stride contract rather than a caller-supplied offset. It is a
+  separate entry point rather than a flag, because at `tokens == 1` the two contracts
+  coincide and only a multi-token case tells them apart.
+- `tests/test_library_ops.py` checks both contracts against an independent float32 reference
+  at T = 1/2/3/4 and I = 8/12/16, on both devices, through two new
+  `tests/kernels/kernel_bridge.cu` entries. Both are **bitwise** equal to the reference
+  (max_abs = 0), and the fixture also asserts the trap: the halves kernel applied to the
+  packed buffer misses by 0.43-1.55 (reference magnitudes 0.36-1.33), so the layout cannot be
+  silently mishandled at T > 1.
+- **not done**: the weight packing and the single GEMM. Recon recorded in the plan's F1 status
+  block.
+
 **The temperature-sampling migration** (plan T0-T4, verified 2026-09-26).
 The plan's generation track is independent of the trainer and was the last unimplemented
 piece of the document; the CLI now samples from `softmax(logits/T)` by default:

@@ -51,6 +51,49 @@ void kernel_silu_mul(__nv_bfloat16 *out, const __nv_bfloat16 *gate,
     }
 }
 
+namespace {
+
+/* The row-interleaved activation (plan F1): row t of `packed` holds gate[t, :] followed by
+ * up[t, :], so gate element i of row t is at 2*intermediate*t + i and its up partner at
+ * 2*intermediate*t + intermediate + i; `out` is [tokens, intermediate] and must not alias
+ * `packed`. One block-row per token keeps the row/stride arithmetic in the index rather
+ * than in a caller-supplied offset. */
+__global__ void silu_mul_packed_kernel(__nv_bfloat16 *__restrict__ out,
+                                      const __nv_bfloat16 *__restrict__ packed,
+                                      int tokens, int intermediate) {
+    const int row = blockIdx.y;
+    if (row >= tokens) return;
+    const __nv_bfloat16 *row_in = packed + (size_t)row * (size_t)(2 * intermediate);
+    __nv_bfloat16 *row_out = out + (size_t)row * (size_t)intermediate;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < intermediate;
+         i += gridDim.x * blockDim.x) {
+        const float gate = __bfloat162float(row_in[i]);
+        const float up = __bfloat162float(row_in[intermediate + i]);
+        row_out[i] = __float2bfloat16((gate / (1.0f + __expf(-gate))) * up);
+    }
+}
+
+}  // namespace
+
+void kernel_silu_mul_packed(__nv_bfloat16 *out, const __nv_bfloat16 *packed, int tokens,
+                            int intermediate, cudaStream_t stream) {
+    if (tokens < 0 || intermediate < 0) {
+        throw std::runtime_error("kernel_silu_mul_packed: negative extent");
+    }
+    if (tokens == 0 || intermediate == 0) return;
+    if (!out || !packed) {
+        throw std::runtime_error("kernel_silu_mul_packed: null buffer");
+    }
+    const int block = 256;
+    const dim3 grid((unsigned)((intermediate + block - 1) / block), (unsigned)tokens);
+    silu_mul_packed_kernel<<<grid, block, 0, stream>>>(out, packed, tokens, intermediate);
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("kernel_silu_mul_packed: ") +
+                                 cudaGetErrorString(status));
+    }
+}
+
 void kernel_silu_inplace(__nv_bfloat16 *x, int n, cudaStream_t stream) {
     if (n < 0) {
         throw std::runtime_error("kernel_silu_inplace: negative element count");

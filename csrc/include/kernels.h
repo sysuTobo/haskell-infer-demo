@@ -100,6 +100,22 @@ void kernel_silu_mul(__nv_bfloat16 *out, const __nv_bfloat16 *gate,
                      const __nv_bfloat16 *up, int n, cudaStream_t stream);
 
 /**
+ * Fused SiLU(gate) * up for the *row-interleaved* layout one N = 2*intermediate
+ * gate/up GEMM produces (plan "F - Operator fusion", F1): `packed` is
+ * [tokens, 2*intermediate] row-major, so gate element i of row t sits at
+ * 2*intermediate*t + i and its up partner at 2*intermediate*t + intermediate + i,
+ * and `out` is [tokens, intermediate].
+ *
+ * This is deliberately a separate entry point rather than a flag on
+ * kernel_silu_mul: the two functions' *contracts* differ, and at tokens == 1 they
+ * coincide (row 0's two halves are the whole buffer), so a single-token case cannot
+ * tell them apart - which is why the fixture drives tokens > 1. Callers pass the
+ * row/stride contract, not pointer offsets: `out` may not alias `packed`.
+ */
+void kernel_silu_mul_packed(__nv_bfloat16 *out, const __nv_bfloat16 *packed, int tokens,
+                            int intermediate, cudaStream_t stream);
+
+/**
  * Elementwise SiLU in place. This is the GDN conv activation (a separate region
  * from the dense MLP's fused gate*up) and is exported so the region harness can
  * drive it independently of the layer that happens to call it.

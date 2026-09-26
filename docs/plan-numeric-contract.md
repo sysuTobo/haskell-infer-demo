@@ -1586,6 +1586,24 @@ recorded in the JSON the runner writes.
   taps disabled, after warm-up, and synchronize only at measurement boundaries;
   keep diagnostic captures separate. Weight traffic, MoE host-offset sync and
   device transfers may dominate launch savings.
+**Status: F1 is half done, 2026-09-26 — the fixtures and the activation contract, not yet the
+packing.** The plan's F1 opens with "First add fixtures for existing separate GEMMs and SiLU
+output", and that half is in: `tests/test_library_ops.py` now pins **both** activation
+contracts — `kernel_silu_mul`'s contiguous `[gate[n], up[n]]` pair and the new
+`kernel_silu_mul_packed`'s row-interleaved `[tokens, 2*intermediate]` buffer — against an
+independent float32 reference, for T = 1/2/3/4 and I = 8/12/16 on two devices. Both reproduce
+the reference **bitwise** (max_abs = 0), so the new kernel's `__expf` arithmetic and the
+FlashInfer path agree exactly at these shapes. The fixture's third check is the one that
+matters: feeding the *packed* buffer to the *halves* kernel misses the reference by
+0.43/0.64/1.55 against reference magnitudes of 0.36/0.68/1.33 — so a fusion that reformatted
+the GEMM output without changing the activation's row/stride contract would pass at T = 1 and
+fail here, which is exactly the "include T>1 tests because T=1 hides this layout defect"
+the plan asks for. What is **not** done: the weight packing and the single N = 2*intermediate
+GEMM. The recon for it is recorded (the scratch size is unchanged at T*(H+3I), the down GEMM
+is unaffected, and the packing can be done at load time with no duplicate weights by
+allocating gate+up as one owned buffer and loading each role into its half), so the remaining
+work is the loader change plus `forward_mlp`, not a design question.
+
 - [ ] **F1 — Merge dense gate/up projections.** First add fixtures for existing
   separate GEMMs and SiLU output; then concatenate weight rows once during
   loading and compute `[T,2I]` in one GEMM. Existing scratch is

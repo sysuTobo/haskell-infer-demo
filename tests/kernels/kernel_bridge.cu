@@ -1,4 +1,5 @@
 #include "fla_ops.h"
+#include "kernels.h"
 #include "flashinfer_ops.h"
 #include <cstdio>
 #include <exception>
@@ -47,6 +48,32 @@ extern "C" int test_rope(void *q, void *k, const int64_t *positions, int tokens)
         return int(cudaDeviceSynchronize());
     } catch (const std::exception &error) {
         std::fprintf(stderr, "test_rope: %s\n", error.what());
+        return -1;
+    }
+}
+
+extern "C" int test_silu_mul(void *out, const void *gate, int n) {
+    try {
+        kernel_silu_mul(static_cast<__nv_bfloat16 *>(out),
+                        static_cast<const __nv_bfloat16 *>(gate),
+                        static_cast<const __nv_bfloat16 *>(gate) + n, n, nullptr);
+        return int(cudaDeviceSynchronize());
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "test_silu_mul: %s\n", error.what());
+        return -1;
+    }
+}
+
+/* The row-interleaved contract of the single gate/up GEMM (plan F1). */
+extern "C" int test_silu_mul_packed(void *out, const void *packed, int tokens,
+                                    int intermediate) {
+    try {
+        kernel_silu_mul_packed(static_cast<__nv_bfloat16 *>(out),
+                               static_cast<const __nv_bfloat16 *>(packed), tokens,
+                               intermediate, nullptr);
+        return int(cudaDeviceSynchronize());
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "test_silu_mul_packed: %s\n", error.what());
         return -1;
     }
 }

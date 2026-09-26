@@ -77,6 +77,54 @@ def test_norm_and_rope(library, device):
         torch.testing.assert_close(actual[..., 64:], expected[..., 64:], atol=0, rtol=0)
 
 
+def test_silu_mul(library, device):
+    """The dense MLP's activation in both layouts (plan F1).
+
+    `kernel_silu_mul` takes the contiguous [gate[n], up[n]] pair the two-GEMM path builds;
+    `kernel_silu_mul_packed` takes the row-interleaved [tokens, 2*intermediate] buffer one
+    N = 2*intermediate gate/up GEMM produces. The reference is computed here in float32/bf16.
+
+    The third check is why this fixture exists: feeding the *packed* buffer to the *halves*
+    kernel must not reproduce the reference once tokens > 1, because at tokens == 1 row 0's
+    two halves are the whole buffer and the two contracts coincide. A fusion that reformats
+    the GEMM output without changing the activation kernel's row/stride contract would pass
+    a single-token test and fail this one.
+    """
+    for tokens, intermediate in ((1, 8), (2, 8), (4, 12), (3, 16)):
+        scale = 0.5
+        gate = (torch.randn(tokens, intermediate, device=device) * scale).bfloat16()
+        up = (torch.randn(tokens, intermediate, device=device) * scale).bfloat16()
+        expected = (F.silu(gate.float()) * up.float()).bfloat16()
+
+        # The existing contract: [gate, up] halves of one flat buffer.
+        halves = torch.cat([gate.reshape(-1), up.reshape(-1)]).contiguous()
+        out_halves = torch.empty(tokens * intermediate, device=device, dtype=torch.bfloat16)
+        assert library.test_silu_mul(pointer(out_halves), pointer(halves),
+                                     tokens * intermediate) == 0
+        check(f"{device}/SiLU-mul/halves/T={tokens}/I={intermediate}",
+              out_halves.view(tokens, intermediate), expected, 0.002, 0.01)
+
+        # The fused contract: one [T, 2I] row-major buffer with gate then up per row.
+        packed = torch.cat([gate, up], dim=1).contiguous()
+        out_packed = torch.empty(tokens, intermediate, device=device, dtype=torch.bfloat16)
+        assert library.test_silu_mul_packed(pointer(out_packed), pointer(packed), tokens,
+                                            intermediate) == 0
+        check(f"{device}/SiLU-mul/packed/T={tokens}/I={intermediate}",
+              out_packed, expected, 0.002, 0.01)
+
+        if tokens > 1:
+            naive = torch.empty_like(out_packed)
+            assert library.test_silu_mul(pointer(naive), pointer(packed.reshape(-1)),
+                                         tokens * intermediate) == 0
+            differs = (naive.float() - expected.float()).abs().max().item()
+            magnitude = expected.float().abs().max().item()
+            print(f"{device}/SiLU-mul/packed-as-halves/T={tokens}: max_abs={differs:.6g} "
+                  f"(reference magnitude {magnitude:.6g})", flush=True)
+            assert differs > 0.1 * magnitude, (
+                "the halves contract reproduced the row-interleaved reference, so the "
+                "fixture is not exercising the layout it exists for")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", required=True)
@@ -85,6 +133,8 @@ def main():
     library.test_fla.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int]
     library.test_norm.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 2
     library.test_rope.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int]
+    library.test_silu_mul.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int]
+    library.test_silu_mul_packed.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 2
     torch.manual_seed(7)
     device_count = torch.cuda.device_count()
     if device_count < 1:
@@ -97,6 +147,7 @@ def main():
             device = torch.device("cuda", index)
             test_norm_and_rope(library, device)
             test_fla(library, device)
+            test_silu_mul(library, device)
     print(f"Library operator tests passed on {min(2, device_count)} device(s)", flush=True)
     return 0
 

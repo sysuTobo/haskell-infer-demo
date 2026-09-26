@@ -149,6 +149,21 @@ target_include_directories(test_train_loop PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(test_train_loop PRIVATE m)
 add_test(NAME test_train_loop COMMAND test_train_loop)
 
+# CPU-only: the Stage-Q INT4 weight-only format (plan Q0). CUDA-free, like the other CPU
+# gates: the layout's refusals, BF16 round-to-nearest-even, the two's-complement nibble packing
+# (checked against a hand-computed byte pattern, not only a round trip), the reserved code, the
+# all-zero group's scale, the signed extrema and the clipping, and the reference dequantizer a
+# kernel is later admitted against (Q2). The second test re-derives the same fixture from the
+# format's definition in numpy, so the C reference cannot certify itself.
+add_executable(test_quantization_format ../tests/quantization_format_test.c linear_weight.cpp)
+target_include_directories(test_quantization_format PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(test_quantization_format PRIVATE m)
+add_test(NAME test_quantization_format COMMAND test_quantization_format)
+
+add_test(NAME test_quantization_format_python COMMAND ${Python3_EXECUTABLE}
+         "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_quantization_format.py"
+         --emitter $<TARGET_FILE:test_quantization_format>)
+
 # CPU-only: the Stage-6 numerical-alignment decision. The verdicts are derived from the
 # Stage-1 inventory (so the two cannot drift), an exception must carry a finite measured
 # bound, an unverified region must name the work that would remove it, and a policy

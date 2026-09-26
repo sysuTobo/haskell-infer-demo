@@ -1586,6 +1586,16 @@ recorded in the JSON the runner writes.
   taps disabled, after warm-up, and synchronize only at measurement boundaries;
   keep diagnostic captures separate. Weight traffic, MoE host-offset sync and
   device transfers may dominate launch savings.
+**Why F2 and F3 are recorded as available-but-not-the-bottleneck, 2026-09-26.** F3's own rule
+is "Expand only where F0 shows a bottleneck", and F0's table says the bottleneck on the
+deployment target is neither the launch count nor the elementwise work it covers: a decode step
+is 95.5 ms, of which the elementwise regions F2 would fuse (the four norms and the two residual
+adds) are ~1.5 ms, and the GDN and attention projections F3 would merge are already one GEMM
+per output group whose cost at M = 1 is *weight traffic* (48 layers x 168 MB for GDN's QKV+Z
+alone), which merging does not reduce. So the next milestone is the one that addresses that
+axis - Q, weight-only quantization - and F2/F3 stay open with this reasoning rather than
+half-done.
+
 **Status: F1 is implemented, 2026-09-26.** The loader allocates one packed `[2I, H]` buffer per
 dense MLP and loads the gate and up roles into its two halves, so there is never a second copy
 of those weights and the shard rule is still applied per role (the two halves' extents are
@@ -1664,6 +1674,46 @@ requires saved-rounded-value and backward/gradient revalidation from Stage 4.
 
 ### Q — Weight-only quantization
 
+**Status: Q0 is implemented, 2026-09-26 — the format and its independent reference, not yet a
+kernel.** `csrc/include/linear_weight.h` + `csrc/linear_weight.cpp` are the frozen INT4 format
+as CUDA-free arithmetic: `s = BF16(max|group|/7)` with `s = 1` for an all-zero group,
+round-to-nearest-even `q = round(w/s)` clipped to `[-7, 7]`, zero-point 0, two
+two's-complement nibbles per U8 byte with the lower K index in the low nibble, `-8` reserved
+invalid, and a reference dequantizer (`w = code * bf16_to_scale`) that a kernel is admitted
+*against* in Q2 rather than alongside. The layout refuses what the format cannot represent - a
+K that is not a whole number of 128-wide groups, an N that is not a whole number of the
+8-row tile, a different group width - instead of hiding padding that would make an artifact's
+byte count disagree with its manifest. Gates: `ctest test_quantization_format` (the CPU checks
+below) and `ctest test_quantization_format_python`.
+
+- **the packing is checked by hand, not only by a round trip.** A round trip cannot catch a
+  self-consistent swap of the nibbles, so the gate asserts the byte pattern for a row whose
+  maximum is exactly 7 (which makes the scale 1 and takes the arithmetic out of the way):
+  `0x10`, `0x9F`, `0x37`, `0x2D`, and the per-index codes through `linear_packed_code`.
+- **the refusals are behaviours.** K=192 (1.5 groups), N=12 (1.5 tiles), a 64-wide group, a
+  NaN or infinite weight, and a group whose `max|w|/7` rounds to zero in BF16 all fail; the
+  reserved `-8` in a payload makes the *reader* report a malformed artifact rather than read it
+  as a value; and the signed extrema clip to ±7, so the quantizer can never emit the reserved
+  code.
+- **quantization is a fixed point of dequantization.** Re-quantizing a dequantized weight
+  reproduces the payload and the scales exactly, which is what "the kernel matches the
+  reference" reduces to once a kernel exists.
+- **a second implementation re-derives the fixture.** `tests/test_quantization_format.py`
+  reads the payload, scales and reference dequantization that the C binary emits for a
+  deterministic [8, 256] weight and re-implements the format *from the definition* in numpy -
+  its own BF16 rounding, scale, code, clipping and nibble packing - requiring an exact match.
+  On that fixture it reports block max_abs error 0.0186 and rms 0.0109 against values of
+  magnitude ~0.25.
+
+Not done, and the gate that must run first: the plan's Q0 says the wire format is frozen
+"subject to a sm_86 kernel feasibility check", and that check has **not** been run, so the
+format is implemented and gated but not yet exercised by a kernel. Q1 (the converter, the
+manifest and ownership) and Q2 (real weight-only execution and the model-quality gates) are
+untouched: there is no `scripts/quantize_weights.py`, no `weights.manifest.json` reader and no
+quantized GEMM.
+
+
+
 **Initial scope:** dense FFN gate/up/down only, first on one device or PP, with
 BF16 activations, BF16 region outputs and the defined FP32 accumulation policy.
 Keep embeddings, LM head, norms, routers, attention/MLA/GDN projections, GDN
@@ -1683,7 +1733,7 @@ format tests `tests/test_quantization_format.py`, kernel tests
 `tests/test_quantization.py`; register compiled targets in `csrc/CMakeLists.txt`.
 These are proposed new files, not current capabilities.
 
-- [ ] **Q0 — Freeze a versioned format and independent reference.** Start with
+- [x] **Q0 — Freeze a versioned format and independent reference.** Start with
   symmetric signed INT4, K-axis groups of 128 and BF16 scales, subject to a
   sm_86 kernel feasibility check before fixing the wire format. A concrete
   baseline quantizer uses FP32 source values, scale

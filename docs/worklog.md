@@ -143,6 +143,39 @@ instrument and the numbers rather than a guess:
   a NULL handle look valid on device 0, which poisoned the stream and aborted the 2-device
   forward at the third scope.
 
+**Q0: the weight-only INT4 format and its independent reference** (plan Q0, verified
+2026-09-26).
+F0's baseline decided the order: a decode step on the deployment target is 95.5 ms and the
+elementwise regions F2 would fuse are ~1.5 ms of it, while the projections F3 would merge are
+weight-traffic-bound at M = 1 - so the milestone that addresses the bottleneck is quantization,
+not more fusion.
+
+- `csrc/include/linear_weight.h` + `csrc/linear_weight.cpp` are the frozen INT4 format as
+  CUDA-free arithmetic: `s = BF16(max|group|/7)` (with `s = 1` for an all-zero group),
+  round-to-nearest-even `q = round(w/s)` clipped to [-7, 7], zero-point 0, two
+  two's-complement nibbles per U8 byte with the lower K index in the low nibble, `-8` reserved
+  invalid, and a **reference dequantizer a kernel is admitted against** (Q2) rather than
+  alongside. The layout refuses K that is not a whole number of 128-wide groups, N that is not
+  a whole number of the 8-row tile, and any other group width, instead of padding silently.
+- **the packing is asserted by hand**: a round trip cannot catch a self-consistent nibble swap,
+  so the gate checks the byte pattern for a row whose maximum is exactly 7 (scale 1, arithmetic
+  out of the way): 0x10, 0x9F, 0x37, 0x2D, plus every index through `linear_packed_code`.
+- **the refusals are behaviours**: half-built extents, NaN/Inf weights, a group whose
+  `max|w|/7` rounds to zero in BF16, the reserved code in a payload (the *reader* reports a
+  malformed artifact), and clipping at the signed extrema so the quantizer can never emit -8.
+- **quantization is a fixed point of dequantization**: requantizing a dequantized weight
+  reproduces the payload and the scales exactly.
+- **a second implementation re-derives the fixture**: `tests/test_quantization_format.py`
+  re-implements the format from the definition in numpy (its own BF16 rounding, scale, code,
+  clipping, packing) against what the C binary emits for a deterministic [8, 256] weight and
+  requires an exact match on payload, scales and dequantization; the fixture's block error is
+  max_abs 0.0186 / rms 0.0109 against values of magnitude ~0.25.
+- gates: `ctest test_quantization_format` and `ctest test_quantization_format_python` (both
+  CPU; they build and pass locally with gcc/g++ as well). **Not done**: the plan's sm_86 kernel
+  feasibility check, which Q0 says the wire format waits on - so the format is implemented and
+  gated but not yet exercised by a kernel - and Q1/Q2 in full (no converter, no
+  `weights.manifest.json` reader, no quantized GEMM).
+
 **F1: the dense gate/up projections are one GEMM** (plan F1, verified 2026-09-26).
 F0's table put the gate/up pair at 40.9 ms of the 27B's 95.5 ms decode step; F1 fuses it:
 
@@ -750,6 +783,11 @@ CPU case pinning the behaviour.
   stale-data objective (`J_decoupled`) and every throughput/lag-distribution/per-device
   memory measurement are **not implemented**, which is what the plan's "start only after a
   synchronous algorithm and parameter publication protocol pass all relevant gates" defers.
+- **Quantization stops at the format.** Q0's INT4 layout and its reference are implemented,
+  gated and re-derived by a second implementation, but nothing consumes them yet: there is no
+  converter (`scripts/quantize_weights.py`), no `weights.manifest.json` reader, no quantized
+  GEMM to admit against the reference, and the plan's sm_86 kernel feasibility check - which
+  Q0 says the wire format waits on - has not been run.
 - **F0's memory-traffic and host-synchronization columns are not measured.** The plan's F0
   asks for four quantities per region; this repository now measures two of them (CUDA time
   and launch count). Per-region **memory traffic** and **host-synchronization counts** need a

@@ -847,6 +847,34 @@ recording because the *reason* it is faster is not the reason it looks like:
   `deployment_id` do not, so the fusion is recorded as a numerical-policy fact rather than
   disguised as an unchanged-arithmetic refactor.
 
+### The weight-only INT4 format
+
+F0's baseline made the ordering decision for the optimization track: a decode step is
+weight-bandwidth-bound, so the format comes before more fusion.
+
+- **the format is code, and its reference is separate from any kernel.**
+  `csrc/include/linear_weight.h` + `csrc/linear_weight.cpp` are CUDA-free:
+  `s = BF16(max|group|/7)` with `s = 1` for an all-zero group, round-to-nearest-even
+  `q = round(w/s)` clipped to `[-7, 7]`, zero-point 0, two two's-complement nibbles per byte
+  with the lower K index in the low nibble, and `-8` reserved invalid.
+  `linear_dequantize_int4` is the definition a kernel is admitted *against* (Q2), in the same
+  arithmetic, so "the kernel matches the reference" is a comparison that can be lost.
+- **unsupported shapes are refused, not padded.** A K that is not a whole number of 128-wide
+  groups, an N that is not a whole number of the 8-row tile, and any other group width are
+  errors, because padding would make an artifact's byte count disagree with its manifest.
+- **the packing is asserted by hand.** A round trip cannot catch a self-consistent swap of the
+  two nibbles, so the gate pins the byte pattern for a row whose maximum makes the scale
+  exactly 1 (`0x10`, `0x9F`, `0x37`, `0x2D`) as well as the per-index codes, and it checks that
+  the reader refuses the reserved code instead of reading it as -8.
+- **a second implementation re-derives it.** `tests/test_quantization_format.py` re-implements
+  the format from the definition in numpy and requires an exact match on the payload, the
+  scales and the reference dequantization of a deterministic fixture - the same shape as the
+  manifest emitter being re-derived by hashlib.
+
+The plan freezes the wire format "subject to a sm_86 kernel feasibility check", and that check
+has not been run, so this is a gated format with no kernel consuming it yet: Q1 (converter,
+manifest, ownership) and Q2 (real weight-only execution) are untouched.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:
@@ -878,6 +906,7 @@ stops at the first failure, so one command answers "is the tree green".
 | Group objective | `ctest -R test_gspo` (CPU) | the GSPO and GRPO objectives match an independent FP64 reference and its central difference on an unequal-length group; both advantage signs and both clip boundaries; masks, zero-variance and truncated groups; and the unclipped analytic gradient `A_i s_i / T_i` |
 | Rollout admission | `ctest -R test_rollout_queue` (CPU) | whole completed groups only; bounds in groups, tokens and live behavior versions; lag enforced at admission; a consumed group cannot be re-enqueued; and lag zero reproduces the synchronous objective and gradient bitwise while larger lag is reported as a policy change |
 | Sampling | `cabal test infer-generation-tests` (CPU, `tests/SamplingSpec.hs`) + `tests/test_sampling_cli.py` | the frozen splitmix64 vectors; the CDF boundaries, exact hits and zero-mass bins; shift invariance; overflow/underflow refusal; the draw-count contract (greedy none, a positive temperature one per selected token); same-seed stream/non-stream parity and a shorter request as a prefix; and, through the CLI runner, that every invalid temperature or seed is refused *before* any model is loaded |
+| Quantization format | `ctest -R test_quantization_format` (CPU) + `test_quantization_format_python` | the layout's refusals (partial groups, partial tiles, other group widths), BF16 round-to-nearest-even, the nibble packing checked against a hand-computed byte pattern as well as a round trip, the reserved code refused by the reader, the all-zero group's scale, the signed extrema and clipping, quantization as a fixed point of dequantization, and a numpy re-derivation of the whole fixture |
 | Baseline | `tests/benchmark_inference.py` (device, run by hand — not a CTest gate) | full-request wall time with dispersion for prefill M=2/64/128 and decode M=1, plus per-region CUDA time and launch count from the opt-in scopes, with the measurement's own overhead reported beside them |
 | Resource safety | `ctest -R test_engine_resources` | repeated failing creations return no handle, explain the error and move no device memory; a valid checkpoint still builds afterwards |
 | Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set; configured `--rms-tolerance` (default 0.1, family-specific overrides) |

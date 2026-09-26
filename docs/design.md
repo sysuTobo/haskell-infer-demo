@@ -793,6 +793,31 @@ a token is picked:
   and reports `temperature`, `seed` and the sampler version on stderr so the generated text
   stays clean.
 
+### Instrumentation for the optimization track
+
+The plan's fusion and quantization milestones both start by asking where the time actually
+goes, so the repository now has the instrument that question needs, and it is built to be
+*absent* from everything else:
+
+- **`csrc/include/profile.h` + `csrc/profile.cu` are opt-in per-region CUDA timing.** A
+  `PROFILE_SCOPE(name, stream)` guard records one event pair per region invocation and never
+  synchronizes while recording; `profile_report` is the single measurement boundary. It is
+  **off by default**, so the gates, the goldens and the captures run on exactly the path they
+  always did, and the switch lives in the library rather than in a build flag so a benchmark
+  and a correctness run can use the same binary.
+- **the recording is not free, and the runner says so.** Every scope is two more stream
+  operations, so an instrumented call carries host-side launch overhead the uninstrumented
+  one does not; `tests/benchmark_inference.py` times the same call both ways and reports the
+  difference as `overhead_ms`, because a per-region table's *sum* is not a decomposition of
+  the wall time it was measured beside.
+- **one entry point, dispersion rather than a best case.** `tests/benchmark_inference.py`
+  measures full-request wall time for prefill at several M and for single-token decode over
+  repeated warm runs, reports min/median/max/stdev, and records the provenance the plan's
+  checkpoint list demands (the descriptor, the device list, the GPU model/clocks/temperature
+  and the manifest's identities) so two baselines can be compared at all. It is an entry
+  point and not a CTest gate on purpose: a timing threshold in the suite would be a flaky
+  gate, and the plan asks for recorded measurements, not a pass/fail.
+
 ### Memory budget (2× A40, 4096 context)
 
 Approximate per-device budget for a balanced 32-layer split:
@@ -824,6 +849,7 @@ stops at the first failure, so one command answers "is the tree green".
 | Group objective | `ctest -R test_gspo` (CPU) | the GSPO and GRPO objectives match an independent FP64 reference and its central difference on an unequal-length group; both advantage signs and both clip boundaries; masks, zero-variance and truncated groups; and the unclipped analytic gradient `A_i s_i / T_i` |
 | Rollout admission | `ctest -R test_rollout_queue` (CPU) | whole completed groups only; bounds in groups, tokens and live behavior versions; lag enforced at admission; a consumed group cannot be re-enqueued; and lag zero reproduces the synchronous objective and gradient bitwise while larger lag is reported as a policy change |
 | Sampling | `cabal test infer-generation-tests` (CPU, `tests/SamplingSpec.hs`) + `tests/test_sampling_cli.py` | the frozen splitmix64 vectors; the CDF boundaries, exact hits and zero-mass bins; shift invariance; overflow/underflow refusal; the draw-count contract (greedy none, a positive temperature one per selected token); same-seed stream/non-stream parity and a shorter request as a prefix; and, through the CLI runner, that every invalid temperature or seed is refused *before* any model is loaded |
+| Baseline | `tests/benchmark_inference.py` (device, run by hand — not a CTest gate) | full-request wall time with dispersion for prefill M=2/64/128 and decode M=1, plus per-region CUDA time and launch count from the opt-in scopes, with the measurement's own overhead reported beside them |
 | Resource safety | `ctest -R test_engine_resources` | repeated failing creations return no handle, explain the error and move no device memory; a valid checkpoint still builds afterwards |
 | Engine | `tests/test_engine.py` vs independent PyTorch logits | argmax in the reference's max set; configured `--rms-tolerance` (default 0.1, family-specific overrides) |
 | Chunking | same prompt, different prefill splits | top-1 equal, rms ≤ 5 (state-loss guard) |

@@ -107,6 +107,42 @@ greedy-token agreement — never a relaxation of the top-1 check.
 
 ## Recently completed
 
+**F0: the costed baseline for the inference-optimization track** (plan F0, verified
+2026-09-26).
+The plan's fusion milestones all start by asking where the time goes, so F0 delivers the
+instrument and the numbers rather than a guess:
+
+- `csrc/include/profile.h` + `csrc/profile.cu` are **opt-in per-region CUDA timing**: a
+  `PROFILE_SCOPE(name, stream)` guard records one event pair per region invocation and never
+  synchronizes while recording; `profile_report` is the single measurement boundary. It is
+  **off by default**, so 28/28 ctest and the goldens still run the untouched path, and the
+  switch is a library call rather than a build flag so one binary serves both a benchmark and
+  a correctness run. 31 scopes sit at the region call sites (the dispatcher's mixer/ffn
+  choices, the dense MLP's five steps, the attention layer's ten, the GDN layer's ten, the
+  final norm and LM head, and the residual adds).
+- `tests/benchmark_inference.py` is the entry point: repeated warm runs with min/median/max
+  and a standard deviation for prefill M=2/64/128 and single-token decode, the per-region
+  table, and the provenance a baseline needs (descriptor, device list, GPU model/clocks/
+  temperature, manifest identities). It is run by hand, not registered in CTest - a timing
+  threshold in the suite would be a flaky gate.
+- **the deployment target's baseline** (Qwen3.8-27B, 2× A40, sm_86, pipelined): prefill
+  M=2 105.86 ms, M=64 122.82 ms, M=128 146.22 ms, decode M=1 **95.53 ms = 10.47 tok/s**,
+  dispersions ≤ 0.044 ms over 5 (or 120) samples.
+- **the per-region table decides F1's question**: a decode step is the dense MLP
+  (`ffn.dense` 62.3 of 95.5 ms), and inside it the three GEMMs are 20.5 + 20.5 + 19.8 ms
+  while the SiLU-multiply is 0.51 ms. **Gate + up alone are 40.9 ms, 43% of a decode step**,
+  which is the pair F1 proposes to merge. The GDN in-projections are the next lever (QKV 9.3
+  + Z 5.8 ms of 48 layers) and the LM head's single row costs 4.46 ms through a 248320-entry
+  vocabulary. Conversely F2's norms and residual adds sum to under 2 ms at M=1, and
+  `mlp.silu_mul` is negligible there but 20.7 ms (22% of the MLP) at prefill M=128.
+- **the measurement's own cost is reported**: recording adds +4.91 ms to the instrumented
+  calls (151.13 vs 146.22 ms), so `overhead_ms` sits beside every per-region table and those
+  sums are not a decomposition of the wall clock. A two-device bug was found and fixed here
+  too: events belong to a device and `cudaEventElapsedTime` only reads events of the current
+  one, so the pool is now created per device - and an earlier zero-initialised slot map made
+  a NULL handle look valid on device 0, which poisoned the stream and aborted the 2-device
+  forward at the third scope.
+
 **The temperature-sampling migration** (plan T0-T4, verified 2026-09-26).
 The plan's generation track is independent of the trainer and was the last unimplemented
 piece of the document; the CLI now samples from `softmax(logits/T)` by default:
@@ -683,6 +719,13 @@ CPU case pinning the behaviour.
   stale-data objective (`J_decoupled`) and every throughput/lag-distribution/per-device
   memory measurement are **not implemented**, which is what the plan's "start only after a
   synchronous algorithm and parameter publication protocol pass all relevant gates" defers.
+- **F0's memory-traffic and host-synchronization columns are not measured.** The plan's F0
+  asks for four quantities per region; this repository now measures two of them (CUDA time
+  and launch count). Per-region **memory traffic** and **host-synchronization counts** need a
+  profiler (ncu/nsys) rather than CUDA events, so the per-region table's bandwidth story - and
+  the plan's warning that "weight traffic, MoE host-offset sync and device transfers may
+  dominate launch savings" - is still unwatched, which matters most for F1's claim once the
+  GEMM count drops.
 - **The sampling migration's performance is unmeasured.** The plan's T4 asks for host
   selection time, allocations/GC, TTFT and tokens/s; none is measured, and the vocabulary
   sized scratch the selector allocates per row (the `a_i` and `w_i` lists) is transient but

@@ -1538,7 +1538,48 @@ currently unpacked into separate weight views at load time.
 Extend `tests/test_library_ops.py`, its `tests/kernels/kernel_bridge.cu`, and
 existing norm/GDN/engine tests. The model-level Haskell FFI remains unchanged.
 
-- [ ] **F0 — Establish a costed baseline before choosing fusions.** Record
+**Status: F0 is implemented and the baseline is measured, 2026-09-26.** The instrument is
+`csrc/include/profile.h` + `csrc/profile.cu` (opt-in per-region CUDA timing: a
+`PROFILE_SCOPE(name, stream)` guard records one event pair per region invocation, never
+synchronizes while recording, and `profile_report` is the single measurement boundary;
+**off by default**, so the gates and the goldens run the path they always did), and the
+entry point is `tests/benchmark_inference.py` (repeated warm runs with min/median/max and a
+standard deviation, per-region time and launch count, and the provenance a baseline needs:
+descriptor, devices, GPU model/clocks/temperature, manifest identities). On the deployment
+target — Qwen3.8-27B, 2× A40, sm_86, pipelined across the two cards:
+
+| Request | median | dispersion (5 or 120 samples) |
+|---|---|---|
+| prefill M=2 | 105.86 ms | stdev 0.012 ms |
+| prefill M=64 | 122.82 ms | stdev 0.044 ms |
+| prefill M=128 | 146.22 ms | stdev 0.040 ms |
+| decode M=1 | **95.53 ms (10.47 tok/s)** | stdev 0.036 ms over 120 steps |
+
+The per-region table is where F1's decision comes from, and it is decisive. **A decode step
+is the dense MLP**: `ffn.dense` is **62.3 ms of the 95.5 ms step**, and inside it the three
+GEMMs are 20.5 + 20.5 + 19.8 = 60.7 ms while `mlp.silu_mul` is 0.51 ms and the post-norm
+0.33 ms. The **gate and up GEMMs alone are 40.9 ms — 43% of a whole decode step** (48.1 ms of
+a 146 ms prefill), which is exactly the pair F1 proposes to merge. The mixers are the rest:
+`mixer.gdn` 24.8 ms (48 layers; in-projection QKV 9.3 + Z 5.8, out-projection 6.1, and the
+delta core only 0.7) and `mixer.attention` 7.6 ms (16 layers; Q 3.7, O 2.0). The LM head's
+**single row** through a 248320-entry vocabulary costs 4.46 ms + 0.07 ms of download, 4.7% of
+a decode step. Two F0 observations run *against* the obvious reading: the norms and residual
+adds that F2 proposes to fuse sum to well under 2 ms at M=1, so F2 is a launch-count and
+bandwidth question rather than a time one; and `mlp.silu_mul` is negligible at M=1 but
+**20.7 ms — 22% of the MLP — at prefill M=128**, so the activation's cost is prefill-specific.
+Qwen3-4B on one A40 shows the same shape (MLP 11.5 of 17.3 ms, gate+up+down 10.7 ms), so the
+conclusion is not a property of the two-card split.
+
+Three things F0 records rather than estimates: **the recording itself costs +4.91 ms** on both
+instrumented calls (151.13 ms vs 146.22 measured, 100.44 vs 95.53), which is why the runner
+reports `overhead_ms` beside every per-region table and why those tables' sums are not a
+decomposition of the wall time they were measured next to; **memory traffic and
+host-synchronization counts per region are not measured at all** (they need a profiler, not
+events), so the plan's two remaining F0 columns stay open; and the baseline is one
+configuration — the shapes are the descriptor's, and the numbers are medians of the runs
+recorded in the JSON the runner writes.
+
+- [x] **F0 — Establish a costed baseline before choosing fusions.** Record
   per-region CUDA time, launch count, host synchronization and memory traffic for
   decode M=1 and representative prefill M=2/64/128, within each descriptor's
   limits. Include layer placement and full request wall time. Run timing with

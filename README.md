@@ -302,6 +302,14 @@ equal highest BF16 reference logits are treated as ties.
   across shifts, masks, forced labels and explicit positions.
 - `ctest` also runs `test_norm` (both RMSNorm variants) and `test_rope` (partial
   and full rotation), each against a CPU reference.
+- `tests/benchmark_inference.py` is the costed baseline the plan's fusion work starts from:
+  repeated warm runs of prefill (M=2/64/128) and single-token decode with min/median/max and
+  a standard deviation, per-region CUDA time and launch count from the opt-in
+  `profile_scope_*` hooks (off by default, so the gates run the untouched path), and the
+  provenance a baseline needs (descriptor, devices, GPU clocks, manifest identities). It is
+  run by hand — a timing threshold in the suite would be a flaky gate. Example:
+  `python3 tests/benchmark_inference.py --library csrc/build-libs/libengine.so \
+  --model-dir "$MODEL_DIR" --desc "$DESC" --devices 0,1 --json /tmp/f0.json`.
 - `tests/test_engine.py --rms-tolerance` defaults to 0.1 and is raised per family
   where the reference's arithmetic differs (plain-norm families and MoE expert
   reduction land around 0.1-0.4); every greedy token still has to match.

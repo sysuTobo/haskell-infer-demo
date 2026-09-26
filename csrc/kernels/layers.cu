@@ -1,6 +1,7 @@
 /** Batched attention, GDN and MLP forwards with caller-owned scratch. */
 #include "kernels.h"
 #include "layers.h"
+#include "profile.h"
 #include "flashinfer_ops.h"
 #include "fla_ops.h"
 
@@ -112,11 +113,21 @@ int forward_mlp(cublasHandle_t cublas, cudaStream_t stream,
     __nv_bfloat16 *up = gate + TI;
     __nv_bfloat16 *mlp_act = up + TI;
 
+    { PROFILE_SCOPE("mlp.post_norm", stream);
     layer_norm(normed, residual, w->post_norm_w, H, tokens, dims, stream);
+    }
+    { PROFILE_SCOPE("mlp.gate_gemm", stream);
     checked_gemm(cublas, gate, normed, w->gate_proj_w, tokens, I, H);
+    }
+    { PROFILE_SCOPE("mlp.up_gemm", stream);
     checked_gemm(cublas, up, normed, w->up_proj_w, tokens, I, H);
+    }
+    { PROFILE_SCOPE("mlp.silu_mul", stream);
     kernel_silu_mul(mlp_act, gate, up, tokens * I, stream);
+    }
+    { PROFILE_SCOPE("mlp.down_gemm", stream);
     checked_gemm(cublas, layer_out, mlp_act, w->down_proj_w, tokens, H, I);
+    }
     return 0;
 }
 
@@ -145,14 +156,22 @@ int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
     __nv_bfloat16 *attn_out = gate + T * Q;
     __nv_bfloat16 *gated = attn_out + T * Q;
 
+    { PROFILE_SCOPE("attn.in_norm", stream);
     layer_norm(normed, residual, w->input_norm_w, H, tokens, dims, stream);
+    }
     /* With a fused gate the projection lands in q_raw and is split below;
      * without one it is written straight into the query buffer. */
     __nv_bfloat16 *q_dst = dims->attn_output_gate ? q_raw : q;
+    { PROFILE_SCOPE("attn.q_gemm", stream);
     checked_gemm(cublas, q_dst, normed, w->q_proj_w, tokens,
                  dims->attn_output_gate ? 2 * Q : Q, H);
+    }
+    { PROFILE_SCOPE("attn.k_gemm", stream);
     checked_gemm(cublas, k_out, normed, w->k_proj_w, tokens, KV, H);
+    }
+    { PROFILE_SCOPE("attn.v_gemm", stream);
     checked_gemm(cublas, v_out, normed, w->v_proj_w, tokens, KV, H);
+    }
 
     if (dims->attn_output_gate) {
         const int total = tokens * Q;
@@ -160,24 +179,40 @@ int forward_attention_layer(cublasHandle_t cublas, cudaStream_t stream,
             q, gate, q_raw, total, hd);
         check_launch();
     }
+    { PROFILE_SCOPE("attn.q_norm", stream);
     layer_norm(q, q, w->q_norm_w, hd, tokens * nH, dims, stream);
+    }
+    { PROFILE_SCOPE("attn.k_norm", stream);
     layer_norm(k_out, k_out, w->k_norm_w, hd, tokens * nKV, dims, stream);
+    }
+    { PROFILE_SCOPE("attn.rope", stream);
     kernel_flashinfer_rope(q, k_out, positions, tokens, nH, nKV, hd,
                            dims->rotary_dim, dims->rope_theta, stream);
+    }
     check_launch();
 
     const int seq_start = seq_len - tokens;
+    { PROFILE_SCOPE("attn.kv_write", stream);
     kernel_kv_cache_write(kv_cache, k_out, v_out, seq_start, tokens,
                           nKV, hd, dims->max_seq_len, stream);
+    }
     check_launch();
+    { PROFILE_SCOPE("attn.core", stream);
     kernel_attention(attn_out, q, kv_cache, seq_start, tokens, seq_len,
                       nH, nKV, hd, 1.0f / sqrtf((float)hd), dims->max_seq_len, stream);
+    }
     check_launch();
     if (dims->attn_output_gate) {
+        { PROFILE_SCOPE("attn.out_gate", stream);
         kernel_sigmoid_mul(gated, attn_out, gate, Q, tokens, Q, 0, stream);
+        }
+        { PROFILE_SCOPE("attn.o_proj", stream);
         checked_gemm(cublas, layer_out, gated, w->o_proj_w, tokens, H, Q);
+        }
     } else {
+        { PROFILE_SCOPE("attn.o_proj", stream);
         checked_gemm(cublas, layer_out, attn_out, w->o_proj_w, tokens, H, Q);
+        }
     }
     return 0;
 }
@@ -212,31 +247,51 @@ int forward_gdn_layer(cublasHandle_t cublas, cudaStream_t stream,
             tap_dump_rows(taps->config, kind, taps->layer, taps->device, stream, data, tokens, cols);
     };
 
+    { PROFILE_SCOPE("gdn.in_norm", stream);
     kernel_gemma_rms_norm(normed, residual, w->input_norm_w,
                           H, tokens, dims->rms_eps, stream);
+    }
     tap("gdn_in", normed, H);
+    { PROFILE_SCOPE("gdn.in_proj_qkv", stream);
     checked_gemm(cublas, qkv, normed, w->in_proj_qkv_w, tokens, C, H);
+    }
+    { PROFILE_SCOPE("gdn.in_proj_z", stream);
     checked_gemm(cublas, z, normed, w->in_proj_z_w, tokens, V, H);
+    }
+    { PROFILE_SCOPE("gdn.in_proj_a", stream);
     checked_gemm(cublas, a, normed, w->in_proj_a_w, tokens, nVH, H);
+    }
+    { PROFILE_SCOPE("gdn.in_proj_b", stream);
     checked_gemm(cublas, b, normed, w->in_proj_b_w, tokens, nVH, H);
+    }
     tap("gdn_z", z, V);
     tap("gdn_a", a, nVH);
     tap("gdn_b", b, nVH);
 
+    { PROFILE_SCOPE("gdn.conv1d", stream);
     kernel_causal_conv1d(conv_out, qkv, w->conv1d_w, w->conv1d_bias,
                          conv_state, C, tokens, dims->gdn_conv_kernel, stream);
+    }
     check_launch();
     // Convolution returns unfused BF16; preserve its rounding before SiLU.
+    { PROFILE_SCOPE("gdn.conv_act", stream);
     kernel_silu_inplace(conv_out, tokens * C, stream);
+    }
     check_launch();
     tap("gdn_conv", conv_out, C);
+    { PROFILE_SCOPE("gdn.delta_core", stream);
     kernel_fla_gdn(delta_out, conv_out, a, b, w->A_log, w->dt_bias,
                     ssm_state, fla_scratch, tokens, nKH, nVH, stream, taps);
+    }
     check_launch();
     tap("gdn_delta", delta_out, V);
+    { PROFILE_SCOPE("gdn.gated_norm", stream);
     kernel_gdn_gated_norm(norm_delta, delta_out, z, w->gdn_norm_w,
                           hd, tokens * nVH, dims->rms_eps, stream);
+    }
     tap("gdn_gated", norm_delta, V);
+    { PROFILE_SCOPE("gdn.out_proj", stream);
     checked_gemm(cublas, layer_out, norm_delta, w->out_proj_w, tokens, H, V);
+    }
     return 0;
 }

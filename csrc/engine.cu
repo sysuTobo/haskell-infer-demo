@@ -3,6 +3,7 @@
 #include "backward_layers.h"
 #include "engine.h"
 #include "kernels.h"
+#include "profile.h"
 #include "layers.h"
 #include "manifest.h"
 #include "model_desc.h"
@@ -1352,17 +1353,25 @@ static void compute_logits(EngineHandle *eng, DeviceCtx &last, const __nv_bfloat
     // Public API returns only the final row; avoid [max_chunk,vocab] logits.
     const __nv_bfloat16 *final_row = act + (size_t)(tokens - 1) * eng->dims.hidden_size;
     if (eng->dims.norm_style == 1) {
+        { PROFILE_SCOPE("lm_head.final_norm", last.stream);
         kernel_rms_norm_plain(last.workspace, final_row, last.final_norm_w,
                               eng->dims.hidden_size, 1, eng->dims.rms_eps, last.stream);
+        }
     } else {
+        { PROFILE_SCOPE("lm_head.final_norm", last.stream);
         kernel_gemma_rms_norm(last.workspace, final_row, last.final_norm_w,
                               eng->dims.hidden_size, 1, eng->dims.rms_eps, last.stream);
+        }
     }
     check_cuda(cudaGetLastError(), "Final norm");
+    { PROFILE_SCOPE("lm_head.gemm", last.stream);
     check_forward(gemm_bf16_f32out(last.cublas, last.d_logits, last.workspace,
                   last.lm_head_w, 1, eng->dims.vocab_size, eng->dims.hidden_size), "LM head");
+    }
+    { PROFILE_SCOPE("lm_head.d2h", last.stream);
     check_cuda(cudaMemcpyAsync(h_logits, last.d_logits, eng->dims.vocab_size * sizeof(float),
                                cudaMemcpyDeviceToHost, last.stream), "Download logits");
+    }
 }
 
 /* Layer-wise placement: the residual hops device-to-device once per layer. */

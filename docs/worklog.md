@@ -143,6 +143,41 @@ instrument and the numbers rather than a guess:
   a NULL handle look valid on device 0, which poisoned the stream and aborted the 2-device
   forward at the third scope.
 
+**Q1: the converter and the weights.manifest.json sidecar** (plan Q1, verified 2026-09-26).
+
+- `scripts/quantize_weights.py` converts the admitted roles - the dense FFN gate/up/down, Q's
+  initial scope - into a **separate output directory** and leaves the BF16 checkpoint
+  byte-identical (it hashes every source file before and after and refuses to continue if they
+  changed). It writes a versioned `weights.manifest.json` with exactly the fields Q1 lists:
+  source directory with per-file size and SHA-256, converter and config version, the
+  per-layer/role mapping, the logical `[N, K]`, the packed layout/shape/dtype and byte count,
+  the group axis and size, the scale tensor's shape/dtype/count, the zero-point convention,
+  per-artifact hashes, and a precision map with one cell for every `(role, layer)` cell of the
+  descriptor (28 cells for the 2-layer fixture, 6 of them int4). It also records the measured
+  elementwise error so a quality gate has the number rather than a claim.
+- **the converter does not re-implement the quantizer**: each tensor goes to the Q0 reference
+  (`test_quantization_format --quantize`), so an artifact is produced by the same code Q2 will
+  admit a kernel against and the two cannot drift.
+- `--verify` **re-derives rather than re-reads**: it re-hashes every artifact, re-checks the
+  extents against the format, requires the precision map to cover every role of every layer
+  exactly once and to agree with the entries, and re-quantizes a sample from the source.
+- `ctest test_quantization_converter` drives it over the synthetic dense checkpoint (6 role
+  instances, block error max_abs 0.0062 / rms 0.0024 over 196608 elements) and **requires the
+  verification to fail** on a corrupted payload, a manifest claiming a foreign group width, and
+  a missing artifact.
+- **a trap this stage found and closed**: both this gate and Stage 5's `test_sft` skip
+  themselves when the node-local synthetic checkpoint is absent, and **CTest reports a skip as
+  `Passed`**. A pod that moved nodes had lost
+  `/var/pony/cache/bohaotu-haskell/synth-qwen3-dense`, so a "28/28" suite was 27 ran + 1
+  skipped, and this new gate began life skipped too. Regenerating the checkpoint
+  (`python3 tests/synth/make_qwen3_dense.py --out-dir ... --layers 2 --seed 0`) makes both run:
+  Stage 5's passes in 12.5 s, this one in 0.6 s. A green count that includes skips is the
+  failure mode the plan names when it says an absent prerequisite is "skipped/unverified, not a
+  passing gate".
+- **not done**: Q2 (no quantized GEMM consumes the artifact, so the reference has no kernel to
+  admit yet), the plan's sm_86 kernel feasibility check, and the model-quality gates (logits
+  RMS, top-1 agreement, held-out NLL) that compare a quantized model against the BF16 baseline.
+
 **Q0: the weight-only INT4 format and its independent reference** (plan Q0, verified
 2026-09-26).
 F0's baseline decided the order: a decode step on the deployment target is 95.5 ms and the
@@ -783,6 +818,15 @@ CPU case pinning the behaviour.
   stale-data objective (`J_decoupled`) and every throughput/lag-distribution/per-device
   memory measurement are **not implemented**, which is what the plan's "start only after a
   synchronous algorithm and parameter publication protocol pass all relevant gates" defers.
+- **The node-local synthetic checkpoints are a hidden prerequisite for two gates.** `test_sft`
+  and `test_quantization_converter` skip themselves when
+  `/var/pony/cache/bohaotu-haskell/synth-qwen3-dense` is absent, and CTest reports a skip as
+  `Passed`, so a suite can be green while a gate never ran - which is what happened after the
+  pod moved nodes. The fixture is regenerated with `python3 tests/synth/make_qwen3_dense.py
+  --out-dir /var/pony/cache/bohaotu-haskell/synth-qwen3-dense --layers 2 --seed 0` (~1 minute),
+  and both gates then run. A stronger fix would store the fixture on the PVC next to the other
+  models, or make a skip a distinct CTest status (`set_tests_properties(... SKIP_RETURN_CODE)`)
+  so the count cannot hide it.
 - **Quantization stops at the format.** Q0's INT4 layout and its reference are implemented,
   gated and re-derived by a second implementation, but nothing consumes them yet: there is no
   converter (`scripts/quantize_weights.py`), no `weights.manifest.json` reader, no quantized

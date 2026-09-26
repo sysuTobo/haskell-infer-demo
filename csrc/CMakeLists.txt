@@ -298,6 +298,15 @@ if(BUILD_TESTS)
     # Initialization resource safety: a checkpoint that cannot be loaded must
     # leave no handle and no device memory behind. Skips itself when no GPU is
     # visible.
+    # Q1's gate (plan Q1): the converter writes a verifiable weights.manifest.json over the
+    # synthetic dense checkpoint without touching it, and the conversion's own verification
+    # rejects a corrupted payload, a manifest claiming a foreign format and a missing artifact.
+    add_test(NAME test_quantization_converter COMMAND ${Python3_EXECUTABLE}
+             "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_quantization_converter.py"
+             --reference $<TARGET_FILE:test_quantization_format>
+             --model-dir "${ENGINE_SFT_MODEL_DIR}"
+             --desc "${CMAKE_CURRENT_SOURCE_DIR}/../descriptors/qwen3-dense-synth.json")
+
     add_test(NAME test_engine_resources COMMAND ${Python3_EXECUTABLE}
              "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_engine_resources.py"
              --library $<TARGET_FILE:engine>)

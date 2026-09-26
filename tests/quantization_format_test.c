@@ -307,8 +307,62 @@ static int emit_fixture(const char *path) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* The converter's arithmetic                                          */
+/* ------------------------------------------------------------------ */
+
+/* Quantize one raw FP32 [N, K] weight with the *reference* implementation and write the
+ * payload and the scales as raw files. The offline converter calls this instead of
+ * re-implementing the quantizer, so a converted artifact is produced by the same code a kernel
+ * is admitted against (plan Q1: the artifact and the reference cannot drift). */
+static int quantize_tensor(const char *in_path, const char *packed_path, const char *scales_path,
+                           long long n, long long k) {
+    struct LinearWeightLayout layout;
+    if (linear_layout_init(&layout, n, k, LINEAR_WEIGHT_GROUP_SIZE) != LINEAR_OK) {
+        fprintf(stderr, "quantize: %s\n", linear_last_error());
+        return 1;
+    }
+    const size_t elements = (size_t)(n * k);
+    float *weights = (float *)malloc(elements * sizeof(float));
+    uint8_t *packed = (uint8_t *)malloc((size_t)layout.packed_bytes);
+    uint16_t *scales = (uint16_t *)malloc((size_t)layout.scale_count * sizeof(uint16_t));
+    if (weights == NULL || packed == NULL || scales == NULL) {
+        fprintf(stderr, "quantize: out of memory\n");
+        return 1;
+    }
+    FILE *in = fopen(in_path, "rb");
+    if (in == NULL || fread(weights, sizeof(float), elements, in) != elements) {
+        fprintf(stderr, "quantize: cannot read %s\n", in_path);
+        return 1;
+    }
+    fclose(in);
+    if (linear_quantize_int4(&layout, weights, packed, scales) != LINEAR_OK) {
+        fprintf(stderr, "quantize: %s\n", linear_last_error());
+        return 1;
+    }
+    FILE *packed_out = fopen(packed_path, "wb");
+    FILE *scales_out = fopen(scales_path, "wb");
+    if (packed_out == NULL || scales_out == NULL ||
+        fwrite(packed, 1, (size_t)layout.packed_bytes, packed_out) !=
+            (size_t)layout.packed_bytes ||
+        fwrite(scales, sizeof(uint16_t), (size_t)layout.scale_count, scales_out) !=
+            (size_t)layout.scale_count) {
+        fprintf(stderr, "quantize: cannot write the artifacts\n");
+        return 1;
+    }
+    fclose(packed_out);
+    fclose(scales_out);
+    free(weights);
+    free(packed);
+    free(scales);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--emit") == 0) return emit_fixture(argv[2]);
+    if (argc == 7 && strcmp(argv[1], "--quantize") == 0) {
+        return quantize_tensor(argv[2], argv[3], argv[4], atoll(argv[5]), atoll(argv[6]));
+    }
     test_layout();
     test_bf16();
     test_packing();

@@ -871,9 +871,24 @@ weight-bandwidth-bound, so the format comes before more fusion.
   scales and the reference dequantization of a deterministic fixture - the same shape as the
   manifest emitter being re-derived by hashlib.
 
+- **the converter is plumbing, not a second quantizer.** `scripts/quantize_weights.py` walks
+  the descriptor's role templates, reads the admitted tensors (dense FFN gate/up/down, Q's
+  initial scope) and hands each one to the *reference* implementation to quantize, then writes
+  the payload, the scales and a versioned `weights.manifest.json` into a separate directory -
+  the checkpoint itself is never touched, and the converter checks that by hashing every source
+  file before and after. Because the arithmetic comes from the reference, an artifact and the
+  kernel gate (Q2) cannot drift apart.
+- **the sidecar is verifiable, and the verification is tested for its ability to fail.**
+  `--verify` re-hashes the artifacts, re-checks the extents and the precision map against the
+  descriptor, and re-quantizes a sample from the source; the gate requires it to reject a
+  corrupted payload, a manifest claiming a different group width and a missing artifact.
+- **the manifest records the precision map, not just the quantized entries**: one cell for
+  every `(role, layer)` of the descriptor, marking int4 or bf16, so a loader cannot silently
+  miss a role or invent one.
+
 The plan freezes the wire format "subject to a sm_86 kernel feasibility check", and that check
-has not been run, so this is a gated format with no kernel consuming it yet: Q1 (converter,
-manifest, ownership) and Q2 (real weight-only execution) are untouched.
+has not been run, so this is a gated format with a gated converter and no kernel consuming
+either yet: Q2 (real weight-only execution and the model-quality gates) is untouched.
 
 ### Memory budget (2× A40, 4096 context)
 
@@ -906,6 +921,7 @@ stops at the first failure, so one command answers "is the tree green".
 | Group objective | `ctest -R test_gspo` (CPU) | the GSPO and GRPO objectives match an independent FP64 reference and its central difference on an unequal-length group; both advantage signs and both clip boundaries; masks, zero-variance and truncated groups; and the unclipped analytic gradient `A_i s_i / T_i` |
 | Rollout admission | `ctest -R test_rollout_queue` (CPU) | whole completed groups only; bounds in groups, tokens and live behavior versions; lag enforced at admission; a consumed group cannot be re-enqueued; and lag zero reproduces the synchronous objective and gradient bitwise while larger lag is reported as a policy change |
 | Sampling | `cabal test infer-generation-tests` (CPU, `tests/SamplingSpec.hs`) + `tests/test_sampling_cli.py` | the frozen splitmix64 vectors; the CDF boundaries, exact hits and zero-mass bins; shift invariance; overflow/underflow refusal; the draw-count contract (greedy none, a positive temperature one per selected token); same-seed stream/non-stream parity and a shorter request as a prefix; and, through the CLI runner, that every invalid temperature or seed is refused *before* any model is loaded |
+| Quantization converter | `ctest -R test_quantization_converter` (CPU) | the converter writes a verifiable sidecar over the synthetic dense checkpoint (6 role instances, error max_abs 0.0062 / rms 0.0024), leaves the checkpoint byte-identical, and the verification rejects a corrupted payload, a foreign format and a missing artifact |
 | Quantization format | `ctest -R test_quantization_format` (CPU) + `test_quantization_format_python` | the layout's refusals (partial groups, partial tiles, other group widths), BF16 round-to-nearest-even, the nibble packing checked against a hand-computed byte pattern as well as a round trip, the reserved code refused by the reader, the all-zero group's scale, the signed extrema and clipping, quantization as a fixed point of dequantization, and a numpy re-derivation of the whole fixture |
 | Baseline | `tests/benchmark_inference.py` (device, run by hand — not a CTest gate) | full-request wall time with dispersion for prefill M=2/64/128 and decode M=1, plus per-region CUDA time and launch count from the opt-in scopes, with the measurement's own overhead reported beside them |
 | Resource safety | `ctest -R test_engine_resources` | repeated failing creations return no handle, explain the error and move no device memory; a valid checkpoint still builds afterwards |

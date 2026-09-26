@@ -1674,8 +1674,37 @@ requires saved-rounded-value and backward/gradient revalidation from Stage 4.
 
 ### Q — Weight-only quantization
 
-**Status: Q0 is implemented, 2026-09-26 — the format and its independent reference, not yet a
-kernel.** `csrc/include/linear_weight.h` + `csrc/linear_weight.cpp` are the frozen INT4 format
+**Status: Q0 and Q1 are implemented, 2026-09-26 — the format, its reference, the converter and
+the sidecar; not yet a kernel consuming any of it.** `scripts/quantize_weights.py` converts a
+checkpoint's admitted roles (the dense FFN gate/up/down, per Q's initial scope) into a
+separate output directory without touching the BF16 checkpoint, and writes a versioned
+`weights.manifest.json` carrying exactly the fields Q1 lists: the source directory with a
+per-file size and SHA-256, the converter and config versions, the per-layer/role mapping, the
+logical `[N, K]`, the packed layout/shape/dtype and byte count, the group axis and size, the
+scale tensor's shape/dtype/count, the zero-point convention, per-artifact hashes, and a
+precision map with one cell for every `(role, layer)` of the descriptor. **The quantization
+arithmetic is not re-implemented in the converter**: each tensor is handed to the Q0 reference
+(`test_quantization_format --quantize`), so an artifact is produced by the same code Q2 admits
+a kernel against and the two cannot drift. `--verify` re-derives rather than re-reads: it
+re-hashes every artifact, re-checks the extents against the format, requires the precision map
+to cover every role of every layer exactly once and to agree with the entries, and re-quantizes
+a sample from the source checkpoint. `ctest test_quantization_converter` drives it over the
+synthetic dense checkpoint (6 role instances; block error max_abs 0.0062, rms 0.0024 over
+196608 elements) **and requires the verification to fail** on a corrupted payload, a manifest
+claiming a foreign group width and a missing artifact, because a validator that cannot fail is
+not a gate.
+
+One trap this stage walked into and then closed: **both this gate and Stage 5's `test_sft`
+skip themselves when the node-local synthetic checkpoint is absent, and a skip reports as
+`Passed` in CTest.** A pod that moved nodes lost that checkpoint, so a full suite of "28/28"
+was in fact 27 ran + 1 skipped, and the new converter gate started its life skipped too. The
+checkpoint is regenerated with `python3 tests/synth/make_qwen3_dense.py --out-dir
+/var/pony/cache/bohaotu-haskell/synth-qwen3-dense --layers 2 --seed 0`, after which both gates
+run (Stage 5's passes in 12.5 s and the converter gate in 0.6 s). The plan's own rule - "absent
+model/runtime prerequisites mean skipped/unverified, not a passing gate" - is exactly what the
+CTest status hid.
+
+**Q0's status.** `csrc/include/linear_weight.h` + `csrc/linear_weight.cpp` are the frozen INT4 format
 as CUDA-free arithmetic: `s = BF16(max|group|/7)` with `s = 1` for an all-zero group,
 round-to-nearest-even `q = round(w/s)` clipped to `[-7, 7]`, zero-point 0, two
 two's-complement nibbles per U8 byte with the lower K index in the low nibble, `-8` reserved
@@ -1746,7 +1775,7 @@ These are proposed new files, not current capabilities.
   K/group and backend tile alignment; reject unsupported shapes instead of
   inventing hidden padding. Better calibration/AWQ/GPTQ is a later named
   quantizer, not an unrecorded improvement to the same artifact.
-- [ ] **Q1 — Implement converter, manifest validation and ownership.** Write
+- [x] **Q1 — Implement converter, manifest validation and ownership.** Write
   quantized artifacts to a separate output directory without modifying the BF16
   checkpoint. Use a strict, versioned `weights.manifest.json` sidecar resolved
   from the model directory; keep the architecture descriptor portable and

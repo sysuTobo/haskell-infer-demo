@@ -1746,8 +1746,9 @@ separate output directory without touching the BF16 checkpoint, and writes a ver
 `weights.manifest.json` carrying exactly the fields Q1 lists: the source directory with a
 per-file size and SHA-256, the converter and config versions, the per-layer/role mapping, the
 logical `[N, K]`, the packed layout/shape/dtype and byte count, the group axis and size, the
-scale tensor's shape/dtype/count, the zero-point convention, per-artifact hashes, and a
-precision map with one cell for every `(role, layer)` of the descriptor. **The quantization
+scale tensor's shape/dtype/count, the zero-point convention, per-artifact hashes, a precision map
+with one cell for every `(role, layer)` of the descriptor, and a `pairs` section for the F1
+layout below. **The quantization
 arithmetic is not re-implemented in the converter**: each tensor is handed to the Q0 reference
 (`test_quantization_format --quantize`), so an artifact is produced by the same code Q2 admits
 a kernel against and the two cannot drift. `--verify` re-derives rather than re-reads: it
@@ -1758,6 +1759,20 @@ synthetic dense checkpoint (6 role instances; block error max_abs 0.0062, rms 0.
 196608 elements) **and requires the verification to fail** on a corrupted payload, a manifest
 claiming a foreign group width and a missing artifact, because a validator that cannot fail is
 not a gate.
+
+**The F1-compatible layout is emitted, not left to the reader.** The plan's Q2 requires that
+"if F1 is active, concatenate packed rows and scale rows consistently and preserve its
+activation layout", because F1's `forward_mlp` takes one `[2I, H]` weight and the row-interleaved
+`[T, 2I]` activation. The converter now emits a **pair artifact** per dense layer with both
+members quantized: `mlpGateUp_layer{L}.packed` is the gate's packed rows followed by the up's
+(`[2I, H]`, the operand F1's GEMM already wants) and `.scales` is the same row order, so the
+engine does not have to know the pair's internal split. `--verify` requires each pair to equal
+its members' bytes in order and its `logical_shape` to be `[sum(rows), k]`; the gate re-derives
+that from the **entries located by role**, not from the pair's own member list, so a pair that
+agreed with itself but not with the quantized members would fail. On the synthetic checkpoint
+this is 2 pairs (`[512, 128]`, 32768 packed bytes and 512 scales each) and the verification
+reports "2 F1 pair(s) match their members' rows". The engine-side reader that consumes these is
+the next piece, not this one.
 
 One trap this stage walked into and then closed: **both this gate and Stage 5's `test_sft`
 skip themselves when the node-local synthetic checkpoint is absent, and a skip reports as

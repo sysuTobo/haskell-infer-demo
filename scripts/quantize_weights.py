@@ -56,6 +56,12 @@ MANIFEST_VERSION = 1
 CONVERTER = {"name": "scripts/quantize_weights.py", "version": 1}
 # The plan's initial scope: dense FFN gate/up/down only, BF16 elsewhere.
 DEFAULT_ROLES = ("mlpGate", "mlpUp", "mlpDown")
+# The pair F1's fused gate/up GEMM consumes: its weights are one packed [2I, H] buffer (gate
+# rows then up rows) and the activation runs on the row-interleaved [T, 2I] output. The
+# converter emits the pair as its own artifact so that layout is fixed, hashed and verifiable
+# offline rather than assembled by whoever loads it.
+PAIR_ROLES = ("mlpGate", "mlpUp")
+PAIR_NAME = "mlpGateUp"
 
 
 def sha256_file(path):
@@ -148,8 +154,9 @@ def quantize_with_reference(reference, tensor, workdir):
 
 def convert(args):
     descriptor = json.load(open(args.desc))
-    os.makedirs(args.out_dir, exist_ok=True)
-    artifact_dir = os.path.join(args.out_dir, "artifacts")
+    out_dir = args.out_dir
+    os.makedirs(out_dir, exist_ok=True)
+    artifact_dir = os.path.join(out_dir, "artifacts")
     os.makedirs(artifact_dir, exist_ok=True)
 
     sources = [os.path.join(args.model_dir, name)
@@ -226,6 +233,48 @@ def convert(args):
                 "group": FORMAT["group"],
             })
 
+    # The F1-compatible pair: one packed [2I, H] payload and one [2I, H/group] scale block,
+    # built by concatenating the members' rows - byte concatenation of already-quantized
+    # artifacts, so no arithmetic happens here and the pair cannot drift from its members.
+    pairs = []
+    for layer in range(descriptor["num_layers"]):
+        members = [e for e in entries if e["layer"] == layer and e["role"] in PAIR_ROLES]
+        if len(members) != len(PAIR_ROLES):
+            continue
+        members.sort(key=lambda e: PAIR_ROLES.index(e["role"]))
+        gate, up = members
+        if gate["logical_shape"][1] != up["logical_shape"][1]:
+            raise SystemExit(f"quantize_weights: layer {layer}'s gate and up differ in K")
+        def read_artifact(entry, kind):
+            with open(os.path.join(out_dir, entry[kind]["file"]), "rb") as handle:
+                return handle.read()
+        packed = read_artifact(gate, "packed") + read_artifact(up, "packed")
+        scales = read_artifact(gate, "scales") + read_artifact(up, "scales")
+        rows = gate["logical_shape"][0] + up["logical_shape"][0]
+        k = gate["logical_shape"][1]
+        stem = f"{PAIR_NAME}_layer{layer}"
+        with open(os.path.join(artifact_dir, f"{stem}.packed"), "wb") as handle:
+            handle.write(packed)
+        with open(os.path.join(artifact_dir, f"{stem}.scales"), "wb") as handle:
+            handle.write(scales)
+        pairs.append({
+            "name": PAIR_NAME,
+            "layer": layer,
+            "members": [{"role": gate["role"], "role_index": gate["role_index"]},
+                        {"role": up["role"], "role_index": up["role_index"]}],
+            "rule": "row concatenation: gate rows then up rows, which is the [2I, H] weight "
+                    "layout F1's packed gate/up GEMM takes and the row-interleaved [T, 2I] "
+                    "output its activation expects",
+            "logical_shape": [rows, k],
+            "packed": {"file": f"artifacts/{stem}.packed", "dtype": FORMAT["packed_dtype"],
+                       "bytes": len(packed),
+                       "sha256": sha256_file(os.path.join(artifact_dir, f"{stem}.packed"))},
+            "scales": {"file": f"artifacts/{stem}.scales", "dtype": FORMAT["scale_dtype"],
+                       "count": len(scales) // 2, "bytes": len(scales),
+                       "sha256": sha256_file(os.path.join(artifact_dir, f"{stem}.scales"))},
+            "group": FORMAT["group"],
+        })
+
     # The precision map: every role of every layer, quantized or retained.
     admitted_keys = {(layer, name) for layer, _, name, _ in instances}
     precision_map = []
@@ -261,11 +310,15 @@ def convert(args):
         },
         "precision_map": precision_map,
         "entries": entries,
+        "pairs": pairs,
     }
     path = os.path.join(args.out_dir, "weights.manifest.json")
     with open(path, "w") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    if pairs:
+        print(f"quantize_weights: {len(pairs)} F1 pair(s) concatenated "
+              f"({PAIR_NAME}: packed rows then scales)")
     print(f"quantize_weights: {len(entries)} role instance(s) quantized; "
           f"block max_abs {error_max:.6g}, rms {(error_sq / error_count) ** 0.5 if error_count else 0:.6g}")
     print(f"quantize_weights: wrote {path}")
@@ -338,6 +391,44 @@ def verify(args):
             require((layer, name) in covered,
                     f"the precision map does not cover layer {layer}'s {name}")
 
+    # Each pair must be exactly its members' bytes, in the order the rule names.
+    by_key = {(entry["layer"], entry["role"]): entry for entry in entries}
+    for pair in manifest.get("pairs", []):
+        layer = pair["layer"]
+        members = [by_key.get((layer, name["role"])) for name in pair["members"]]
+        if any(member is None for member in members):
+            problems.append(f"pair at layer {layer} names a member that has no entry")
+            continue
+
+        def read(entry, kind):
+            with open(os.path.join(out_dir, entry[kind]["file"]), "rb") as handle:
+                return handle.read()
+
+        paths = [os.path.join(out_dir, pair["packed"]["file"]),
+                 os.path.join(out_dir, pair["scales"]["file"])]
+        for member in members:
+            paths.append(os.path.join(out_dir, member["packed"]["file"]))
+            paths.append(os.path.join(out_dir, member["scales"]["file"]))
+        if not all(os.path.exists(path) for path in paths):
+            # A missing artifact (or a manifest read from elsewhere) is already or about to be
+            # reported above; re-deriving it here would only raise, and the report is what the
+            # caller needs.
+            problems.append(f"pair at layer {layer} is missing an artifact")
+            continue
+        expected_packed = b"".join(read(member, "packed") for member in members)
+        expected_scales = b"".join(read(member, "scales") for member in members)
+        path, scales_path = paths[0], paths[1]
+        with open(path, "rb") as handle:
+            require(handle.read() == expected_packed,
+                    f"pair at layer {layer} is not its members' packed rows in order")
+        with open(scales_path, "rb") as handle:
+            require(handle.read() == expected_scales,
+                    f"pair at layer {layer} is not its members' scale rows in order")
+        rows = sum(member["logical_shape"][0] for member in members)
+        k = members[0]["logical_shape"][1]
+        require(pair["logical_shape"] == [rows, k],
+                f"pair at layer {layer} claims {pair['logical_shape']}, expected {[rows, k]}")
+
     # Re-derive a sample: the artifact must be reproducible from the source by the reference.
     sample = entries[:max(1, min(2, len(entries)))]
     index = read_safetensors_index(source_dir)
@@ -362,9 +453,10 @@ def verify(args):
         for problem in problems:
             print(f"quantize_weights: verify: {problem}")
         return 1
-    print(f"quantize_weights: verify: {len(entries)} entries, the precision map covers "
-          f"{len(covered)} (role, layer) cells, the source is unchanged and the sampled "
-          f"artifacts re-derive from it")
+    print(f"quantize_weights: verify: {len(entries)} entries, "
+          f"{len(manifest.get('pairs', []))} F1 pair(s) match their members' rows, the "
+          f"precision map covers {len(covered)} (role, layer) cells, the source is unchanged "
+          f"and the sampled artifacts re-derive from it")
     return 0
 
 

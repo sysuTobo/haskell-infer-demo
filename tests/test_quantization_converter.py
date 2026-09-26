@@ -97,6 +97,36 @@ def main():
     print(f"quantization error over {error['elements']} elements: max_abs {error['max_abs']:.6g}, "
           f"rms {error['rms']:.6g}")
 
+    # The F1 pair: gate rows then up rows, for the payload and the scales. Checked against the
+    # members' *roles* rather than the pair's own list of members, so a manifest that swapped
+    # them could not certify itself.
+    for pair in manifest.get("pairs", []):
+        layer = pair["layer"]
+        members = {e["role"]: e for e in manifest["entries"] if e["layer"] == layer}
+        if not {"mlpGate", "mlpUp"} <= set(members):
+            if not check(False, f"layer {layer}'s pair has no gate/up entry to check against"):
+                failures += 1
+            continue
+
+        def read(entry, kind):
+            with open(os.path.join(out_dir, entry[kind]["file"]), "rb") as handle:
+                return handle.read()
+
+        gate, up = members["mlpGate"], members["mlpUp"]
+        if not check(read(pair, "packed") == read(gate, "packed") + read(up, "packed"),
+                     f"layer {layer}'s pair payload is not gate rows then up rows"):
+            failures += 1
+        if not check(read(pair, "scales") == read(gate, "scales") + read(up, "scales"),
+                     f"layer {layer}'s pair scales are not gate rows then up rows"):
+            failures += 1
+        if not check(pair["logical_shape"][0] ==
+                     gate["logical_shape"][0] + up["logical_shape"][0] and
+                     pair["logical_shape"][1] == gate["logical_shape"][1],
+                     f"layer {layer}'s pair claims {pair['logical_shape']}"):
+            failures += 1
+    print(f"F1 pairs: {len(manifest.get('pairs', []))} (packed rows then scale rows, "
+          f"gate then up)")
+
     # The converter's own verification, which re-hashes and re-derives a sample.
     verification = run([sys.executable, CONVERTER, "--verify", manifest_path,
                         "--reference", args.reference])

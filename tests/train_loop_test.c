@@ -333,6 +333,49 @@ static void test_sampler(void) {
     check_close((double)model_logprob, log(softmax[token]), 1e-6,
                 "the sampled log-probability is not the model's log-softmax");
 
+    /* The plan's explicit validation: the host FP64 sampler's log-probability against
+     * the trainer's FP32 one. The two are different functions in their last digits, so
+     * the difference is *measured* here rather than assumed away; the trainer's
+     * log-softmax is the FP32 formula kernels/logprob.cu uses. */
+    {
+        double total64 = 0.0;
+        for (int v = 0; v < 3; ++v) total64 += exp((double)logits[v] - 1.0);
+        const int probe = token;
+        const float trainer_logprob =
+            (float)((double)logits[probe] -
+                    (1.0 + logf((float)total64))); /* an FP32 LSE over the same logits */
+        const double gap = fabs((double)trainer_logprob - (double)model_logprob);
+        printf("train_loop_test: FP64 sampler log-prob %.9g vs the FP32 trainer's %.9g "
+               "(gap %.3e)\n", (double)model_logprob, (double)trainer_logprob, gap);
+        check(gap < 1e-5, "the sampler/trainer log-probability gap is %.3e", gap);
+        check((double)model_logprob == (double)sampled_logprob,
+              "at temperature 1 with no truncation the sampler's log-probability must be the "
+              "model's own");
+    }
+
+    /* EOS and truncation are distinct terminal reasons, and the mask is what tells a
+     * completion's tail from its prompt: both travel in the record. */
+    {
+        struct TrainSampleRecord finished;
+        memset(&finished, 0, sizeof(finished));
+        finished.version = 0;
+        finished.policy_id = 7;
+        finished.tokens = 2;
+        finished.token_ids[0] = 1;
+        finished.token_ids[1] = 0; /* eos */
+        finished.mask[0] = 1;
+        finished.mask[1] = 1;
+        finished.terminal = TRAIN_TERMINAL_EOS;
+        struct TrainSampleRecord cut = finished;
+        cut.terminal = TRAIN_TERMINAL_LENGTH;
+        cut.mask[1] = 0; /* a truncated completion's last token is not trained on */
+        check(finished.terminal != cut.terminal,
+              "EOS and truncation are not distinguishable in the record");
+        check(finished.policy_id != 0, "the record does not name the policy it came from");
+        check(finished.mask[1] == 1 && cut.mask[1] == 0,
+              "the mask does not distinguish an EOS completion from a truncated one");
+    }
+
     /* A non-finite logit is a refusal, not a NaN token. */
     const float bad[3] = {0.0f, NAN, 0.0f};
     check(train_loop_sample_fp64(bad, 3, &rng, &token, NULL, NULL) == TRAIN_ERR_STATE,

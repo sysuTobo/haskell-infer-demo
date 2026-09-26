@@ -1749,16 +1749,18 @@ writes the BF16 weights and would leave the packed operands describing the old o
 `ctest test_quantized_ffn` is the gate. On the synthetic dense fixture the prefill logits are
 **bitwise equal**, the worst decode rms is **9.08e-3** over 8 steps, top-1 is 7/8 with the flip
 explained by its margin (3.2e-3, below the step's 2.7e-2 perturbation - a tie-break, and the gate
-requires exactly that), and the held-out NLL moves by **-0.0008 nats**. On a real model
-(Qwen3-4B, 36 dense full-attention layers) the same gate reports prefill **bitwise unchanged**,
-worst decode rms **1.00379**, top-1 **6/8 with both flips tie-breaks and none unexplained**, the
-held-out NLL **+0.28559 nats** inside a per-model budget, and the **cost side the plan's Q gates
-ask for**: 1322.6 MiB resident (from a 2204.5 MiB sidecar, whose pairs duplicate their members),
-a 6.04 s load, TTFT **unchanged** at 17.27 ms and decode **17.09 -> 10.60 ms, 1.61x** (58.3 ->
-94.1 tok/s). The converter's own error on the deployment target is max_abs 0.0835 / rms 1.37e-3
-over 192 role instances in 1705 s. A packed operand is a numerical-policy change and nothing else:
-`numerical_policy_id` moves, `semantic_id` and `deployment_id` do not, and `manifest_test.c` pins
-that.
+requires exactly that), and the held-out NLL moves by **-0.0008 nats**. **On the deployment
+target** (Qwen3.8-27B, 64 dense layers, 2× A40) the same gate reports prefill **bitwise
+unchanged**, worst decode rms **0.34605**, top-1 **7/8 with the one flip a tie-break and none
+unexplained**, the held-out NLL **-0.05826 nats**, an 8415.0 MiB residency from a 14025.4 MiB
+sidecar, a 45.32 s load, TTFT **unchanged** at 106.07 ms and decode **99.64 -> 63.26 ms, 1.57x**
+(10.0 -> 15.7 tok/s). On a second real model (Qwen3-4B, 36 dense full-attention layers) it
+reports the same shape with the larger error that model's coarser weights imply: worst decode rms
+1.00379, top-1 6/8 with both flips tie-breaks and none unexplained, held-out NLL +0.28559 nats
+inside a per-model budget, TTFT unchanged and decode **1.61x**. The converter's own error on the
+deployment target is max_abs 0.0835 / rms 1.37e-3 over 192 role instances in 1705 s. A packed
+operand is a numerical-policy change and nothing else: `numerical_policy_id` moves, `semantic_id`
+and `deployment_id` do not, and `manifest_test.c` pins that.
 
 **Q0 and Q1 status.** — the format, its reference, the converter, the sidecar and its reader;
 the Q2 kernel consumes the format, and the engine does not yet consume the sidecar.**

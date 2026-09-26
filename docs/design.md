@@ -843,6 +843,29 @@ round protocol the later stages reuse, so the protocol is the code:
   depend on what was consumed, not on how many calls have happened - and the consumed histories
   are what the retention claim is asserted against.
 
+S1 then replaces the two expensive halves of that prototype, and the replacements are worth
+stating because they change what a round *costs* without changing what it *decides*:
+
+- **Verification becomes one bounded batch.** `engine_verify_rows` consumes n ids and returns
+  every row's logits, row i conditioning on inputs[0..i]. The ordinary inference path computes
+  only the final row on purpose, so the `[max_chunk, vocab]` buffer this needs is allocated
+  lazily - an engine that never verifies never pays for it - and the batch is refused, not
+  silently chunked, past `max_chunk`. On the synthetic attention-only fixture the rows match
+  serial `engine_decode` execution to **2.4e-7 max_abs with every argmax equal**, and n = 1 is
+  bitwise a decode, which is the boundary that makes "one token is one execution case" checkable.
+- **Rollback becomes truncation instead of replay.** A rejected round leaves the target holding
+  tokens the round did not confirm and the draft holding one fewer than the retained prefix, so
+  the target is truncated back and the draft is *truncated or advanced* - advancing being the
+  plan's "on full acceptance draft must additionally consume its missing yk". `engine_truncate`
+  moves the sequence length for an append-only cache, which is why it admits only a model whose
+  every layer is full attention: a GDN state cannot be rewound and MLA needs its own admission,
+  so both are refused rather than left disagreeing with the cache. The CLI checks that admission
+  before generating, so it cannot arrive as a mid-run failure.
+- **What that buys and what it does not.** A round no longer pays a replay of the prefix, and the
+  two runtimes are kept in step by construction, but S0's *replay* remains the reference the
+  truncation path is checked against, and nothing here measures acceptance or throughput: S3 owns
+  admitting the acceleration, and S2 owns admitting a recurrent model at all.
+
 ### Instrumentation for the optimization track
 
 The plan's fusion and quantization milestones both start by asking where the time actually

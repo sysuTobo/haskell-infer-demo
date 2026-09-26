@@ -211,24 +211,25 @@ model-quality gate; verified 2026-09-26).
   actually reads - the first version of the test corrupted a *member's* file, which nothing
   loads, and the gate caught that by failing) and a tampered format block are both refused with
   the reason.
-- **Measured on real models.** The converter ran on the deployment target (Qwen3.8-27B, 64 dense
-  layers, hidden 5120, intermediate 17408, all four of those multiples of the group): 192 role
-  instances and 64 F1 pairs in **1705 s**, with a per-element block error of max_abs 0.0835 /
-  rms 1.37e-3. The engine-side comparison below ran on **Qwen3-4B** (36 dense full-attention
-  layers, hidden 2560, intermediate 9728 — the pod for it had a single A40, and the 27B's BF16
-  weights are ~50 GiB): prefill logits **bitwise unchanged**, and over 8 decode steps the worst
-  rms is **1.00379** with top-1 **6/8 where both flips are tie-breaks** (the BF16 margins were
-  2.5e-2 and 5.8e-2, both far below their steps' 4.0 and 1.5 max_abs differences, and the gate
-  reports any flip it cannot explain) and the held-out NLL moved by **+0.28559 nats** - inside the
-  documented budget of 1.25 / 0.40, which is a *per-model* budget set from this measurement
-  because the plan explicitly does not require token identity with BF16.
-- **The cost side, from the same run** (the plan's Q gates ask for it): the sidecar is 2204.5 MiB
-  on disk and **1322.6 MiB loaded** into the engine (the F1 pair duplicates its members on disk,
-  and only the pair plus every `mlpDown` is resident), the load takes **6.04 s**, TTFT is
-  **unchanged** (17.265 ms BF16 vs 17.239 ms INT4) because prefill still reads BF16, and decode
-  goes **17.092 ms -> 10.597 ms, 1.61x faster** (58.3 -> 94.1 tok/s). That is the format's
-  advantage showing up on a real model rather than on a synthetic one, and it is exactly the
-  decode-only specialization the kernel measurement predicted.
+- **Measured on the deployment target** (Qwen3.8-27B, 64 dense layers, hidden 5120, intermediate
+  17408, all four multiples of the group; 2× A40): the converter produced 192 role instances and
+  64 F1 pairs in **1705 s** at a per-element block error of max_abs 0.0835 / rms 1.37e-3, and the
+  gate then reports prefill logits **bitwise unchanged**, worst decode rms **0.34605** over 8
+  steps, top-1 **7/8 with the one flip a tie-break and none unexplained**, and the held-out NLL
+  **-0.05826 nats**. The cost side the plan's Q gates ask for comes from the same run: the sidecar
+  is 14025.4 MiB on disk and **8415.0 MiB resident** (the F1 pair duplicates its members on disk;
+  only the pair plus every `mlpDown` is loaded), the load takes **45.32 s**, TTFT is **unchanged**
+  (106.068 ms BF16 vs 106.042 ms INT4 - prefill still reads BF16), and decode goes **99.637 ms ->
+  63.264 ms, 1.57x faster** (10.0 -> 15.7 tok/s). That is the format's advantage as a measurement
+  on the real model, and it is the decode-only specialization the kernel measurement predicted.
+- **The same gate on a second real model** (Qwen3-4B, 36 dense full-attention layers): prefill
+  bitwise unchanged, worst decode rms **1.00379** with top-1 **6/8 and both flips tie-breaks, none
+  unexplained**, held-out NLL **+0.28559 nats** inside the same documented budget, 1322.6 MiB
+  resident from a 2204.5 MiB sidecar, 6.04 s load, TTFT unchanged at 17.27 ms and decode **1.61x**
+  (17.09 -> 10.60 ms). The larger per-step error is the smaller model's coarser weights
+  (block rms 2.86e-3 against the 27B's 1.37e-3) accumulating over its 36 layers - which is why the
+  budget is per model, as the plan requires, and why the gate reports the margin beside every flip
+  instead of asking for token identity with BF16.
 
 **The `weights.manifest.json` reader, as a validator** (plan Q1's sidecar, consumed by Q2;
 verified 2026-09-26).

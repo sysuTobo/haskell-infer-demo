@@ -1,17 +1,20 @@
 # Plan: Numerical Execution Contract, Haskell Training, and Asynchronous RL
 
 Status: **Stages 0-5 are implemented**, and so are Stage 6's decision layer,
-Stage 7's GSPO/GRPO objectives and Stage 8's lag-zero admission protocol; the rest
-of Stage 8 and the temperature-sampling and inference-optimization tracks below are
-proposals (the versioned execution manifest with capture provenance, the region
-inventory with its cross-case harness, the feasibility/invariance experiments, the
-trainable runtime's parameter lifecycle, the backward/loss/optimizer layer, the
-synchronous SFT/rollout baseline, the numerical-alignment decision, the GSPO/GRPO
-group objectives and their gate, and the bounded-staleness rollout queue —
-see
+Stage 7's GSPO/GRPO objectives, Stage 8's lag-zero admission protocol and the
+temperature-sampling migration (T0-T4). Still proposals: the asynchronous GPU half of
+Stage 8 (snapshots, device leases, publication transfer, throughput measurement) and
+the inference-optimization track (F/Q/S). What has landed: the versioned execution
+manifest with capture provenance, the region inventory with its cross-case harness, the
+feasibility/invariance experiments, the trainable runtime's parameter lifecycle, the
+backward/loss/optimizer layer, the synchronous SFT/rollout baseline, the
+numerical-alignment decision, the GSPO/GRPO group objectives and their gate, the
+bounded-staleness rollout queue, and the host binary64 temperature sampler with its
+request-owned RNG — see
 [manifest-contract.md](manifest-contract.md), [worklog.md](worklog.md),
 `csrc/regions.c`, `csrc/include/train.h`, `csrc/include/backward.h`,
-`csrc/include/alignment.h` and `csrc/include/rollout_queue.h`).
+`csrc/include/alignment.h`, `csrc/include/rollout_queue.h` and
+`src/Infer/Sampling.hs`.
 Revised after the design review, 2026-09-23.
 Extends [design.md](design.md). This document separates current capabilities,
 proposed interfaces, measured observations and hypotheses requiring experiments.

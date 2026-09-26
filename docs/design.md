@@ -866,6 +866,19 @@ stating because they change what a round *costs* without changing what it *decid
   truncation path is checked against, and nothing here measures acceptance or throughput: S3 owns
   admitting the acceleration, and S2 owns admitting a recurrent model at all.
 
+S2 supplies the half S1 could not: a **round checkpoint**. Truncating a cache's length works
+because the entries past it are overwritten and the entries before it are immutable; a GDN layer
+has neither property - its SSM state is a running summary that cannot be inverted - so the round
+instead *saves* the state it may need back and restores it. The save covers every buffer
+`engine_reset` clears (caches and recurrent state alike), the sequence length, the reset
+generation and the parameter identity, and the restore refuses when any of those has moved: a
+reset since, a failed forward that already requires a reset, or a change of weights *or numerical
+policy*. That last one is why the checkpoint records the quantization posture separately - packed
+operands do not move the weight digest, but they do change the execution, and a checkpoint taken
+before them must not be restored after. The mode is chosen where the descriptor is: an
+attention-only runtime keeps S1's free truncation, and a runtime with a recurrent layer pays for
+the copy, which is the admission the plan reserved for this stage.
+
 ### Instrumentation for the optimization track
 
 The plan's fusion and quantization milestones both start by asking where the time actually

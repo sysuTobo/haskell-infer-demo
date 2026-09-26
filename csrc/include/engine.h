@@ -173,6 +173,39 @@ int engine_verify_rows(EngineHandle *engine, const int64_t *token_ids, int num_t
  */
 int engine_truncate(EngineHandle *engine, int retain_len);
 
+/**
+ * Round checkpoints (plan S2): save, restore and release the engine's per-sequence state.
+ *
+ * A checkpoint is **engine-owned and opaque**, and an engine holds at most one at a time - the
+ * plan's "at most one round checkpoint per engine initially" - so `save` reports success rather
+ * than handing back a handle, and a second `save` while one is live is refused. What is saved is
+ * every buffer `engine_reset` would clear (the attention and MLA caches, and the GDN convolution
+ * and SSM state), plus the sequence length, the reset generation and the parameter identity.
+ *
+ * The subtlety is *why* the whole set is copied rather than only the recurrent part: the KV and
+ * MLA entries up to the retained length are immutable under the append-only cache design, so
+ * their logical length would suffice - but the length alone cannot put them back if a caller
+ * restores across a longer sequence, and classifying buffers by role would be a second registry
+ * to keep in step. Copying the reset set is redundant for those caches and correct for all of
+ * them.
+ *
+ * `restore` refuses rather than guessing when the saved state is no longer the engine's: after
+ * `engine_reset` (the reset generation moved), after a failed forward (the engine requires a
+ * reset), or after the weights or numerical policy changed (the parameter digest differs).
+ * Restoring does **not** clear that invalid state, and it does not replay anything: the plan's
+ * protocol is restore the round-start state and then replay exactly the retained inputs, which
+ * is the caller's job. `release` frees the copies and is a no-op when none is live, because it is
+ * also a cleanup path.
+ *
+ * @return ENGINE_OK, or a negative error code with the reason in engine_last_error().
+ */
+int engine_checkpoint_save(EngineHandle *engine);
+int engine_checkpoint_restore(EngineHandle *engine);
+int engine_checkpoint_release(EngineHandle *engine);
+
+/** Bytes a live checkpoint holds, or 0 when none is saved (for a report, not a gate). */
+long long engine_checkpoint_bytes(const EngineHandle *engine);
+
 /* ------------------------------------------------------------------ */
 /*  Queries                                                           */
 /* ------------------------------------------------------------------ */

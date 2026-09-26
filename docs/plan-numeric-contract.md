@@ -1998,7 +1998,7 @@ CMake configuration. No CUDA pointers cross the Haskell boundary.
   contract change. Add append-only cache truncation restricted to the current
   sequence and an available prefix. Initially admit pure full-attention targets
   and drafts; MLA needs its own admission, and any GDN model waits for S2.
-- [ ] **S2 — Add hybrid state checkpoints and restore/replay.** Introduce
+- [x] **S2 — Add hybrid state checkpoints and restore/replay.** Introduce
   opaque, engine-owned checkpoint handles and explicit save/restore/release
   operations; at most one round checkpoint per engine initially. Save all GDN
   conv/SSM buffers on every owning device, plus sequence length, engine/reset
@@ -2039,6 +2039,26 @@ vocabulary. 71 examples pass in `cabal test infer-generation-tests` (locally and
 all-position verification and append-cache rollback (the prototype verifies with sequential decode
 calls), S2's checkpoints (so recovery is a full replay), S3's cross-case admission gates, and any
 measurement of acceptance or speed - S0 is explicitly not a speedup.
+
+**S2 status (2026-09-26): implemented, and it is what admits a recurrent model.**
+`engine_checkpoint_save` / `_restore` / `_release` are an engine-owned, opaque checkpoint of one
+round's state: the buffers `engine_reset` would clear (the attention and MLA caches and the GDN
+convolution and SSM state), the sequence length, the reset generation and the parameter identity.
+The whole reset set is copied rather than only the recurrent part - the KV and MLA entries are
+immutable up to the retained length, so their length would suffice, but classifying buffers by
+role would be a second registry to keep in step, and the copy is what makes a restore correct
+across any sequence. A restore refuses rather than guessing when the saved state is no longer the
+engine's: after a reset (the generation moved), after a failed forward (the engine already
+requires a reset, and a checkpoint does not clear that), and after the weights *or the numerical
+policy* changed - the packed operands do not move the weight digest, so the quantization posture
+is recorded separately. `generateSpeculative` now takes the checkpoint at each round boundary
+when the rollback mode asks for it, restores and replays exactly the retained suffix on
+rejection, and releases them when the run ends (a live one would refuse the next run's save); the
+mode is chosen from the descriptor, which is why the earlier "any GDN model waits for S2"
+refusal is gone. `tests/test_checkpoints.py` is the gate: on a model with GDN layers, three
+decodes after a restore are **bitwise** what a second engine that never took the detour produces,
+and the five refusals fire (a second save, none saved, after a reset, after a release, and after
+a policy change). A fully accepted round restores nothing, which the CPU suite pins.
 
 **S1 status (2026-09-26): implemented; its device gate is the open confirmation.** `engine_verify_rows`
 consumes n ids as one bounded batch (refusing n > max_chunk rather than silently chunking, and

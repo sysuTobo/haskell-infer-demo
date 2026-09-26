@@ -20,7 +20,8 @@ module Infer.Generation
   , argmax
   ) where
 
-import Control.Exception (throwIO)
+import Control.Exception (finally, throwIO)
+import Control.Monad (when)
 import Data.Int (Int64)
 import Foreign.Ptr (Ptr)
 import System.IO (hFlush, stdout)
@@ -160,11 +161,13 @@ takeConfirmed isEos = go []
 -- the longest matching prefix @y[1:r]@ plus the target's correction (or bonus at @r = k@)
 -- becomes the round's output. Only target-confirmed tokens are returned, in order.
 --
--- Recovery is deliberately the slow, obviously-correct one: S0 owns no checkpoints (that is
--- S2), so both engines are reset and the retained prefix @P + [x] + y[1:r]@ is replayed
--- **sequentially** - one prefill of the first token and one decode per remaining token - so the
--- state matches the serial path rather than a chunked prefill, which Stage 2 measured to differ.
--- This is why S0 is a correctness prototype and not a speedup.
+-- Recovery follows the plan's two admissions, chosen by the caller from the descriptor:
+-- S1's **truncate** mode moves an append-only cache's length back for a pure full-attention
+-- model, which costs nothing; S2's **checkpoint** mode saves the round-start state (the buffers
+-- @engine_reset@ would clear, the sequence length and the parameter identity) and restores it
+-- on rejection, which is what admits a model with a recurrent layer - a GDN state cannot be
+-- rewound, so it has to be restored. Either way the round then replays exactly the inputs it
+-- kept, @[x] + y[1:r]@, and the checkpoints are released when the run ends.
 --
 -- The draft and target must share a vocabulary: S0 admits a draft with a different architecture
 -- but not a different token space. The runtime is what compares tokenizers and prompt templates.
@@ -184,7 +187,14 @@ generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt ma
                           ++ show draftVocab ++ " and " ++ show targetVocab
                           ++ "); S0 requires one token space"))
   | maxNew <= 0 = return []
-  | otherwise = do
+  | otherwise = run `finally` releaseCheckpoints
+  where
+    isEos token = fromIntegral token `elem` eosTokens
+    vocab = targetVocab
+    k = spProposals spec
+    checkpoints = spRollback spec == RollbackCheckpoint
+
+    run = do
       -- Both runtimes consume the identical prefix, sequentially, so their states are the
       -- serial path's states and a later replay can reproduce them exactly.
       _ <- consumeSequentially draft vocab prompt
@@ -193,10 +203,12 @@ generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt ma
       if isEos first
         then return [first]
         else go [first] prompt first (maxNew - 1)
-  where
-    isEos token = fromIntegral token `elem` eosTokens
-    vocab = targetVocab
-    k = spProposals spec
+
+    -- A run's checkpoints do not outlive it: a live one would refuse the next run's save.
+    releaseCheckpoints = do
+      _ <- engineCheckpointRelease draft
+      _ <- engineCheckpointRelease target
+      return ()
 
     -- Consume a nonempty sequence on one engine and return the last logits. A single-token
     -- prefill followed by decodes is the same path 'generate' takes after its own prefill.
@@ -240,6 +252,9 @@ generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt ma
             then return (reverse (next : emitted))
             else go (next : emitted) (consumed ++ [pending]) next (remaining - 1)
       | otherwise = do
+          -- S2's checkpoint is taken before anything consumes, so a rejection can be undone;
+          -- S1's mode needs nothing here because its cache can be moved back.
+          when checkpoints saveBothCheckpoints
           proposals <- draftPropose window pending
           -- S1's bounded all-position verification: one batch over [x, y1 .. yk] whose row i
           -- conditions on inputs[0..i], so the target pays one forward instead of k+1 decodes.
@@ -257,8 +272,7 @@ generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt ma
               -- correction becomes the new pending token and is not consumed here, precisely so
               -- it is not decoded twice.
               let retained = consumed ++ [pending] ++ confirmed
-              reconcile target retained
-              reconcile draft retained
+              rollback (length consumed) (accepted < window) retained
               go emitted' retained correction (remaining - length thisRound)
       where
         window = proposalWindow k remaining (length consumed) (spMaxSeqLen spec)
@@ -273,6 +287,34 @@ generateSpeculative spec draft draftVocab target targetVocab eosTokens prompt ma
           result <- engineTruncate engine (length retained)
           either (throwIO . userError . ("speculative: truncate failed: " ++)) return result
         else catchUp engine (drop length_ retained)
+
+    -- S2's rollback: a *rejected* round puts the round-start state back on both runtimes -
+    -- which is what a model with a recurrent layer needs, since its state cannot be moved back
+    -- like a cache's length - and then replays exactly the retained suffix, the plan's "restore
+    -- the round-start state, then replay exactly the retained inputs". A fully accepted round
+    -- has nothing to undo: the target is already at the retained prefix, and only the draft's
+    -- never-consumed last proposal is missing, which is the same catch-up S1 does.
+    rollback startLen rejected retained
+      | checkpoints && rejected = do
+          restoreCheckpoint draft
+          restoreCheckpoint target
+          catchUp draft (drop startLen retained)
+          catchUp target (drop startLen retained)
+      | otherwise = do
+          reconcile target retained
+          reconcile draft retained
+
+    -- A live checkpoint from the previous round is finished with; the engine refuses a second.
+    saveCheckpoint engine = do
+      _ <- engineCheckpointRelease engine
+      result <- engineCheckpointSave engine
+      either (throwIO . userError . ("speculative: checkpoint save failed: " ++)) return result
+
+    saveBothCheckpoints = saveCheckpoint draft >> saveCheckpoint target
+
+    restoreCheckpoint engine = do
+      result <- engineCheckpointRestore engine
+      either (throwIO . userError . ("speculative: checkpoint restore failed: " ++)) return result
 
     catchUp _ [] = return ()
     catchUp engine (t : ts) = do

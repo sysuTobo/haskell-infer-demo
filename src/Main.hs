@@ -517,7 +517,7 @@ runGenerate opts = do
   -- runtime, so the combination it needs is refused here, before anything is loaded: the plan
   -- asks for T=0 to be selected explicitly and for unsupported stochastic speculation to be
   -- rejected rather than silently ignored.
-  specCfg <- case (genSpecK opts, genDraftModelDir opts) of
+  specCfgBase <- case (genSpecK opts, genDraftModelDir opts) of
     (Nothing, _) -> return Nothing
     (Just _, Nothing) -> do
       putStrLn "ERROR: --speculative-k needs --draft-model-dir (S0 owns two runtimes)"
@@ -599,9 +599,10 @@ runGenerate opts = do
     putStrLn "---"
     -- An engine failure is reported as a failed run, never as a short output
     -- that exits 0.
-    outcome <- tryIOError $ case specCfg of
-      Just spec -> bracket (initRuntime draftCfg) shutdownRuntime $ \draftRt -> do
-        checkDraftCompatibility rt draftRt (genPrompt opts)
+    outcome <- tryIOError $ case specCfgBase of
+      Just base -> bracket (initRuntime draftCfg) shutdownRuntime $ \draftRt -> do
+        rollbackMode <- checkDraftCompatibility rt draftRt (genPrompt opts)
+        let spec = base { spRollback = rollbackMode }
         toks <- generateSpeculative spec (runtimeEngine draftRt) (rtVocabSize draftRt)
                                    engine vocab (dEosTokens desc) promptTokens
                                    (genMaxTokens opts)
@@ -634,7 +635,7 @@ runGenerate opts = do
 -- target never sees. Both contexts must also hold the prompt, and S0 requires one token space
 -- outright (the generate loop refuses a differing vocabulary as well; this is the earlier,
 -- more specific refusal).
-checkDraftCompatibility :: Runtime -> Runtime -> String -> IO ()
+checkDraftCompatibility :: Runtime -> Runtime -> String -> IO RollbackMode
 checkDraftCompatibility target draft promptText = do
   let targetVocab = rtVocabSize target
       draftVocab = rtVocabSize draft
@@ -656,18 +657,14 @@ checkDraftCompatibility target draft promptText = do
   if draftCapacity < length draftIds
     then refuse ("the prompt does not fit the draft's context (" ++ show draftCapacity ++ ")")
     else return ()
-  -- S1 admits pure full-attention runtimes. A GDN layer's recurrent state cannot be rewound and
-  -- MLA needs its own admission, so the rollback would be refused by the engine *mid-run*; the
-  -- refusal belongs here, before anything is generated.
+  -- Which rollback the round uses is decided here, where the descriptor is in hand: a pure
+  -- full-attention runtime can have its append-only cache moved back (S1), while a model with a
+  -- recurrent layer cannot rewind that state and needs S2's checkpoint. Before S2 existed this
+  -- was an outright refusal ("any GDN model waits for S2"), and this is that admission arriving.
   let recurrent d = [ (i, k) | (i, k) <- zip [0 ..] (dLayerMixers d), k /= MFullAttention ]
-  case recurrent (runtimeDescriptor target) of
-    ((i, _) : _) -> refuse ("the target's layer " ++ show i ++ " is not full attention; S1 "
-                            ++ "verification and rollback admit attention-only runtimes")
-    [] -> return ()
-  case recurrent (runtimeDescriptor draft) of
-    ((i, _) : _) -> refuse ("the draft's layer " ++ show i ++ " is not full attention; S1 "
-                            ++ "verification and rollback admit attention-only runtimes")
-    [] -> return ()
+  case recurrent (runtimeDescriptor target) ++ recurrent (runtimeDescriptor draft) of
+    [] -> return RollbackTruncate
+    _ -> return RollbackCheckpoint
   where
     refuse message = do
       putStrLn ("ERROR: " ++ message)

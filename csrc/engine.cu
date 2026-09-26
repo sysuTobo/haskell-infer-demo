@@ -255,6 +255,30 @@ struct DeviceCtx {
     size_t mla_size = 0;
 };
 
+/* A round checkpoint (plan S2): device copies of every buffer engine_reset clears, tagged with
+ * the device that owns each one, plus the facts a restore has to agree with. Built off to the
+ * side by engine_checkpoint_save and committed only once every copy has finished, so a failure
+ * mid-save leaves the engine without a checkpoint rather than with a partial one. */
+struct CheckpointBuffer {
+    void *target;      /* the live buffer to copy back into */
+    void *copy;        /* the saved device copy */
+    size_t bytes;
+    int ctx_index;     /* which DeviceCtx owns both */
+};
+
+struct EngineCheckpoint {
+    bool live = false;
+    int reset_generation = 0;
+    int seq_len = 0;
+    /* The parameter identity *and* the quantization posture: the weight digest does not move
+     * when packed operands are loaded, but the execution does, so a checkpoint taken before that
+     * must not be restored after it. */
+    int quantized_layers = 0;
+    manifest_hex_t weights_sha{};
+    std::vector<CheckpointBuffer> buffers;
+    long long bytes = 0;
+};
+
 struct EngineHandle {
     ModelDims dims{};            // full (checkpoint) dimensions
     ModelDims local_dims{};      // rank dimensions: heads and the dense MLP are
@@ -276,6 +300,11 @@ struct EngineHandle {
                                         // when replicated (layer-major)
     int seq_len = 0;
     bool state_valid = true;
+    /* Bumped by engine_reset: a checkpoint taken before a reset describes a state that no longer
+     * exists, so a restore has to notice. */
+    int reset_generation = 0;
+    /* The live round checkpoint (plan S2), at most one. */
+    struct EngineCheckpoint checkpoint;
     /* Execution manifest inputs that are facts about *this* load: the canonical
      * descriptor digest (the descriptor itself stays portable) and the immutable
      * parameter identity, both computed once at create. */
@@ -1744,12 +1773,24 @@ void engine_reset(EngineHandle *eng) {
             check_cuda(cudaStreamSynchronize(ctx.stream), "Finish reset");
         }
         eng->seq_len = 0;
+        eng->reset_generation += 1;
         eng->state_valid = true;
     } catch (const std::exception &e) {
         set_error("engine_reset: %s", e.what());
     } catch (...) {
         set_error("engine_reset: unknown failure");
     }
+}
+
+static void free_checkpoint(EngineHandle *eng, struct EngineCheckpoint &checkpoint) {
+    for (const CheckpointBuffer &buffer : checkpoint.buffers) {
+        if (buffer.copy == nullptr) continue;
+        if (eng != nullptr) cudaSetDevice(eng->ctx[buffer.ctx_index].device_id);
+        cudaFree(buffer.copy);
+    }
+    checkpoint.buffers.clear();
+    checkpoint.bytes = 0;
+    checkpoint.live = false;
 }
 
 static void cleanup_cuda(cudaError_t status) {
@@ -1759,6 +1800,8 @@ static void cleanup_cuda(cudaError_t status) {
 
 void engine_destroy(EngineHandle *eng) {
     if (!eng) return;
+    /* A live round checkpoint holds device copies of its own. */
+    free_checkpoint(eng, eng->checkpoint);
     /* The training store owns its own buffers, but it refuses to be destroyed while
      * a context or a step is live; at engine teardown there are none, and a leftover
      * reader would be a bug worth reporting rather than leaking. */
@@ -1892,8 +1935,151 @@ int engine_truncate(EngineHandle *eng, int retain_len) {
     return ENGINE_OK;
 }
 
-int engine_vocab_size(const EngineHandle *eng) { return eng ? eng->dims.vocab_size : 0; }
-int engine_seq_len(const EngineHandle *eng) { return eng ? eng->seq_len : 0; }
+/* ------------------------------------------------------------------ */
+/*  Round checkpoints (plan S2)                                        */
+/* ------------------------------------------------------------------ */
+
+int engine_checkpoint_save(EngineHandle *eng) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr) {
+        set_error("engine_checkpoint_save: null engine");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (!eng->state_valid) {
+        set_error("engine_checkpoint_save: the engine requires engine_reset after a failed "
+                  "forward, so its state is not worth saving");
+        return ENGINE_ERR_STATE;
+    }
+    if (eng->checkpoint.live) {
+        set_error("engine_checkpoint_save: this engine already holds a checkpoint; the plan "
+                  "admits one per engine for now");
+        return ENGINE_ERR_STATE;
+    }
+    struct EngineCheckpoint next;
+    try {
+        next.reset_generation = eng->reset_generation;
+        next.seq_len = eng->seq_len;
+        next.quantized_layers = eng->quantized_ffn_layers;
+        std::memcpy(next.weights_sha, eng->weights.parameter_manifest_sha256,
+                    sizeof(next.weights_sha));
+        for (int d = 0; d < eng->num_devices; ++d) {
+            DeviceCtx &ctx = eng->ctx[d];
+            if (ctx.device_id < 0) continue;
+            check_cuda(cudaSetDevice(ctx.device_id), "Select checkpoint device");
+            for (int i = 0; i < eng->num_layers; ++i) {
+                if (!eng->replicated && eng->layer_device[i] != d) continue;
+                for (const auto &buffer : layer_weights(eng, i, d).reset_zero) {
+                    if (buffer.first == nullptr || buffer.second == 0) continue;
+                    /* Record the entry before allocating, so a failed allocation leaves a null
+                     * copy this can free rather than a leak. */
+                    next.buffers.push_back(CheckpointBuffer{buffer.first, nullptr, buffer.second,
+                                                            d});
+                    CheckpointBuffer &entry = next.buffers.back();
+                    check_cuda(cudaMalloc(&entry.copy, entry.bytes),
+                               "Allocate checkpoint buffer");
+                    next.bytes += (long long)entry.bytes;
+                    check_cuda(cudaMemcpyAsync(entry.copy, entry.target, entry.bytes,
+                                               cudaMemcpyDeviceToDevice, ctx.stream),
+                               "Save checkpoint buffer");
+                }
+            }
+        }
+        /* Every copy finished on its own stream before success is reported, so a caller can rely
+         * on the checkpoint from here on (the plan's "save/restore/copy must finish on all
+         * relevant streams before reporting success or releasing buffers"). */
+        for (int d = 0; d < eng->num_devices; ++d) {
+            DeviceCtx &ctx = eng->ctx[d];
+            if (ctx.device_id < 0) continue;
+            check_cuda(cudaSetDevice(ctx.device_id), "Select checkpoint device");
+            check_cuda(cudaStreamSynchronize(ctx.stream), "Finish checkpoint save");
+        }
+        eng->checkpoint = std::move(next);
+        eng->checkpoint.live = true;
+    } catch (const std::exception &e) {
+        free_checkpoint(eng, next);
+        set_error("engine_checkpoint_save: %s", e.what());
+        return ENGINE_ERR_CUDA;
+    } catch (...) {
+        free_checkpoint(eng, next);
+        set_error("engine_checkpoint_save: unknown failure");
+        return ENGINE_ERR_CUDA;
+    }
+    return ENGINE_OK;
+}
+
+int engine_checkpoint_restore(EngineHandle *eng) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr) {
+        set_error("engine_checkpoint_restore: null engine");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (!eng->checkpoint.live) {
+        set_error("engine_checkpoint_restore: this engine has no checkpoint");
+        return ENGINE_ERR_STATE;
+    }
+    if (!eng->state_valid) {
+        set_error("engine_checkpoint_restore: the engine requires engine_reset after a failed "
+                  "forward; a checkpoint does not clear that");
+        return ENGINE_ERR_STATE;
+    }
+    if (eng->checkpoint.reset_generation != eng->reset_generation) {
+        set_error("engine_checkpoint_restore: the engine was reset since the checkpoint was "
+                  "taken (generation %d against %d)", eng->reset_generation,
+                  eng->checkpoint.reset_generation);
+        return ENGINE_ERR_STATE;
+    }
+    if (eng->checkpoint.quantized_layers != eng->quantized_ffn_layers ||
+        std::memcmp(eng->checkpoint.weights_sha, eng->weights.parameter_manifest_sha256,
+                    sizeof(eng->checkpoint.weights_sha)) != 0) {
+        set_error("engine_checkpoint_restore: the weights or the numerical policy changed since "
+                  "the checkpoint was taken");
+        return ENGINE_ERR_WEIGHTS;
+    }
+    try {
+        for (const CheckpointBuffer &buffer : eng->checkpoint.buffers) {
+            DeviceCtx &ctx = eng->ctx[buffer.ctx_index];
+            check_cuda(cudaSetDevice(ctx.device_id), "Select checkpoint device");
+            check_cuda(cudaMemcpyAsync(buffer.target, buffer.copy, buffer.bytes,
+                                       cudaMemcpyDeviceToDevice, ctx.stream),
+                       "Restore checkpoint buffer");
+        }
+        for (int d = 0; d < eng->num_devices; ++d) {
+            DeviceCtx &ctx = eng->ctx[d];
+            if (ctx.device_id < 0) continue;
+            check_cuda(cudaSetDevice(ctx.device_id), "Select checkpoint device");
+            check_cuda(cudaStreamSynchronize(ctx.stream), "Finish checkpoint restore");
+        }
+        eng->seq_len = eng->checkpoint.seq_len;
+    } catch (const std::exception &e) {
+        /* A partially restored state is not the engine's state any more: require a reset rather
+         * than pretending the restore succeeded (the plan's invalid-state requirement). */
+        eng->state_valid = false;
+        set_error("engine_checkpoint_restore: %s", e.what());
+        return ENGINE_ERR_CUDA;
+    } catch (...) {
+        eng->state_valid = false;
+        set_error("engine_checkpoint_restore: unknown failure");
+        return ENGINE_ERR_CUDA;
+    }
+    return ENGINE_OK;
+}
+
+int engine_checkpoint_release(EngineHandle *eng) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr) {
+        set_error("engine_checkpoint_release: null engine");
+        return ENGINE_ERR_CONFIG;
+    }
+    /* A no-op when nothing is live: this is also the cleanup path. */
+    free_checkpoint(eng, eng->checkpoint);
+    return ENGINE_OK;
+}
+
+long long engine_checkpoint_bytes(const EngineHandle *eng) {
+    return eng != nullptr && eng->checkpoint.live ? eng->checkpoint.bytes : 0;
+}
+
+int engine_vocab_size(const EngineHandle *eng) { return eng ? eng->dims.vocab_size : 0; }int engine_seq_len(const EngineHandle *eng) { return eng ? eng->seq_len : 0; }
 
 /* ------------------------------------------------------------------ */
 /* Stage 3: the training path                                         */

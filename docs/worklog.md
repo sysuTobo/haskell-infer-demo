@@ -107,6 +107,41 @@ greedy-token agreement — never a relaxation of the top-1 check.
 
 ## Recently completed
 
+**S2: round checkpoints, which admit a model with a recurrent layer** (plan S2; verified
+2026-09-26).
+
+- `engine_checkpoint_save` / `_restore` / `_release` are an **engine-owned, opaque** checkpoint of
+  one round's state, at most one per engine (the plan's "at most one round checkpoint per engine
+  initially", so `save` reports success rather than handing back a handle). What is saved is every
+  buffer `engine_reset` would clear - the attention and MLA caches and the GDN convolution and SSM
+  state - plus the sequence length, the reset generation and the parameter identity. The whole
+  reset set is copied rather than only the recurrent part: the KV and MLA entries are immutable up
+  to the retained length, so their length *would* suffice, but classifying buffers by role would
+  be a second registry to keep in step, and the copy is what makes a restore correct across any
+  sequence.
+- **A restore refuses rather than guessing** when the saved state is no longer the engine's: after
+  `engine_reset` (the reset generation moved), after a failed forward (the engine already requires
+  a reset, and a checkpoint does not clear that - the plan's "do not merely set `state_valid`"),
+  and after the weights **or the numerical policy** changed. The packed operands do not move the
+  weight digest, which is why the quantization posture is recorded separately - and that is what
+  makes loading INT4 after a save observably invalidate the checkpoint.
+- `generateSpeculative` takes the checkpoint at each round boundary when the rollback mode asks
+  for it, and on rejection restores it and replays exactly the retained suffix - the plan's
+  "restore the round-start state, then replay exactly the retained inputs". A fully accepted round
+  restores nothing (the target is already at the retained prefix and only the draft's
+  never-consumed last proposal is missing), which the CPU suite pins. The checkpoints are released
+  when the run ends, because a live one would refuse the next run's save; the mode comes from the
+  descriptor, so **the earlier "any GDN model waits for S2" refusal is gone** - S2 is that wait
+  arriving.
+- Gate `tests/test_checkpoints.py` on the real engine: on a model with GDN layers, three decodes
+  after a restore are **bitwise** what a second engine that never took the detour produces (a
+  6.46 MB checkpoint on the synthetic hybrid fixture), and the refusals all fire - a second save,
+  none saved, after a reset, after a release, and after a policy change. `cabal test
+  infer-generation-tests` is **73 examples, 0 failures** (locally and on the pod) with the two new
+  checkpoint cases, and the full suite is **34/34**.
+- One compile error of mine the pod caught: `free_checkpoint` was defined after `engine_destroy`,
+  which uses it (the local CPU tests do not build that file).
+
 **S1: bounded all-position verification and append-cache rollback** (plan S1; verified
 2026-09-26).
 

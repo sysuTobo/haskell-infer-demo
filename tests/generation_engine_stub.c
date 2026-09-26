@@ -69,10 +69,16 @@ typedef struct {
     int decode_calls;
     int verify_calls;
     int truncate_calls;
+    int save_calls;
+    int restore_calls;
     int reset_calls;
     /* Every id this handle has consumed, in order. Not cleared by engine_reset. */
     int64_t consumed[STUB_MAX_CONSUMED];
     int consumed_len;
+    /* The one live round checkpoint (plan S2): a save remembers the logical position, a restore
+     * puts it back, and the release is what lets the next round save again. */
+    int checkpoint_live;
+    int checkpoint_pos;
 } StubEngine;
 
 /* --- control surface ------------------------------------------------- */
@@ -209,6 +215,8 @@ int stub_consumed_copy_h(EngineHandle *engine, int64_t *out, int cap) {
 int stub_prefill_calls_h(EngineHandle *engine) { return handle_of(engine)->prefill_calls; }
 int stub_decode_calls_h(EngineHandle *engine) { return handle_of(engine)->decode_calls; }
 int stub_verify_calls_h(EngineHandle *engine) { return handle_of(engine)->verify_calls; }
+int stub_save_calls_h(EngineHandle *engine) { return handle_of(engine)->save_calls; }
+int stub_restore_calls_h(EngineHandle *engine) { return handle_of(engine)->restore_calls; }
 int stub_truncate_calls_h(EngineHandle *engine) { return handle_of(engine)->truncate_calls; }
 int stub_reset_calls_h(EngineHandle *engine) { return handle_of(engine)->reset_calls; }
 
@@ -354,6 +362,39 @@ int engine_truncate(EngineHandle *engine, int retain_len) {
     }
     e->pos = retain_len;
     return 0;
+}
+
+int engine_checkpoint_save(EngineHandle *engine) {
+    StubEngine *e = handle_of(engine);
+    e->save_calls++;
+    if (e->checkpoint_live) {
+        set_error("stub: this engine already holds a checkpoint");
+        return ENGINE_ERR_STATE;
+    }
+    e->checkpoint_pos = e->pos;
+    e->checkpoint_live = 1;
+    return 0;
+}
+
+int engine_checkpoint_restore(EngineHandle *engine) {
+    StubEngine *e = handle_of(engine);
+    e->restore_calls++;
+    if (!e->checkpoint_live) {
+        set_error("stub: this engine has no checkpoint");
+        return ENGINE_ERR_STATE;
+    }
+    e->pos = e->checkpoint_pos;
+    return 0;
+}
+
+int engine_checkpoint_release(EngineHandle *engine) {
+    handle_of(engine)->checkpoint_live = 0;
+    return 0;
+}
+
+long long engine_checkpoint_bytes(const EngineHandle *engine) {
+    const StubEngine *e = (const StubEngine *)engine;
+    return (e == NULL ? g_default.checkpoint_live : e->checkpoint_live) ? 128 : 0;
 }
 
 int engine_desc_version(void) { return 1; }

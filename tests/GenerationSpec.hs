@@ -104,6 +104,12 @@ foreign import ccall unsafe "stub_verify_calls_h"
 foreign import ccall unsafe "stub_truncate_calls_h"
   stubTruncateCallsH :: Ptr EngineHandle -> IO CInt
 
+foreign import ccall unsafe "stub_save_calls_h"
+  stubSaveCallsH :: Ptr EngineHandle -> IO CInt
+
+foreign import ccall unsafe "stub_restore_calls_h"
+  stubRestoreCallsH :: Ptr EngineHandle -> IO CInt
+
 -- | The stub ignores the handle, so a placeholder is enough.
 stubEngine :: Ptr EngineHandle
 stubEngine = nullPtr
@@ -451,6 +457,36 @@ main = hspec $ do
         single <- generate target 64 [9] [1] 4 greedy
         single `shouldBe` out
         out `shouldBe` [1, 2, 9]
+
+    it "restores the round-start state in checkpoint mode when a proposal is rejected" $ do
+      let scriptT = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+          scriptD = [0, 1, 9, 9, 9, 9, 9, 9, 9, 9]
+      withPair scriptT scriptD $ \draft target -> do
+        out <- generateSpeculative ((specWindow 2) { spRollback = RollbackCheckpoint })
+                                   draft 64 target 64 [] [1] 3
+        out `shouldBe` [1, 2, 3]
+        -- The round saved before anything consumed and restored on rejection, on both runtimes:
+        -- this is the mode a model with a recurrent layer needs, since its state cannot be moved
+        -- back the way S1 moves a cache's length.
+        saves <- stubSaveCallsH target
+        saves `shouldSatisfy` (> 0)
+        restores <- stubRestoreCallsH target
+        restores `shouldSatisfy` (> 0)
+        draftRestores <- stubRestoreCallsH draft
+        draftRestores `shouldSatisfy` (> 0)
+        -- The run's checkpoint did not outlive it, so a second run can save again.
+        again <- generateSpeculative ((specWindow 2) { spRollback = RollbackCheckpoint })
+                                     draft 64 target 64 [] [1] 2
+        again `shouldBe` [1, 2]
+
+    it "does not restore when every proposal was accepted" $ do
+      let scriptT = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+      withPair scriptT scriptT $ \draft target -> do
+        out <- generateSpeculative ((specWindow 2) { spRollback = RollbackCheckpoint })
+                                   draft 64 target 64 [] [1] 4
+        out `shouldBe` [1, 2, 3, 4]
+        restores <- stubRestoreCallsH target
+        restores `shouldBe` 0
 
     it "refuses a draft whose vocabulary differs from the target's" $ do
       withPair [0, 1, 2] [0, 1, 2] $ \draft target ->

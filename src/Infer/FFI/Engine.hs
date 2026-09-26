@@ -22,6 +22,10 @@ module Infer.FFI.Engine
   , engineDecode
   , engineVerifyRows
   , engineTruncate
+  , engineCheckpointSave
+  , engineCheckpointRestore
+  , engineCheckpointRelease
+  , engineCheckpointBytes
   , engineReset
     -- * Queries
   , engineVocabSize
@@ -66,6 +70,18 @@ foreign import ccall unsafe "engine.h engine_decode"
 
 foreign import ccall unsafe "engine.h engine_truncate"
   c_engine_truncate :: Ptr EngineHandle -> CInt -> IO CInt
+
+foreign import ccall unsafe "engine.h engine_checkpoint_save"
+  c_engine_checkpoint_save :: Ptr EngineHandle -> IO CInt
+
+foreign import ccall unsafe "engine.h engine_checkpoint_restore"
+  c_engine_checkpoint_restore :: Ptr EngineHandle -> IO CInt
+
+foreign import ccall unsafe "engine.h engine_checkpoint_release"
+  c_engine_checkpoint_release :: Ptr EngineHandle -> IO CInt
+
+foreign import ccall unsafe "engine.h engine_checkpoint_bytes"
+  c_engine_checkpoint_bytes :: Ptr EngineHandle -> IO CLLong
 
 foreign import ccall unsafe "engine.h engine_verify_rows"
   c_engine_verify_rows :: Ptr EngineHandle -> Ptr Int64 -> CInt -> Ptr CFloat -> CLLong -> IO CInt
@@ -179,6 +195,31 @@ engineTruncate h retainLen = do
 
 engineReset :: Ptr EngineHandle -> IO ()
 engineReset = c_engine_reset
+
+-- | Save the engine's per-sequence state as its one live round checkpoint (plan S2). The
+-- engine refuses a second save while one is live, and refuses outright after a failed forward.
+engineCheckpointSave :: Ptr EngineHandle -> IO (Either String ())
+engineCheckpointSave h = checkpointResult =<< c_engine_checkpoint_save h
+
+-- | Restore that checkpoint. The engine refuses when it was reset since, when the weights or
+-- numerical policy changed, or when it needs a reset after a failed forward.
+engineCheckpointRestore :: Ptr EngineHandle -> IO (Either String ())
+engineCheckpointRestore h = checkpointResult =<< c_engine_checkpoint_restore h
+
+-- | Release it (a no-op when none is live, because this is also the cleanup path).
+engineCheckpointRelease :: Ptr EngineHandle -> IO (Either String ())
+engineCheckpointRelease h = checkpointResult =<< c_engine_checkpoint_release h
+
+-- | What a live checkpoint holds, or 0.
+engineCheckpointBytes :: Ptr EngineHandle -> IO Integer
+engineCheckpointBytes h = fromIntegral <$> c_engine_checkpoint_bytes h
+
+checkpointResult :: CInt -> IO (Either String ())
+checkpointResult rc
+  | rc == 0 = return (Right ())
+  | otherwise = do
+      err <- engineLastError
+      return (Left err)
 
 engineVocabSize :: Ptr EngineHandle -> IO Int
 engineVocabSize h = fromIntegral <$> c_engine_vocab_size h

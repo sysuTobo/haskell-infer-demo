@@ -12,6 +12,7 @@ module Infer.Config
   , samplingSummary
   , streamSeed
   , SpecConfig(..)
+  , RollbackMode(..)
   , defaultSpecConfig
   , maxProposals
   , parseProposals
@@ -63,6 +64,13 @@ data SamplingConfig = SamplingConfig
 defaultSamplingConfig :: SamplingConfig
 defaultSamplingConfig = SamplingConfig { scTemperature = 1.0, scSeed = Nothing }
 
+-- | How a rejected round is rolled back. A pure full-attention model can just move the
+-- append-only cache's length back (S1), which costs nothing; a model with a recurrent layer
+-- cannot rewind that state, so it saves a round checkpoint and restores it (S2). The caller
+-- picks from the descriptor, because that is where the mixer kinds are known.
+data RollbackMode = RollbackTruncate | RollbackCheckpoint
+  deriving (Eq, Show)
+
 -- | The speculative window (plan S). S0 is greedy-only and takes a *fixed* proposal count -
 -- the plan says to start at 2-4 and to select a fixed k from measurements before considering
 -- anything adaptive - and the context capacity both engines share, which bounds how many
@@ -70,11 +78,13 @@ defaultSamplingConfig = SamplingConfig { scTemperature = 1.0, scSeed = Nothing }
 data SpecConfig = SpecConfig
   { spProposals :: Int
   , spMaxSeqLen :: Int
+  , spRollback  :: RollbackMode
   } deriving (Eq, Show)
 
--- | The plan's starting window.
+-- | The plan's starting window, with the rollback the attention-only case can use.
 defaultSpecConfig :: SpecConfig
-defaultSpecConfig = SpecConfig { spProposals = 3, spMaxSeqLen = 4096 }
+defaultSpecConfig = SpecConfig { spProposals = 3, spMaxSeqLen = 4096
+                               , spRollback = RollbackTruncate }
 
 -- | The largest window this prototype admits. A window is a bounded batch of proposals; a
 -- large one is a different protocol (adaptive windows are explicitly later work), so the

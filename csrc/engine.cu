@@ -1,4 +1,5 @@
 /** Weight loading and chunked, layer-partitioned multi-GPU inference. */
+#include "backward.h"
 #include "backward_layers.h"
 #include "engine.h"
 #include "kernels.h"
@@ -3002,4 +3003,111 @@ int engine_train_import_state(EngineHandle *eng, int logical, const float *maste
     }
     check_cuda(cudaStreamSynchronize(eng->ctx[0].stream), "Finish the import");
     return ENGINE_OK;
+}
+
+long long engine_train_version(EngineHandle *eng) {
+    if (eng == nullptr || eng->train_store == nullptr) return -1;
+    return train_store_version(eng->train_store);
+}
+
+int engine_rollout_sample(EngineHandle *eng, const int *prompt, int prompt_tokens, int max_tokens,
+                          int eos_token, long long policy_id, struct BackwardRng *rng,
+                          struct TrainSampleRecord *record) {
+    g_error_buf[0] = '\0';
+    if (eng == nullptr || !eng->state_valid) {
+        set_error("engine_rollout_sample: engine is null or needs engine_reset");
+        return ENGINE_ERR_STATE;
+    }
+    if (eng->train_store == nullptr) {
+        set_error("engine_rollout_sample: no training store is attached, so there is no "
+                  "version to bind the record to");
+        return ENGINE_ERR_STATE;
+    }
+    if (prompt == nullptr || rng == nullptr || record == nullptr) {
+        set_error("engine_rollout_sample: a prompt, an RNG and a record are required");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (prompt_tokens < 1 || max_tokens < 1) {
+        set_error("engine_rollout_sample: prompt_tokens and max_tokens must be positive");
+        return ENGINE_ERR_CONFIG;
+    }
+    if (max_tokens > TRAIN_LOOP_MAX_TOKENS) {
+        set_error("engine_rollout_sample: %d tokens exceeds the record's %d", max_tokens,
+                  TRAIN_LOOP_MAX_TOKENS);
+        return ENGINE_ERR_CONFIG;
+    }
+    if (eng->seq_len != 0) {
+        set_error("engine_rollout_sample: the sequence is at position %d; reset first",
+                  eng->seq_len);
+        return ENGINE_ERR_STATE;
+    }
+    for (int t = 0; t < prompt_tokens; ++t) {
+        if (prompt[t] < 0 || prompt[t] >= eng->dims.vocab_size) {
+            set_error("engine_rollout_sample: prompt token %d is out of range", prompt[t]);
+            return ENGINE_ERR_CONFIG;
+        }
+    }
+    const int vocab = eng->dims.vocab_size;
+    std::vector<float> logits((size_t)vocab);
+    std::vector<int64_t> ids(prompt_tokens);
+    for (int t = 0; t < prompt_tokens; ++t) ids[t] = prompt[t];
+    memset(record, 0, sizeof(*record));
+    record->policy_id = policy_id;
+    try {
+        /* A rollout context borrows the store's committed version for the whole
+         * generation: an update cannot begin while this is alive, and the version the
+         * record is stamped with is the one this context read rather than one the caller
+         * asserted. */
+        TrainContext *rollout = train_context_create(eng->train_store, 1);
+        if (rollout == nullptr) {
+            set_error("engine_rollout_sample: %s", train_last_error());
+            return ENGINE_ERR_STATE;
+        }
+        record->version = train_context_borrowed_version(rollout);
+        /* The whole rollout is one sequence: it is reset here and advanced token by token,
+         * so the KV cache and the recurrent state belong to this completion alone. */
+        engine_reset(eng);
+        if (engine_prefill(eng, ids.data(), prompt_tokens, logits.data()) != ENGINE_OK) {
+            set_error("engine_rollout_sample: %s", engine_last_error());
+            train_context_destroy(rollout);
+            return ENGINE_ERR_STATE;
+        }
+        int generated = 0;
+        record->terminal = TRAIN_TERMINAL_LENGTH;
+        for (int step = 0; step < max_tokens; ++step) {
+            int token = 0;
+            float model_logprob = 0.0f;
+            float sampled_logprob = 0.0f;
+            const TrainStatus sampled = train_loop_sample_fp64(logits.data(), vocab, rng, &token,
+                                                               &model_logprob, &sampled_logprob);
+            if (sampled != TRAIN_OK) {
+                set_error("engine_rollout_sample: %s", train_loop_last_error());
+                train_context_destroy(rollout);
+                return ENGINE_ERR_STATE;
+            }
+            record->token_ids[generated] = token;
+            record->logprobs[generated] = model_logprob;
+            record->sampled_logprobs[generated] = sampled_logprob;
+            record->mask[generated] = 1; /* everything generated is a completion token */
+            ++generated;
+            if (token == eos_token) {
+                record->terminal = TRAIN_TERMINAL_EOS;
+                break;
+            }
+            if (engine_decode(eng, (int64_t)token, logits.data()) != ENGINE_OK) {
+                set_error("engine_rollout_sample: %s", engine_last_error());
+                train_context_destroy(rollout);
+                return ENGINE_ERR_STATE;
+            }
+        }
+        record->tokens = generated;
+        /* The reward is the verifier's: a deterministic check on the completion, which is
+         * what the plan wants before a reward model exists. The caller fills it. */
+        record->reward = 0.0f;
+        engine_reset(eng);
+        train_context_destroy(rollout);
+        return ENGINE_OK;
+    } catch (const std::exception &e) {
+        return forward_error(eng, e);
+    }
 }

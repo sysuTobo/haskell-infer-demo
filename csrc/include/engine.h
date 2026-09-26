@@ -18,7 +18,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "train.h"   /* the trainable runtime's handles and status codes (Stage 3) */
+#include "backward.h"   /* the RNG and the sampler's log-probability transform (Stage 4) */
+#include "train.h"      /* the trainable runtime's handles and status codes (Stage 3) */
+#include "train_loop.h" /* the phase machine and the selection record (Stage 5) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -366,6 +368,34 @@ int engine_train_apply(EngineHandle *engine, const struct TrainOptimizerOptions 
 
 /** Zero every trainable parameter's FP32 gradient accumulator. */
 int engine_train_zero_grads(EngineHandle *engine);
+
+/** The parameter version the store currently publishes, or -1 when no training store is
+ * attached. This is the version a rollout is bound to and the one a caller compares a
+ * record's against, so it has to be readable rather than assumed. */
+long long engine_train_version(EngineHandle *engine);
+
+/**
+ * Generate one completion from the model as it currently stands and fill a Stage-5
+ * selection record: the sampled token ids, each token's model log-probability *and* the
+ * sampler's, the completion mask, the terminal reason and the version.
+ *
+ * The sampling is `train_loop_sample_fp64` -- host FP64, temperature 1, no truncation --
+ * so the sampler's distribution is the model's softmax, which is what makes the ratio's
+ * exactly-one property at unchanged parameters true rather than approximate. The logits
+ * come back to the host one row at a time (the engine's logits are for the last position
+ * only), so no [tokens, vocab] tensor is retained anywhere.
+ *
+ * The rollout runs inside a real borrowing `TrainContext` (train_store's rollout kind), and
+ * the record's version is the one *that context* borrowed -- not a value the caller hands
+ * in. Two things follow, and they are why it is done this way: an optimizer update cannot
+ * open while the generation is live (`train_store_begin_update` refuses a borrowed
+ * version), and the record cannot be stamped with a version the rollout did not read.
+ * `policy_id` stays the caller's, because "behavior policy vs frozen reference" is a
+ * question about the run, not about the store.
+ */
+int engine_rollout_sample(EngineHandle *engine, const int *prompt, int prompt_tokens,
+                          int max_tokens, int eos_token, long long policy_id,
+                          struct BackwardRng *rng, struct TrainSampleRecord *record);
 
 /**
  * Copy one trainable logical parameter's training state out to (or in from) the host:

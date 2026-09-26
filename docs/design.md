@@ -12,7 +12,9 @@ These describe the current inference engine, not the proposed trainer in
 [plan-numeric-contract.md](plan-numeric-contract.md).
 
 - Single request at a time (chunked prefill, no multi-request batching)
-- Greedy decoding only; stochastic rollout sampling is planned, not implemented
+- Greedy decoding on the inference path. The trainer's synchronous rollout *does* sample
+  (`engine_rollout_sample`, host FP64 at temperature 1 with no truncation, plan Stage 5),
+  but the CLI's own sampler migration is planned, not implemented
 - 1–8 GPUs; layer-wise placement and separate TP/EP policies (verified on 2× A40 46 GB, sm_86); combined TP+EP is rejected
 - Pure text (no vision/multimodal)
 - CLI interface with streaming output
@@ -686,10 +688,18 @@ into a step, and the chaining is where the interesting decisions are:
   state instead. A phase boundary resets the sequence, and a record is bound to the version
   it was generated under — reading it after an update is refused, which is the plan's
   "never reconstruct an old denominator using updated weights".
+- **The rollout's version is read, not asserted.** `engine_rollout_sample` opens a *rollout*
+  `TrainContext` for the whole generation and stamps the record with the version that
+  context borrowed, so a caller cannot label a completion with a version the engine did not
+  read and the store cannot write an update underneath it. The generation path and the
+  teacher-forced trainer path are the same weights through different code (a KV cache
+  against a causal mask), so the gate measures the gap between their log-probabilities
+  (4.8e-07 on the tiny fixture) instead of assuming the two denominators are one.
 
 The step is wired for the attention and dense-MLP path on one device; the GDN mixer's
-backward, the placements and the rollout's engine driver are named in the plan's Stage-5
-status as the remaining work rather than implied to exist.
+backward and the placements are named in the plan's Stage-5 status as the remaining work
+rather than implied to exist, and a group's G completions are collected by looping (there
+is no batched group driver).
 
 ### Memory budget (2× A40, 4096 context)
 
@@ -741,7 +751,8 @@ coverage; see `plan-numeric-contract.md`.
 - Not multi-request batched
 - Not multimodal (text only)
 - Not a Haskell GPU compute framework (Haskell orchestrates, CUDA computes)
-- Not yet a trainer or an asynchronous rollout service
+- Not an asynchronous rollout service (a *synchronous* SFT/rollout step exists; staleness,
+  batching and a reward model do not)
 
 ## Future work
 

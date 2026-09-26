@@ -94,6 +94,31 @@ def bind(lib):
         lib.engine_train_import_state.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                                  ctypes.c_void_p, ctypes.c_void_p,
                                                  ctypes.c_void_p]
+    # Stage 5: the synchronous rollout and the phase machine's bookkeeping. Bound only
+    # when the library exports the rollout entry point.
+    if hasattr(lib, "engine_rollout_sample"):
+        lib.engine_train_version.argtypes = [ctypes.c_void_p]
+        lib.engine_train_version.restype = ctypes.c_int64
+        lib.engine_rollout_sample.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                              ctypes.c_int, ctypes.c_int, ctypes.c_int64,
+                                              ctypes.c_void_p, ctypes.c_void_p]
+        lib.backward_rng_seed.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        lib.train_loop_create.argtypes = [ctypes.c_void_p]
+        lib.train_loop_create.restype = ctypes.c_void_p
+        lib.train_loop_destroy.argtypes = [ctypes.c_void_p]
+        lib.train_loop_enter.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                         ctypes.POINTER(ctypes.c_int64)]
+        lib.train_loop_leave.argtypes = [ctypes.c_void_p]
+        lib.train_loop_version.argtypes = [ctypes.c_void_p]
+        lib.train_loop_version.restype = ctypes.c_int64
+        lib.train_loop_sequence_resets.argtypes = [ctypes.c_void_p]
+        lib.train_loop_sequence_resets.restype = ctypes.c_int
+        lib.train_loop_record.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        lib.train_loop_read_reward.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                               ctypes.POINTER(ctypes.c_float)]
+        lib.train_loop_ratio.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.POINTER(ctypes.c_double)]
+        lib.train_loop_last_error.restype = ctypes.c_char_p
     if hasattr(lib, "model_desc_role_from_name"):
         lib.model_desc_role_from_name.argtypes = [ctypes.c_char_p]
         lib.model_desc_role_from_name.restype = ctypes.c_int

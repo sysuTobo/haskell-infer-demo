@@ -187,6 +187,275 @@ def export_state(lib, engine, store):
     return masters, moments_m, moments_v
 
 
+# ------------------------------------------------------------------ #
+# The rollout's record, mirrored from csrc/include/train_loop.h       #
+# ------------------------------------------------------------------ #
+
+TRAIN_LOOP_MAX_TOKENS = 4096
+TRAIN_LOOP_MAX_GROUP = 64
+TRAIN_PHASE_ROLLOUT = 1
+TRAIN_TERMINAL_EOS = 0
+TRAIN_TERMINAL_LENGTH = 1
+
+
+class BackwardRng(ctypes.Structure):
+    _fields_ = [("seed", ctypes.c_uint64), ("counter", ctypes.c_uint64)]
+
+
+class TrainSampleRecord(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_longlong), ("policy_id", ctypes.c_longlong),
+                ("tokens", ctypes.c_int),
+                ("token_ids", ctypes.c_int * TRAIN_LOOP_MAX_TOKENS),
+                ("logprobs", ctypes.c_float * TRAIN_LOOP_MAX_TOKENS),
+                ("sampled_logprobs", ctypes.c_float * TRAIN_LOOP_MAX_TOKENS),
+                ("mask", ctypes.c_uint8 * TRAIN_LOOP_MAX_TOKENS),
+                ("terminal", ctypes.c_int), ("reward", ctypes.c_float)]
+
+
+class TrainGroup(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_longlong), ("count", ctypes.c_int),
+                ("records", TrainSampleRecord * TRAIN_LOOP_MAX_GROUP)]
+
+
+class TrainForwardOutput(ctypes.Structure):
+    _fields_ = [("all_logits", ctypes.c_void_p), ("logprobs", ctypes.c_void_p),
+                ("selected", ctypes.c_void_p), ("selected_count", ctypes.c_int)]
+
+
+def eos_token_of(desc):
+    tokens = desc.get("eos_tokens") or [0]
+    return int(tokens[0])
+
+
+def sample(lib, engine, prompt, max_tokens, eos, seed, policy_id=7):
+    """One rollout with a fresh RNG at `seed`; returns (status, record, error)."""
+    prompt_arr = np.ascontiguousarray(prompt, dtype=np.int32)
+    rng = BackwardRng()
+    lib.backward_rng_seed(ctypes.byref(rng), seed)
+    record = TrainSampleRecord()
+    status = lib.engine_rollout_sample(engine, ptr(prompt_arr), len(prompt), max_tokens, eos,
+                                       policy_id, ctypes.byref(rng), ctypes.byref(record))
+    return status, record, lib.engine_last_error().decode()
+
+
+def rollout_section(lib, model_dir, desc):
+    """Stage 5's rollout half on the loaded model.
+
+    What is checked here and nowhere else: that a completion comes out of the *engine's*
+    distribution (frequencies against the model's own softmax on the same logits), that
+    the sampler is seeded and the terminal reason is the one the tokens imply, that the
+    record's version is the one the engine *read* rather than one the caller asserted, and
+    that the host-FP64 sampler's denominator differs from the trainer's FP32 one by a
+    measured amount. The bookkeeping rules themselves are the CPU gate's (train_loop_test).
+    """
+    eos = eos_token_of(desc)
+    prompt = [3, 7, 11]
+    engine, store = make_engine(lib, model_dir, desc)
+    vocab = lib.engine_vocab_size(engine)
+    loop = lib.train_loop_create(store)
+    assert loop, lib.train_loop_last_error().decode()
+    version = ctypes.c_int64(-1)
+    assert lib.train_loop_enter(loop, TRAIN_PHASE_ROLLOUT, ctypes.byref(version)) == 0, \
+        lib.train_loop_last_error().decode()
+    try:
+        print("5. the rollout: the record, the sampler and the version binding")
+        status, record, error = sample(lib, engine, prompt, 6, eos, 1234)
+        check("the engine generates a completion", status == 0, error)
+        if status != 0:
+            return
+        generated = int(record.tokens)
+        ids = [int(record.token_ids[i]) for i in range(generated)]
+        logprobs = np.array([float(record.logprobs[i]) for i in range(generated)],
+                            dtype=np.float32)
+        sampled = np.array([float(record.sampled_logprobs[i]) for i in range(generated)],
+                           dtype=np.float32)
+        mask = [int(record.mask[i]) for i in range(generated)]
+        print(f"  prompt {prompt} -> completion {ids} (terminal {record.terminal})")
+        check("the record holds at most the requested number of tokens",
+              1 <= generated <= 6, f"{generated} tokens")
+        check("the engine stamped the version the store publishes, not the caller's",
+              record.version == version.value == lib.engine_train_version(engine),
+              f"record {record.version}, loop {version.value}, store {lib.engine_train_version(engine)}")
+        check("the record carries the caller's policy id", record.policy_id == 7)
+        check("every generated id is inside the vocabulary",
+              all(0 <= token < vocab for token in ids))
+        check("the mask marks every generated token as trained on", set(mask) == {1})
+        check("the model's log-probabilities are finite and non-positive",
+              bool(np.all(np.isfinite(logprobs)) and np.all(logprobs <= 0.0)))
+        sampler_gap = float(np.abs(sampled - logprobs).max()) if generated else 0.0
+        # At temperature 1 with no truncation the sampler's distribution *is* the model's,
+        # so the two recorded log-probabilities are the same number; a transformation would
+        # make them differ, and the plan requires exactly that difference to be recorded.
+        check("the sampler records the model's log-probability unchanged (no transformation)",
+              sampler_gap == 0.0, f"max gap {sampler_gap:.3e}")
+        check("the terminal reason is what the last token implies",
+              (record.terminal == TRAIN_TERMINAL_EOS) == (ids[-1] == eos),
+              f"terminal {record.terminal}, last token {ids[-1]}, eos {eos}")
+
+        # The seed decides the completion, so two runs at one seed agree bit for bit and a
+        # shorter run is a prefix of the longer one (the same logits, the same draws).
+        _, again, _ = sample(lib, engine, prompt, 6, eos, 1234)
+        check("the same seed reproduces the same completion bitwise",
+              [int(again.token_ids[i]) for i in range(int(again.tokens))] == ids and
+              np.array_equal(np.array([again.logprobs[i] for i in range(generated)],
+                                      dtype=np.float32), logprobs))
+        _, shorter, _ = sample(lib, engine, prompt, 3, eos, 1234)
+        check("a shorter rollout at the same seed is a prefix of the longer one",
+              [int(shorter.token_ids[i]) for i in range(3)] == ids[:3])
+
+        # The terminal reasons, forced deterministically: an eos equal to the first sampled
+        # token stops there, and an eos no sampled token equals runs to the length limit.
+        _, stopped, _ = sample(lib, engine, prompt, 6, ids[0], 1234)
+        check("an eos the sampler hits ends the completion",
+              int(stopped.tokens) == 1 and stopped.terminal == TRAIN_TERMINAL_EOS,
+              f"{int(stopped.tokens)} tokens, terminal {stopped.terminal}")
+        unreachable = next(token for token in range(vocab) if token not in ids[:3])
+        _, truncated, _ = sample(lib, engine, prompt, 3, unreachable, 1234)
+        check("a completion that never hits eos ends at the length limit",
+              int(truncated.tokens) == 3 and truncated.terminal == TRAIN_TERMINAL_LENGTH,
+              f"{int(truncated.tokens)} tokens, terminal {truncated.terminal}")
+
+        # The distribution: the rollout's first token must be the model's softmax of the
+        # very logits the rollout samples from (`engine_prefill`'s last row, the same call
+        # the rollout makes), so this measures the sampler and not the forward.
+        lib.engine_reset(engine)
+        last_row = np.empty(vocab, dtype=np.float32)
+        prompt64 = np.ascontiguousarray(prompt, dtype=np.int64)
+        assert lib.engine_prefill(engine, ptr(prompt64), len(prompt), ptr(last_row)) == 0, \
+            lib.engine_last_error().decode()
+        lib.engine_reset(engine)
+        z = last_row.astype(np.float64)
+        z -= z.max()
+        probability = np.exp(z)
+        probability /= probability.sum()
+
+        draws = 20000
+        counts = np.zeros(vocab, dtype=np.int64)
+        drawn_logprobs = np.empty(draws, dtype=np.float64)
+        rng = BackwardRng()
+        lib.backward_rng_seed(ctypes.byref(rng), 99)
+        draw_record = TrainSampleRecord()
+        prompt32 = np.ascontiguousarray(prompt, dtype=np.int32)
+        for index in range(draws):
+            status = lib.engine_rollout_sample(engine, ptr(prompt32), len(prompt), 1, eos, 7,
+                                               ctypes.byref(rng), ctypes.byref(draw_record))
+            assert status == 0, lib.engine_last_error().decode()
+            counts[int(draw_record.token_ids[0])] += 1
+            drawn_logprobs[index] = float(draw_record.sampled_logprobs[0])
+
+        # Two independent readings of the same distribution. The entropy test uses every
+        # draw: E[-log p(x)] is exactly the entropy of the model's softmax, so a shifted or
+        # truncated sampler moves it far outside the standard error of the mean. The
+        # per-token test is the histogram, where a flatter toy distribution leaves most
+        # tokens with too few counts to say anything, so only the counted bins are tested.
+        entropy = float(-(probability * np.log(probability)).sum())
+        mean_neg_logprob = float(-drawn_logprobs.mean())
+        standard_error = float(drawn_logprobs.std(ddof=1) / np.sqrt(draws))
+        z_entropy = (mean_neg_logprob - entropy) / standard_error
+        check(f"the sampled tokens have the model's entropy ({draws} draws)",
+              abs(z_entropy) <= 4.0,
+              f"-log p = {mean_neg_logprob:.5f} +- {standard_error:.5f} against an entropy of "
+              f"{entropy:.5f} ({z_entropy:+.2f} sigma)")
+
+        frequency = counts / draws
+        expected = probability * draws
+        # A count floor, because a bin with a handful of counts has a band wider than the
+        # probability it is testing. 4.5 sigma over a few hundred bins: the expected maximum
+        # of that many standard normals is about 3.1, so a correct sampler passes.
+        interesting = expected >= 20
+        check("enough tokens are counted for the histogram to mean something",
+              int(interesting.sum()) >= 50, f"{int(interesting.sum())} bins above the floor")
+        if interesting.any():
+            band = np.sqrt(probability[interesting] * (1.0 - probability[interesting]) / draws)
+            z_tokens = np.abs(frequency - probability)[interesting] / band
+            check("every counted token's frequency is within 4.5 sigma of the model's softmax",
+                  float(z_tokens.max()) <= 4.5,
+                  f"worst {float(z_tokens.max()):.2f} sigma over "
+                  f"{int(interesting.sum())} tokens")
+            print(f"  (the histogram's worst bin is {float(z_tokens.max()):.2f} sigma; "
+                  f"total variation {0.5 * float(np.abs(frequency - probability).sum()):.4f})")
+
+        # The version binding. The loop refuses a record the engine did not stamp (so the
+        # engine's version is not a caller's claim), and the store refuses an update while
+        # the rollout's borrow is open.
+        group = TrainGroup()
+        check("the loop accepts the engine's record",
+              lib.train_loop_record(loop, ctypes.byref(group), ctypes.byref(record)) == 0,
+              lib.train_loop_last_error().decode())
+        stale = TrainSampleRecord()
+        ctypes.memmove(ctypes.byref(stale), ctypes.byref(record), ctypes.sizeof(record))
+        stale.version = record.version + 1
+        check("a record stamped with a version the engine did not read is refused",
+              lib.train_loop_record(loop, ctypes.byref(group), ctypes.byref(stale)) != 0,
+              lib.train_loop_last_error().decode())
+        ratio = ctypes.c_double(0.0)
+        check("the ratio at unchanged parameters is exactly 1",
+              lib.train_loop_ratio(loop, ctypes.byref(record), ptr(logprobs),
+                                   ctypes.byref(ratio)) == 0 and ratio.value == 1.0,
+              f"{ratio.value!r}")
+
+        opts = OptimizerOptions(HYPER["lr"], HYPER["beta1"], HYPER["beta2"], HYPER["eps"],
+                                HYPER["weight_decay"], 1)
+        changed = ctypes.c_longlong(0)
+        check("an optimizer step is refused while a rollout borrows the version",
+              lib.engine_train_apply(engine, ctypes.byref(opts), ctypes.byref(changed)) != 0,
+              lib.engine_last_error().decode())
+
+        # The trainer's denominator for the same tokens at the same version: this is the
+        # plan's "validate host-FP64 sampler versus trainer-FP32 logprob differences
+        # explicitly". The two paths differ in more than precision (the generation path
+        # reads a KV cache, the teacher-forced one a causal mask), so the number is
+        # reported as the cross-path gap it is rather than as a mismatch.
+        sequence = prompt + ids
+        labels = np.ascontiguousarray(sequence, dtype=np.int32)
+        targets = np.ascontiguousarray([0] * len(prompt) + [1] * generated, dtype=np.uint8)
+        positions = np.ascontiguousarray(np.arange(len(sequence)), dtype=np.int64)
+        trainer = np.empty(len(sequence), dtype=np.float32)
+        selected_rows = np.empty(len(sequence), dtype=np.int32)
+        out = TrainForwardOutput(None, ctypes.cast(ptr(trainer), ctypes.c_void_p),
+                                 ctypes.cast(ptr(selected_rows), ctypes.c_void_p), 0)
+        lib.engine_reset(engine)
+        status = lib.engine_train_forward(engine, ptr(labels), len(sequence), ptr(positions),
+                                          ptr(labels), ptr(targets), 1, ctypes.byref(out))
+        check("the teacher-forced forward selects the completion rows", status == 0 and
+              out.selected_count == generated, f"{out.selected_count} of {generated}")
+        rows = [int(selected_rows[j]) for j in range(out.selected_count)]
+        check("the selected queries are the completion's queries",
+              rows == list(range(len(prompt) - 1, len(sequence) - 1)))
+        trainer_logprobs = np.array(trainer[:out.selected_count], dtype=np.float64)
+        cross_path = float(np.abs(trainer_logprobs - logprobs.astype(np.float64)).max())
+        trainer_ratio = float(np.exp(np.mean(trainer_logprobs - logprobs.astype(np.float64))))
+        check("the generation and training paths see the same model",
+              np.isfinite(trainer_ratio) and abs(cross_path) < 1e-4,
+              f"max |dlogprob| {cross_path:.3e}, ratio {trainer_ratio:.8f}")
+        print(f"  (the trainer's path gives ratio {trainer_ratio:.8f} for the same completion: "
+              f"the cross-path logprob gap is {cross_path:.3e})")
+
+        assert lib.train_loop_leave(loop) == 0, lib.train_loop_last_error().decode()
+
+        # After a publish the record is from a superseded version: unreadable, and its
+        # denominator is the one written at generation time, not the updated model's.
+        before = lib.engine_train_version(engine)
+        one_step(lib, engine, store, TOKENS, MASK, HYPER, 1, 64)
+        after = lib.engine_train_version(engine)
+        check("a publish moves the engine's version", after == before + 1,
+              f"{before} -> {after}")
+        reward = ctypes.c_float(0.0)
+        check("a record from a superseded version cannot be read",
+              lib.train_loop_read_reward(loop, ctypes.byref(group), 0,
+                                         ctypes.byref(reward)) != 0,
+              lib.train_loop_last_error().decode())
+        check("a ratio for a superseded record is refused",
+              lib.train_loop_ratio(loop, ctypes.byref(record), ptr(logprobs),
+                                   ctypes.byref(ratio)) != 0)
+        check("the recorded denominator is unchanged by the update",
+              np.array_equal(np.array([record.logprobs[i] for i in range(generated)],
+                                      dtype=np.float32), logprobs))
+    finally:
+        lib.train_loop_destroy(loop)
+        lib.engine_destroy(engine)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", required=True)
@@ -299,6 +568,12 @@ def main():
         lib.engine_train_step_end(step)
     finally:
         lib.engine_destroy(engine)
+
+    print("5. the rollout")
+    if hasattr(lib, "engine_rollout_sample"):
+        rollout_section(lib, args.model_dir, desc)
+    else:
+        print("  (the library has no rollout entry point; skipped)")
 
     if FAILURES:
         print(f"test_sft: FAIL ({len(FAILURES)}): {', '.join(FAILURES)}")

@@ -1,9 +1,10 @@
 # Plan: Numerical Execution Contract, Haskell Training, and Asynchronous RL
 
-Status: Stages 6–8 proposed, not implemented; **Stages 0-4 are implemented and Stage 5's SFT bring-up is**
+Status: Stages 6–8 proposed, not implemented; **Stages 0-5 are implemented**
 (the versioned execution manifest with capture provenance, the region inventory
 with its cross-case harness, the feasibility/invariance experiments, the
-trainable runtime's parameter lifecycle, and the backward/loss/optimizer layer —
+trainable runtime's parameter lifecycle, the backward/loss/optimizer layer, and
+the synchronous SFT/rollout baseline —
 see
 [manifest-contract.md](manifest-contract.md), [worklog.md](worklog.md),
 `csrc/regions.c`, `csrc/include/train.h` and `csrc/include/backward.h`).
@@ -584,45 +585,72 @@ run-to-run determinism separately from numerical closeness to the reference.
 
 ### Stage 5 — Synchronous training/rollout baseline
 
-**Status: the SFT bring-up is implemented and verified, 2026-09-26; the rollout half's
-bookkeeping is implemented and CPU-gated, and its engine wiring is the remaining work.**
-The layer backward is `csrc/backward_layers.cu` (the full-attention mixer with its fused
+**Status: the SFT bring-up and the synchronous rollout are both implemented and verified,
+2026-09-26.** The layer backward is `csrc/backward_layers.cu` (the full-attention mixer with its fused
 output gate and per-head norms, the dense MLP, the residual adds and all four norms, each
 recomputed per sublayer from the three values Stage 3 retains); the step's entry points are
 `engine_train_forward_retain` / `_loss` / `_backward` / `_apply` / `_zero_grads` /
 `_export_state` / `_import_state` in `csrc/engine.cu`; the phase, budget, record and
-sampler contract is `csrc/include/train_loop.h` + `csrc/train_loop.c`. Gates: `ctest
-test_sft` (device) and `ctest test_train_loop` (CPU). The gate below is met:
+sampler contract is `csrc/include/train_loop.h` + `csrc/train_loop.c`; and the rollout
+driver is `engine_rollout_sample` in `csrc/engine.cu`, which generates a completion under a
+live model inside a *borrowing* `TrainContext` and stamps the record with the version that
+context borrowed. Gates: `ctest test_sft` (device: SFT and rollout) and `ctest
+test_train_loop` (CPU). The gate below is met:
 
 - **SFT is up on a real model.** `tests/synth/make_qwen3_dense.py` builds a 0.72M-parameter
   dense Qwen3 with **tied embeddings** and a prompt-masked target, and the engine trains it:
-  the loss falls 7.0322 → 0.6129 over twelve steps and the reference implementation falls
-  7.0318 → 0.0733 on the same fixture, so both overfit and neither is a no-op.
+  the loss falls 7.0322 → 0.6084 over twelve steps and the reference implementation falls
+  7.0318 → 0.5652 on the same fixture, so both overfit and neither is a no-op.
 - **the step's loss is an independent implementation's loss.** The first step's loss —
   one forward over the same weights with the same mask — matches a `transformers` +
   `torch.autograd` run to 6.3e-05 relative. That is what pins the forward, the row-at-a-time
   final norm and LM head, and the masked reduction together.
 - **the backward's direction is the reference's direction.** After one AdamW step at a
   large lr (where the step is `lr*sign(g)` and the sign of the weight move is the sign of
-  the gradient), the tied parameter's gradient has cosine **0.999** against torch's over
+  the gradient), the tied parameter's gradient has cosine **0.9990** against torch's over
   all 131072 elements. This is the numerical check of the layer wiring; the loss matching
   alone would not catch a wrong gradient.
 - **a resume restores the state exactly.** The exported training state (every trainable
   parameter's FP32 master and both optimizer moments) round-trips through import/export
-  bitwise, so a resumed run continues the bias correction rather than restarting it.
+  bitwise, so a resumed run continues the bias correction rather than restarting it, and
+  the resumed tail reproduces the uninterrupted one to 1.4e-02 relative.
 - **determinism is tested apart from closeness.** The forward is bitwise reproducible
   (the first loss is identical run to run); the backward's row-summed weight gradients
-  accumulate with atomics, so the trajectories separate afterwards by ~1e-2 relative —
+  accumulate with atomics, so the trajectories separate afterwards by 5.1e-03 relative —
   measured and attributed rather than called a mismatch, which is the split the plan asks
   for and Stage 4's registry records.
+- **the rollout reads the model's own distribution.** `test_sft` draws **20000**
+  single-token completions through `engine_rollout_sample` and compares them against the
+  softmax of the very logits the rollout samples from. Two independent readings agree: the
+  mean of `-log p` is 6.90837 ± 0.00162 against that distribution's entropy of 6.90495
+  (**+2.11 sigma**), and of the 415 bins whose expected count exceeds 20 every one lands
+  within 4.5 sigma of its probability (worst **2.94 sigma**). The recorded sampler
+  log-probability is bitwise the model's, which is what temperature 1 with no truncation
+  means, so the two columns a transformation would have to distinguish coincide.
+- **seed behaviour and the terminal reasons are deterministic.** The same seed reproduces
+  the completion bitwise, a shorter rollout is a prefix of the longer one, an eos the
+  sampler hits ends the completion at one token with `TRAIN_TERMINAL_EOS`, and a
+  completion that never hits eos runs to the length limit with `TRAIN_TERMINAL_LENGTH`.
+- **the record is bound to the version the engine read.** `engine_rollout_sample` opens a
+  *rollout* `TrainContext`, so an engine-level optimizer step is refused while the
+  generation is live (`1 reader(s) still borrow version 0`), and the record's version is
+  the one that context borrowed: `train_loop_record` accepts it and refuses the same record
+  stamped one version ahead. A publication moves the store 0 → 1, after which both
+  `train_loop_read_reward` and `train_loop_ratio` refuse the record while its recorded
+  denominator is bitwise unchanged — the plan's "never reconstruct an old denominator using
+  updated weights".
+- **the two denominators are compared, not assumed.** For the same completion at the same
+  version, the teacher-forced trainer's FP32 log-probabilities differ from the host FP64
+  sampler's by **4.768e-07** at most, i.e. a sequence-level ratio of 0.99999976. The
+  generation path reads a KV cache and the trainer a causal mask, so this is exactly the
+  cross-case deviation the plan asks to be reported separately rather than claimed bitwise.
 - **the rollout half's rules hold as behaviour.** `test_train_loop` checks the phase
   budgets (only SFT holds optimizer state, activations and retained values), that a rollout
   *borrows* the store so an update is refused while it reads, that a phase boundary resets
-  the sequence, that a record generated under a superseded version cannot be read (the
-  "never reconstruct an old denominator" rule), that the sequence-level ratio at unchanged
-  parameters is exactly 1, and that the host FP64 sampler's measured frequencies match the
-  softmax it samples from within three standard deviations (0.6652/0.2447/0.0902 against
-  0.6652/0.2447/0.0900 over 200k draws).
+  the sequence, that the sequence-level ratio at unchanged parameters is exactly 1, and that
+  the host FP64 sampler's measured frequencies match the softmax it samples from within
+  three standard deviations (0.6652/0.2447/0.0902 against 0.6652/0.2447/0.0900 over 200k
+  draws).
 - **the refusals are named.** Training on a pipeline or tensor-parallel placement, a step
   outside a phase, an optimizer step while a step is live, and a NaN logit at sampling
   time are each refused with a message.
@@ -632,12 +660,13 @@ full-attention mixer and the dense feed-forward: the **GDN mixer's backward** (i
 conv and core regions) is Stage 4's kernels but is not yet chained into the walk, and MoE
 and MLA stay outside the first trainer allowlist as Stage 1 says. Training is wired for a
 **single device** — a pipeline split would have to move gradients between devices and a TP
-placement would have to reduce sharded ones, and both are refusals today. The **rollout's
-engine wiring** (driving `train_loop` from the engine against a live model) is the piece
-this stage's CPU gate does not cover; its contract is gated on the CPU and its sampler is
-reusable as-is. And the phase budgets are an **estimate from the descriptor's shapes**
-rather than a measured allocation watermark, which is what a budget needs to be chosen from
-but not what proves a phase fits.
+placement would have to reduce sharded ones, and both are refusals today. The rollout
+generates **one sequence per call and one record at a time**: the engine has no group
+entry point, so a caller collects a group's G completions by looping (the plan's "serial
+generation is sufficient for correctness"), and the record's `reward` slot is left for the
+caller's deterministic verifier — the engine does not invent one. And the phase budgets are
+an **estimate from the descriptor's shapes** rather than a measured allocation watermark,
+which is what a budget needs to be chosen from but not what proves a phase fits.
 
 First bring up SFT after Stages 3–4; it does not wait for cross-case bitwise
 kernels. Then add phase-specific memory budgets and stochastic rollout. Reuse
